@@ -1,0 +1,53 @@
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_USER: imu
+      POSTGRES_PASSWORD: imu
+      POSTGRES_DB: imu
+    volumes:
+      - imu_pg:/var/lib/postgresql/data
+      - ./deploy/init-timescale.sql:/docker-entrypoint-initdb.d/01-timescale.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U imu -d imu"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://imu:imu@db:5432/imu
+      IMU_API_KEY: ${IMU_API_KEY:-dev-change-me}
+      GRAFANA_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-me-grafana}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SERVER_ROOT_URL: https://apps.f0xx.org/app/good_vibes/grafana/
+      GF_SERVER_SERVE_FROM_SUB_PATH: "false"
+      GF_INSTALL_PLUGINS: ""
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  imu_pg:
+  grafana_data:

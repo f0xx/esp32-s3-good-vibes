@@ -1,0 +1,116 @@
+diff --git a/subsys/bluetooth/host/hci_core.h b/subsys/bluetooth/host/hci_core.h
+--- a/subsys/bluetooth/host/hci_core.h
++++ b/subsys/bluetooth/host/hci_core.h
+@@ -598,3 +598,6 @@ void bt_hci_le_per_adv_subevent_data_request(struct net_buf *buf);
+ void bt_hci_le_per_adv_response_report(struct net_buf *buf);
+ 
+ void bt_tx_irq_raise(void);
++/* Route HCI TX + conn tx-complete off sysworkq when using BT RX workqueue. */
++int bt_hci_wq_submit(struct k_work *work);
++k_tid_t bt_hci_wq_thread_get(void);
+diff --git a/subsys/bluetooth/host/hci_core.c b/subsys/bluetooth/host/hci_core.c
+--- a/subsys/bluetooth/host/hci_core.c
++++ b/subsys/bluetooth/host/hci_core.c
+@@ -84,6 +84,30 @@ static struct k_work_q bt_workq;
+ static K_KERNEL_STACK_DEFINE(rx_thread_stack, CONFIG_BT_RX_STACK_SIZE);
+ #endif /* CONFIG_BT_RECV_WORKQ_BT */
+ 
++#if defined(CONFIG_BT_RECV_WORKQ_BT)
++int bt_hci_wq_submit(struct k_work *work)
++{
++	return k_work_submit_to_queue(&bt_workq, work);
++}
++
++k_tid_t bt_hci_wq_thread_get(void)
++{
++	return &bt_workq.thread;
++}
++#else
++int bt_hci_wq_submit(struct k_work *work)
++{
++	return k_work_submit(work);
++}
++
++k_tid_t bt_hci_wq_thread_get(void)
++{
++	return &k_sys_work_q.thread;
++}
++#endif
++
+ static void init_work(struct k_work *work);
+ 
+ struct bt_dev bt_dev = {
+@@ -381,7 +405,7 @@ int bt_hci_cmd_send_sync(uint16_t opcode, struct net_buf *buf,
+ 	/* Since the commands are now processed in the syswq, we cannot suspend
+ 	 * and wait. We have to send the command from the current context.
+ 	 */
+-	if (k_current_get() == &k_sys_work_q.thread) {
++	if (k_current_get() == bt_hci_wq_thread_get()) {
+ 		/* drain the command queue until we get to send the command of interest. */
+ 		struct net_buf *cmd = NULL;
+ 
+@@ -584,7 +608,7 @@ static void hci_num_completed_packets(struct net_buf *buf)
+ 			atomic_dec(&conn->in_ll);
+ 
+ 			/* TX context free + callback happens in there */
+-			k_work_submit(&conn->tx_complete_work);
++			(void)bt_hci_wq_submit(&conn->tx_complete_work);
+ 		}
+ 
+ 		bt_conn_unref(conn);
+@@ -4204,8 +4228,7 @@ static void rx_work_handler(struct k_work *work)
+ #if defined(CONFIG_BT_TESTING)
+ k_tid_t bt_testing_tx_tid_get(void)
+ {
+-	/* We now TX everything from the syswq */
+-	return &k_sys_work_q.thread;
++	return bt_hci_wq_thread_get();
+ }
+ #endif
+ 
+@@ -4665,5 +4688,5 @@ static K_WORK_DEFINE(tx_work, tx_processor);
+ void bt_tx_irq_raise(void)
+ {
+ 	LOG_DBG("kick TX");
+-	k_work_submit(&tx_work);
++	(void)bt_hci_wq_submit(&tx_work);
+ }
+diff --git a/subsys/bluetooth/host/conn.c b/subsys/bluetooth/host/conn.c
+--- a/subsys/bluetooth/host/conn.c
++++ b/subsys/bluetooth/host/conn.c
+@@ -255,8 +255,7 @@ static void tx_free(struct bt_conn_tx *tx)
+ #if defined(CONFIG_BT_CONN_TX)
+ static void tx_notify(struct bt_conn *conn)
+ {
+-	__ASSERT_NO_MSG(k_current_get() ==
+-			k_work_queue_thread_get(&k_sys_work_q));
++	__ASSERT_NO_MSG(k_current_get() == bt_hci_wq_thread_get());
+ 
+ 	LOG_DBG("conn %p", conn);
+ 
+@@ -431,14 +430,12 @@ static void wait_for_tx_work(struct bt_conn *conn)
+ #if defined(CONFIG_BT_CONN_TX)
+ 	LOG_DBG("conn %p", conn);
+ 
+-	if (IS_ENABLED(CONFIG_BT_RECV_WORKQ_SYS) ||
+-	    k_current_get() == k_work_queue_thread_get(&k_sys_work_q)) {
++	if (k_current_get() == bt_hci_wq_thread_get()) {
+ 		tx_notify(conn);
+ 	} else {
+ 		struct k_work_sync sync;
+ 		int err;
+ 
+-		err = k_work_submit(&conn->tx_complete_work);
++		err = bt_hci_wq_submit(&conn->tx_complete_work);
+ 		__ASSERT(err >= 0, "couldn't submit (err %d)", err);
+ 
+ 		k_work_flush(&conn->tx_complete_work, &sync);
+@@ -1536,7 +1533,7 @@ struct net_buf *bt_conn_create_pdu_timeout(struct net_buf_pool *pool,
+ 	__ASSERT_NO_MSG(!k_is_in_isr());
+ 
+ 	if (!K_TIMEOUT_EQ(timeout, K_NO_WAIT) &&
+-	    k_current_get() == k_work_queue_thread_get(&k_sys_work_q)) {
++	    k_current_get() == bt_hci_wq_thread_get()) {
+ 		LOG_DBG("Timeout discarded. No blocking in syswq.");
+ 		timeout = K_NO_WAIT;
+ 	}

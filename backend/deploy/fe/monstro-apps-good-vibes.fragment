@@ -1,0 +1,46 @@
+# Good Vibes — location blocks for apps.f0xx.org (monstro FE).
+# Install: include inside the apps.f0xx.org server {} block in /etc/nginx/apps.conf
+# Requires: include /etc/nginx/good-vibes-upstream.conf; in http {}
+#
+# Public URL: https://apps.f0xx.org/app/good_vibes/
+# Grafana:     https://apps.f0xx.org/app/good_vibes/grafana/  (NOT /app/grafana/)
+# DO NOT reload nginx from CI — operator runs: nginx -t && rc-service nginx reload
+
+	location = /app/grafana {
+		return 301 $scheme://$host/app/good_vibes/grafana/;
+	}
+	location = /app/grafana/ {
+		return 301 $scheme://$host/app/good_vibes/grafana/;
+	}
+
+	location = /app/good_vibes {
+		return 301 $scheme://$host/app/good_vibes/;
+	}
+
+	location ^~ /app/good_vibes/grafana/ {
+		proxy_pass http://good_vibes_grafana/;
+		proxy_http_version 1.1;
+		proxy_set_header Host              $host;
+		proxy_set_header X-Real-IP         $remote_addr;
+		proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+		proxy_set_header X-Forwarded-Proto $scheme;
+		proxy_set_header X-Forwarded-Host  $host;
+		proxy_set_header Upgrade           $http_upgrade;
+		proxy_set_header Connection        $connection_upgrade;
+		proxy_read_timeout 300s;
+		proxy_send_timeout 300s;
+	}
+
+	location ^~ /app/good_vibes/ {
+		proxy_pass http://good_vibes_be;
+		proxy_http_version 1.1;
+		proxy_set_header Host              $host;
+		proxy_set_header X-Real-IP         $remote_addr;
+		proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+		proxy_set_header X-Forwarded-Proto $scheme;
+		proxy_set_header X-Forwarded-Host  $host;
+		proxy_connect_timeout 30s;
+		proxy_read_timeout 120s;
+		proxy_send_timeout 120s;
+		client_max_body_size 4m;
+	}

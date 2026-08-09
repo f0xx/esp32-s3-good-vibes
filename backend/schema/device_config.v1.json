@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "device.config.v1",
+  "title": "DeviceConfigV1 logical view",
+  "type": "object",
+  "required": ["schema", "revision"],
+  "properties": {
+    "schema": { "const": "device.config.v1" },
+    "revision": { "type": "integer", "minimum": 0, "description": "Cloud/phone monotonic unix revision (profile_updated_unix)" },
+    "local_revision": { "type": "integer", "minimum": 0, "description": "ESP-local overlay revision (high bit set)" },
+    "source": { "type": "string", "enum": ["esp", "phone", "cloud", "be"] },
+    "app_version": { "type": "string", "description": "Android app versionName when uploaded from phone" },
+    "profile": {
+      "type": "object",
+      "properties": {
+        "power_profile": { "type": "integer", "minimum": 0, "maximum": 5 },
+        "cpu_mhz": { "type": "integer", "enum": [80, 160, 240] },
+        "imu_sample_hz": { "type": "integer", "minimum": 1, "maximum": 200 },
+        "tft_policy": { "type": "integer", "minimum": 0, "maximum": 2 },
+        "wake_interval_sec": { "type": "integer", "minimum": 0 },
+        "active_window_sec": { "type": "integer", "minimum": 0 },
+        "deep_sleep_enable": { "type": "integer", "enum": [0, 1] },
+        "ble_poll_ms": { "type": "integer", "minimum": 33, "maximum": 2000 },
+        "ble_default_mode": { "type": "integer", "minimum": 0, "maximum": 2 }
+      }
+    },
+    "vibro": {
+      "type": "object",
+      "properties": {
+        "schedule_mode": { "type": "integer", "minimum": 0, "maximum": 2 },
+        "interval_sec": { "type": "integer", "minimum": 1, "maximum": 255 },
+        "window_sec": { "type": "integer", "minimum": 1, "maximum": 255 },
+        "jitter_sec": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "capture_tier": { "type": "integer", "minimum": 0, "maximum": 3 },
+        "wifi_upload_enable": { "type": "integer", "enum": [0, 1] }
+      }
+    },
+    "mix": {
+      "type": "object",
+      "properties": {
+        "every": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "ratio": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "dyn_short": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "dyn_nested": { "type": "integer", "minimum": 0, "maximum": 255 }
+      }
+    },
+    "local": {
+      "type": "object",
+      "description": "ESP-only overlay — not required in cloud copies",
+      "properties": {
+        "tft_user_off": { "type": "boolean" }
+      }
+    },
+    "blob_b64": {
+      "type": "string",
+      "description": "Optional packed DeviceConfigV1 blob (188 bytes) for round-trip"
+    }
+  }
+}

@@ -1,0 +1,9 @@
+identifier: esp32s3_lcd_147b/esp32s3/appcpu
+name: Waveshare ESP32-S3-LCD-1.47B APPCPU
+type: mcu
+arch: xtensa
+toolchain:
+  - zephyr
+supported:
+  - gpio
+vendor: waveshare

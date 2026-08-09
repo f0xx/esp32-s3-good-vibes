@@ -1,0 +1,10 @@
+mainmenu "Handshake application"
+
+source "Kconfig.zephyr"
+
+config APP_CRASH_DEBUG
+	bool "Debug crash injection + BIST (non-production)"
+	default n
+	help
+	  Enables BLE-triggered fault injection and boot/on-demand BIST.
+	  Enable only via prj_crash.conf for development builds.

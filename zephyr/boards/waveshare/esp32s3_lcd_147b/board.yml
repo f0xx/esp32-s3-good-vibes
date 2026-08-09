@@ -1,0 +1,5 @@
+board:
+  name: esp32s3_lcd_147b
+  vendor: waveshare
+  socs:
+  - name: esp32s3

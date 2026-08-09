@@ -1,34 +1,42 @@
-# Gradle files
-.gradle/
-build/
+# Android
+android/**/.gradle/
+android/**/build/
+android/**/local.properties
+android/**/.cxx/
+android/**/captures/
 
-# Local configuration file (sdk path, etc)
-local.properties
+# Backend / Python
+backend/.venv/
+backend/**/__pycache__/
+backend/**/*.db
+backend/deploy/artc0-credentials.local
+backend/deploy/API_KEY.*
+backend/.grafana_admin_password
+backend/.grafana_db_password
+backend/grafana/provisioning/datasources/postgres.yml
 
-# Log/OS Files
-*.log
+# Flash backups (large binaries — keep restore scripts, ignore images)
+backups/*.bin
+backups/LATEST
 
-# Android Studio generated files and folders
-captures/
-.externalNativeBuild/
-.cxx/
-*.aab
-*.apk
-output-metadata.json
+# Generated docs / features
+features.pdf
+docs/.features-pdf-build/
 
-# IntelliJ
-*.iml
+# Zephyr / west (out-of-tree builds via ~/zephyrproject; ignore any local copies)
+**/build/
+**/.west/
+.zephyr/
+*.elf
+*.bin.map
+
+# IDE / editor
 .idea/
-misc.xml
-deploymentTargetDropDown.xml
-render.experimental.xml
+.vscode/
+*.swp
+*~
 
-# Keystore files
-*.jks
-*.keystore
-
-# Google Services (e.g. APIs or Firebase)
-google-services.json
-
-# Android Profiling
-*.hprof
+# OS
+.DS_Store
+Thumbs.db
+tmp
