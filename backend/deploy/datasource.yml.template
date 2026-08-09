@@ -1,0 +1,19 @@
+apiVersion: 1
+datasources:
+  - name: IMU Postgres
+    type: postgres
+    uid: imu-pg
+    access: proxy
+    url: db:5432
+    user: imu_grafana_ro
+    secureJsonData:
+      password: "__GRAFANA_DB_PASSWORD__"
+    jsonData:
+      database: imu
+      sslmode: disable
+      postgresVersion: 1600
+      timescaledb: true
+      maxOpenConns: 5
+      maxIdleConns: 2
+    isDefault: true
+    editable: false

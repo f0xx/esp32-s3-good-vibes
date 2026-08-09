@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://esp32-imu.local/schema/verdict.v1.json",
+  "title": "VerdictRecordV1",
+  "type": "object",
+  "required": ["type", "ts_ms", "seq", "level"],
+  "properties": {
+    "type": { "const": "verdict" },
+    "ts_ms": { "type": "integer", "minimum": 0 },
+    "seq": { "type": "integer", "minimum": 0 },
+    "level": { "type": "integer", "minimum": 0, "maximum": 2 },
+    "rms": { "type": "number" },
+    "peak": { "type": "number" },
+    "corr": { "type": "number" },
+    "rms_delta": { "type": "number" },
+    "pct": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "voltage": { "type": "number" },
+    "power_profile": { "type": "integer", "minimum": 1, "maximum": 5 },
+    "chip_temp_c": { "type": "number" },
+    "band_corr": { "type": "number", "minimum": -1.0, "maximum": 1.0 },
+    "band_delta_max": { "type": "number", "minimum": 0.0 },
+    "bands": {
+      "type": "array",
+      "maxItems": 8,
+      "items": { "type": "number" }
+    },
+    "edge_crest": { "type": "number" },
+    "edge_zcr_hz": { "type": "number" },
+    "edge_hf_ratio": { "type": "number" },
+    "session_seq": { "type": "integer", "minimum": 0 },
+    "cap_mix_sec": { "type": "integer", "minimum": 0 }
+  },
+  "additionalProperties": false
+}

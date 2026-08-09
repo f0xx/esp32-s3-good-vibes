@@ -1,0 +1,21 @@
+identifier: esp32s3_lcd_147b/esp32s3/procpu
+name: Waveshare ESP32-S3-LCD-1.47B PROCPU
+type: mcu
+arch: xtensa
+toolchain:
+  - zephyr
+supported:
+  - gpio
+  - i2c
+  - spi
+  - watchdog
+  - uart
+  - pwm
+  - pinmux
+  - nvs
+  - display
+  - bluetooth
+testing:
+  ignore_tags:
+    - net
+vendor: waveshare

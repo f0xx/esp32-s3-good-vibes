@@ -1,0 +1,102 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "datasource": { "type": "postgres", "uid": "imu-pg" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }] }
+        }
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "id": 1,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "targets": [{
+        "format": "table",
+        "rawQuery": true,
+        "rawSql": "SELECT COUNT(*) AS crashes\nFROM crashes\nWHERE ('${group:raw}' = 'All' OR group_id = '${group:raw}')\n  AND ts_ms >= $__from AND ts_ms <= $__to",
+        "refId": "A"
+      }],
+      "title": "Crashes in range",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "imu-pg" },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "targets": [{
+        "format": "table",
+        "rawQuery": true,
+        "rawSql": "SELECT COUNT(DISTINCT device_id) AS devices\nFROM crashes\nWHERE ('${group:raw}' = 'All' OR group_id = '${group:raw}')\n  AND ts_ms >= $__from AND ts_ms <= $__to",
+        "refId": "A"
+      }],
+      "title": "Devices with crashes",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "imu-pg" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "stacking": { "mode": "normal" }
+          }
+        }
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 4 },
+      "id": 3,
+      "targets": [{
+        "format": "time_series",
+        "rawQuery": true,
+        "rawSql": "SELECT ts_ms AS time, 1 AS count\nFROM crashes\nWHERE ('${group:raw}' = 'All' OR group_id = '${group:raw}')\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
+        "refId": "A"
+      }],
+      "title": "Crash events",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "imu-pg" },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 12 },
+      "id": 4,
+      "targets": [{
+        "format": "table",
+        "rawQuery": true,
+        "rawSql": "SELECT ts_ms, device_id, seq, reason, pc, exccause, fw_version, uptime_ms,\n  detail_json\nFROM crashes\nWHERE ('${group:raw}' = 'All' OR group_id = '${group:raw}')\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms DESC\nLIMIT 100",
+        "refId": "A"
+      }],
+      "title": "Recent crashes",
+      "type": "table"
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 39,
+  "tags": ["imu", "crashes"],
+  "templating": {
+    "list": [{
+      "current": { "selected": true, "text": "All", "value": "All" },
+      "includeAll": true,
+      "label": "Group",
+      "name": "group",
+      "query": "SELECT DISTINCT group_id FROM crashes WHERE group_id IS NOT NULL ORDER BY 1",
+      "type": "query",
+      "datasource": { "type": "postgres", "uid": "imu-pg" }
+    }]
+  },
+  "time": { "from": "now-30d", "to": "now" },
+  "title": "ESP32 IMU Crashes",
+  "uid": "imu-crashes",
+  "version": 1
+}

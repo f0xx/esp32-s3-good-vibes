@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://esp32-imu.local/schema/ingest-envelope.v1.json",
+  "title": "IngestEnvelopeV1",
+  "type": "object",
+  "required": ["schema", "device_id", "sent_at_ms", "records"],
+  "properties": {
+    "schema": { "const": "imu.ingest.v1" },
+    "device_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "group_id": { "type": "string", "maxLength": 64 },
+    "phone_id": { "type": "string", "maxLength": 64 },
+    "sent_at_ms": { "type": "integer", "minimum": 0 },
+    "records": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 500,
+      "items": { "$ref": "verdict.v1.json" }
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Good Vibes — IMU analytics</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --panel: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --ok: #3fb950;
+      --warn: #d29922;
+      --alert: #f85149;
+      --accent: #58a6ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.45;
+    }
+    header {
+      padding: 1rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+    }
+    header h1 { margin: 0; font-size: 1.25rem; font-weight: 600; }
+    header p { margin: 0.35rem 0 0; color: var(--muted); font-size: 0.9rem; }
+    main { max-width: 1200px; margin: 0 auto; padding: 1rem 1.25rem 2rem; }
+    .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem;
+    }
+    .card h2 { margin: 0 0 0.75rem; font-size: 1rem; }
+    label { display: block; font-size: 0.8rem; color: var(--muted); margin-bottom: 0.25rem; }
+    input, select, button {
+      font: inherit;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      padding: 0.45rem 0.6rem;
+    }
+    input { width: 100%; }
+    button {
+      cursor: pointer;
+      background: #21262d;
+      margin-top: 0.5rem;
+    }
+    button:hover { border-color: var(--accent); }
+    .row { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: end; }
+    .row > * { flex: 1; min-width: 140px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+    th, td { text-align: left; padding: 0.35rem 0.4rem; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 500; }
+    .lvl-0 { color: var(--ok); }
+    .lvl-1 { color: var(--warn); }
+    .lvl-2 { color: var(--alert); }
+    .crash-pc { font-family: ui-monospace, monospace; font-size: 0.82rem; }
+    .crash-row { cursor: pointer; }
+    .crash-row:hover { background: #21262d; }
+    .crash-detail-pre {
+      font-family: ui-monospace, monospace;
+      font-size: 0.78rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #010409;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.75rem;
+      max-height: 320px;
+      overflow: auto;
+    }
+    dialog.crash-modal {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--text);
+      max-width: 720px;
+      width: calc(100% - 2rem);
+      padding: 1rem;
+    }
+    dialog.crash-modal::backdrop { background: rgba(0,0,0,0.55); }
+    .empty-hint {
+      color: var(--muted);
+      font-size: 0.85rem;
+      padding: 0.75rem 0;
+    }
+    #spectrumChart { width: 100%; height: 220px; background: #010409; border-radius: 6px; }
+    #statusBar { color: var(--muted); font-size: 0.85rem; margin-top: 0.75rem; }
+    .fusion {
+      font-size: 1.5rem;
+      font-weight: 700;
+      margin: 0.25rem 0;
+    }
+    a { color: var(--accent); }
+    .hints {
+      margin-top: 0.75rem;
+      padding: 0.75rem;
+      border-radius: 6px;
+      border: 1px dashed var(--border);
+      background: #0d1117;
+      font-size: 0.85rem;
+    }
+    .hints h3 {
+      margin: 0 0 0.5rem;
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .hints p { margin: 0.35rem 0; }
+    .hints code {
+      font-family: ui-monospace, monospace;
+      font-size: 0.82rem;
+      background: var(--panel);
+      padding: 0.15rem 0.35rem;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      word-break: break-all;
+    }
+    .hint-row { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
+    .hint-row button {
+      margin: 0;
+      padding: 0.25rem 0.5rem;
+      font-size: 0.78rem;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Good Vibes</h1>
+    <p>ESP32 IMU vibration verdicts, crash reports, spectra, and group fusion</p>
+  </header>
+  <main>
+    <section class="card" style="margin-bottom:1rem">
+      <h2>Demo access</h2>
+      <div class="hints">
+        <h3>API (ingest + this dashboard)</h3>
+        <p class="hint-row">
+          Header <code id="apiKeyHint">X-API-Key: …</code>
+          <button type="button" id="copyApiKeyBtn">Copy key</button>
+          <button type="button" id="phoneSetupBtn">Copy phone setup link</button>
+        </p>
+        <p style="color:var(--muted);font-size:0.85rem;margin-top:0.35rem">
+          On your phone: open Good Vibes app → <strong>Cloud</strong> →
+          <strong>Import from clipboard</strong>, or tap the setup link after copying it here.
+        </p>
+        <p style="color:var(--muted);margin-top:0.5rem">Key is pre-filled below — press <strong>Refresh</strong> to load data.</p>
+      </div>
+      <div class="hints" style="margin-top:0.75rem">
+        <h3>Grafana</h3>
+        <p><a id="grafanaLink" href="grafana/">Open Grafana dashboards</a></p>
+        <p>Login: <code id="grafanaUserHint">admin</code> · password: <code id="grafanaPassHint">…</code></p>
+        <p style="color:var(--muted);font-size:0.8rem">Dashboards: <strong>ESP32 IMU Verdicts</strong>, <strong>ESP32 IMU Crashes</strong></p>
+      </div>
+    </section>
+
+    <section class="card" style="margin-bottom:1rem">
+      <h2>Connection</h2>
+      <div class="row">
+        <div>
+          <label for="apiKey">API key (X-API-Key)</label>
+          <input id="apiKey" type="text" autocomplete="off" placeholder="IMU_API_KEY" spellcheck="false" />
+        </div>
+        <div>
+          <label for="groupId">Group</label>
+          <input id="groupId" value="default" />
+        </div>
+        <div>
+          <label for="deviceId">Device</label>
+          <select id="deviceId"><option value="">— load devices —</option></select>
+        </div>
+        <div style="flex:0">
+          <button type="button" id="refreshBtn">Refresh</button>
+        </div>
+      </div>
+      <div id="statusBar">Configure API key and press Refresh.</div>
+    </section>
+
+    <div class="grid">
+      <section class="card">
+        <h2>Group fusion</h2>
+        <div id="fusionLevel" class="fusion lvl-0">—</div>
+        <div id="fusionMeta" style="color:var(--muted);font-size:0.85rem"></div>
+      </section>
+      <section class="card">
+        <h2>Latest crash</h2>
+        <div id="crashSummary" class="fusion lvl-0" style="font-size:1rem">—</div>
+        <div id="crashSummaryMeta" style="color:var(--muted);font-size:0.85rem"></div>
+      </section>
+      <section class="card">
+        <h2>Latest spectrum</h2>
+        <canvas id="spectrumChart" width="800" height="220"></canvas>
+        <div id="spectrumMeta" style="color:var(--muted);font-size:0.8rem;margin-top:0.5rem"></div>
+      </section>
+    </div>
+
+    <section class="card" style="margin-top:1rem">
+      <h2>Recent verdicts</h2>
+      <table>
+        <thead>
+          <tr><th>Time</th><th>Seq</th><th>Level</th><th>RMS</th><th>Peak</th><th>Corr</th><th>ΔRMS</th><th>Edge</th></tr>
+        </thead>
+        <tbody id="verdictRows"></tbody>
+      </table>
+    </section>
+
+    <section class="card" style="margin-top:1rem">
+      <h2>Device config (versioned JSON)</h2>
+      <p class="empty-hint">
+        Latest <code>device.config.v1</code> from phone/ESP ingest. Edit fields and save — revision must increase or API returns 409.
+        Phone: <strong>Device → Config editor</strong> syncs from ESP first, then pushes with bumped <code>profile_updated_unix</code>.
+      </p>
+      <div id="configMeta" style="color:var(--muted);font-size:0.85rem;margin-bottom:0.5rem">—</div>
+      <textarea id="configEditor" rows="14" style="width:100%;font-family:ui-monospace,monospace;font-size:0.78rem"></textarea>
+      <div class="row" style="margin-top:0.5rem">
+        <div style="flex:0">
+          <button type="button" id="configLoadBtn">Load latest</button>
+        </div>
+        <div style="flex:0">
+          <button type="button" id="configSaveBtn">Save (+1 rev)</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="card" style="margin-top:1rem">
+      <h2>Crash reports</h2>
+      <p class="empty-hint" id="crashHint">
+        Post-mortem from ESP32 fatal errors (panic, WDT, stack overflow). Relay path:
+        device → BLE → phone → <code>POST /v1/ingest/crashes</code> → this table.
+        Debug builds: phone <strong>Device → Crash debug (dev)</strong> to inject faults or run BIST.
+      </p>
+      <div class="row" style="margin-bottom:0.75rem">
+        <div style="flex:0">
+          <label><input type="radio" name="crashScope" value="device" checked /> Selected device</label>
+        </div>
+        <div style="flex:0">
+          <label><input type="radio" name="crashScope" value="group" /> Whole group</label>
+        </div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th><th>Device</th><th>Seq</th><th>Reason</th><th>PC</th><th>Cause</th>
+            <th>Thread</th><th>FW</th><th>Uptime</th><th>Backtrace</th>
+          </tr>
+        </thead>
+        <tbody id="crashRows"></tbody>
+      </table>
+    </section>
+
+    <dialog id="crashModal" class="crash-modal">
+      <h2 style="margin:0 0 0.75rem;font-size:1rem">Crash detail</h2>
+      <pre id="crashModalBody" class="crash-detail-pre"></pre>
+      <div style="margin-top:0.75rem;text-align:right">
+        <button type="button" id="crashModalClose">Close</button>
+      </div>
+    </dialog>
+  </main>
+  <script id="demo-hints" type="application/json">__DEMO_HINTS_JSON__</script>
+  <script>
+    const API = '/app/good_vibes/v1';
+    const $ = (id) => document.getElementById(id);
+
+    const DEMO = (() => {
+      try {
+        return JSON.parse(document.getElementById('demo-hints').textContent || '{}');
+      } catch {
+        return {};
+      }
+    })();
+
+    function applyDemoHints() {
+      const key = DEMO.api_key || '';
+      if (key) {
+        $('apiKeyHint').textContent = 'X-API-Key: ' + key;
+        if (!$('apiKey').value) $('apiKey').value = key;
+      }
+      if (DEMO.grafana_url) $('grafanaLink').href = DEMO.grafana_url;
+      if (DEMO.grafana_user) $('grafanaUserHint').textContent = DEMO.grafana_user;
+      if (DEMO.grafana_password) $('grafanaPassHint').textContent = DEMO.grafana_password;
+      else $('grafanaPassHint').textContent = '(see server .grafana_admin_password)';
+    }
+
+    function loadSettings() {
+      const stored = localStorage.getItem('gv_api_key');
+      $('apiKey').value = stored || DEMO.api_key || '';
+      $('groupId').value = localStorage.getItem('gv_group_id') || 'default';
+      const dev = localStorage.getItem('gv_device_id');
+      if (dev) $('deviceId').dataset.pending = dev;
+    }
+    function saveSettings() {
+      localStorage.setItem('gv_api_key', $('apiKey').value.trim());
+      localStorage.setItem('gv_group_id', $('groupId').value.trim());
+      localStorage.setItem('gv_device_id', $('deviceId').value);
+    }
+
+    async function apiGet(path) {
+      const key = $('apiKey').value.trim();
+      if (!key) throw new Error('API key required');
+      const res = await fetch(API + path, { headers: { 'X-API-Key': key } });
+      if (!res.ok) throw new Error(await res.text());
+      return res.json();
+    }
+
+    function levelClass(l) { return 'lvl-' + Math.min(2, Math.max(0, l)); }
+    function levelName(l) { return ['OK', 'WARN', 'ALERT'][l] || '?'; }
+    function fmtTs(ms) {
+      return new Date(ms).toLocaleString();
+    }
+    function fmtPc(pc) {
+      if (pc == null) return '—';
+      return '0x' + pc.toString(16).padStart(8, '0');
+    }
+    function fmtExcCause(c) {
+      if (c == null) return '—';
+      const names = {
+        0: 'IllegalInstruction', 1: 'Syscall', 2: 'InstrFetchError', 3: 'LoadStoreError',
+        4: 'Level1Interrupt', 5: 'Alloca', 6: 'IntegerDivideByZero', 7: 'PCValue',
+        8: 'Privileged', 9: 'LoadStoreAlignment', 12: 'InstrPIFData', 13: 'LoadStorePIF',
+        14: 'InstrFetchProhibited', 15: 'LoadStoreProhibited',
+      };
+      return names[c] ? `${names[c]} (${c})` : String(c);
+    }
+    function fmtBacktraceFull(bt, detail) {
+      if (detail && detail.frames && detail.frames.length) {
+        return detail.frames.map((f, i) =>
+          `${i}: ${f.symbol || fmtPc(f.pc)}${f.pc != null ? ' @ ' + fmtPc(f.pc) : ''}`
+        ).join('\n');
+      }
+      if (!bt || !bt.length) return '—';
+      return bt.map((x, i) => `${i}: ${fmtPc(x)}`).join('\n');
+    }
+    function fmtBacktrace(bt, detail) {
+      if (detail && detail.frames && detail.frames.length) {
+        return detail.frames.slice(0, 3).map((f) => f.symbol || fmtPc(f.pc)).join('; ');
+      }
+      if (!bt || !bt.length) return '—';
+      return bt.slice(0, 4).map((x) => fmtPc(x)).join(' ');
+    }
+
+    let lastCrashes = [];
+
+    function crashDetailText(c) {
+      const lines = [
+        `device_id: ${c.device_id}`,
+        `group_id: ${c.group_id || '—'}`,
+        `ts_ms: ${c.ts_ms} (${fmtTs(c.ts_ms)})`,
+        `seq: ${c.seq}`,
+        `reason: ${c.reason || '—'}`,
+        `pc: ${fmtPc(c.pc)}`,
+        `exccause: ${fmtExcCause(c.exccause)}`,
+        `excvaddr: ${c.excvaddr != null ? fmtPc(c.excvaddr) : '—'}`,
+        `thread: ${c.thread_name || '—'}`,
+        `fw_version: ${c.fw_version || '—'}`,
+        `reset_reason: ${c.reset_reason ?? '—'}`,
+        `uptime_ms: ${c.uptime_ms ?? '—'}`,
+        '',
+        'Backtrace / symbols:',
+        fmtBacktraceFull(c.backtrace, c.detail),
+      ];
+      if (c.detail && Object.keys(c.detail).length) {
+        lines.push('', 'detail JSON:', JSON.stringify(c.detail, null, 2));
+      }
+      return lines.join('\n');
+    }
+
+    function showCrashModal(c) {
+      $('crashModalBody').textContent = crashDetailText(c);
+      $('crashModal').showModal();
+    }
+
+    function renderCrashSummary(crashes, devices) {
+      const el = $('crashSummary');
+      const meta = $('crashSummaryMeta');
+      if (!crashes.length) {
+        el.textContent = 'No crashes';
+        el.className = 'fusion lvl-0';
+        const total = devices.reduce((s, d) => s + (d.crash_count || 0), 0);
+        meta.textContent = total > 0
+          ? `${total} crash(es) in DB — select device or group scope`
+          : 'Inject a test fault from debug firmware to populate';
+        return;
+      }
+      const c = crashes[0];
+      el.textContent = c.reason || 'crash';
+      el.className = 'fusion lvl-2';
+      meta.textContent =
+        `${fmtTs(c.ts_ms)} · ${c.device_id} · PC ${fmtPc(c.pc)} · ${crashes.length} shown`;
+    }
+
+    function renderCrashes(crashes, showDevice) {
+      const tbody = $('crashRows');
+      const hint = $('crashHint');
+      tbody.innerHTML = '';
+      lastCrashes = crashes;
+      if (!crashes.length) {
+        hint.style.display = 'block';
+        return;
+      }
+      hint.style.display = 'none';
+      crashes.forEach((c, idx) => {
+        const tr = document.createElement('tr');
+        tr.className = 'crash-row';
+        tr.innerHTML =
+          `<td>${fmtTs(c.ts_ms)}</td>` +
+          `<td>${showDevice ? (c.device_id || '—') : '—'}</td>` +
+          `<td>${c.seq}</td>` +
+          `<td>${c.reason || '—'}</td>` +
+          `<td class="crash-pc">${fmtPc(c.pc)}</td>` +
+          `<td>${fmtExcCause(c.exccause)}</td>` +
+          `<td>${c.thread_name || '—'}</td>` +
+          `<td>${c.fw_version || '—'}</td>` +
+          `<td>${c.uptime_ms != null ? (c.uptime_ms / 1000).toFixed(1) + 's' : '—'}</td>` +
+          `<td class="crash-pc">${fmtBacktrace(c.backtrace, c.detail)}</td>`;
+        tr.addEventListener('click', () => showCrashModal(c));
+        tbody.appendChild(tr);
+      });
+    }
+
+    function drawSpectrum(spec) {
+      const canvas = $('spectrumChart');
+      const ctx = canvas.getContext('2d');
+      const w = canvas.width, h = canvas.height;
+      ctx.fillStyle = '#010409';
+      ctx.fillRect(0, 0, w, h);
+      if (!spec || !spec.bins || !spec.bins.length) {
+        $('spectrumMeta').textContent = 'No spectrum data';
+        return;
+      }
+      const bins = spec.bins;
+      const max = Math.max(...bins, 1e-6);
+      const barW = w / bins.length;
+      ctx.fillStyle = '#58a6ff';
+      for (let i = 0; i < bins.length; i++) {
+        const bh = (bins[i] / max) * (h - 20);
+        ctx.fillRect(i * barW, h - bh, Math.max(1, barW - 1), bh);
+      }
+      ctx.strokeStyle = '#f85149';
+      if (spec.peak_hz != null) {
+        const idx = Math.round(spec.peak_hz / spec.bin_hz);
+        ctx.beginPath();
+        ctx.moveTo(idx * barW, 0);
+        ctx.lineTo(idx * barW, h);
+        ctx.stroke();
+      }
+      $('spectrumMeta').textContent =
+        `seq=${spec.seq} ${spec.sample_hz}Hz bin=${spec.bin_hz.toFixed(2)}Hz peak=${spec.peak_hz?.toFixed(1) ?? '—'}Hz`;
+    }
+
+    async function apiPut(path, body) {
+      const key = $('apiKey').value.trim();
+      if (!key) throw new Error('API key required');
+      const res = await fetch(API + path, {
+        method: 'PUT',
+        headers: { 'X-API-Key': key, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      return res.json();
+    }
+
+    let lastConfigRev = 0;
+
+    async function loadDeviceConfig() {
+      const dev = $('deviceId').value;
+      if (!dev) return;
+      try {
+        const row = await apiGet('/devices/' + encodeURIComponent(dev) + '/config');
+        lastConfigRev = row.revision || 0;
+        $('configMeta').textContent =
+          `rev=${row.revision} source=${row.source} ts=${fmtTs(row.ts_ms)}` +
+          (row.app_version ? ` app=${row.app_version}` : '');
+        $('configEditor').value = JSON.stringify(row.config || {}, null, 2);
+      } catch (e) {
+        $('configMeta').textContent = 'No config stored yet';
+        $('configEditor').value = JSON.stringify({
+          schema: 'device.config.v1',
+          revision: Math.floor(Date.now() / 1000),
+          profile: { power_profile: 2, cpu_mhz: 80, imu_sample_hz: 10 },
+          vibro: { schedule_mode: 0, interval_sec: 60, window_sec: 15 },
+          mix: { every: 0, ratio: 0 },
+        }, null, 2);
+      }
+    }
+
+    async function saveDeviceConfig() {
+      const dev = $('deviceId').value;
+      if (!dev) return;
+      let cfg;
+      try {
+        cfg = JSON.parse($('configEditor').value);
+      } catch (e) {
+        $('statusBar').textContent = 'Config JSON invalid: ' + e.message;
+        return;
+      }
+      const rev = Math.max(lastConfigRev + 1, Math.floor(Date.now() / 1000));
+      const row = await apiPut('/devices/' + encodeURIComponent(dev) + '/config', {
+        revision: rev,
+        source: 'be',
+        config: cfg,
+      });
+      lastConfigRev = row.revision;
+      $('configMeta').textContent = `Saved rev=${row.revision}`;
+      $('statusBar').textContent = 'Config saved — phone/ESP should pull if rev > device cfgseq';
+    }
+
+    async function refreshAll() {
+      saveSettings();
+      $('statusBar').textContent = 'Loading…';
+      try {
+        const group = encodeURIComponent($('groupId').value.trim() || 'default');
+        const [devices, fusion] = await Promise.all([
+          apiGet('/devices?group_id=' + group),
+          apiGet('/groups/' + group + '/status'),
+        ]);
+
+        const sel = $('deviceId');
+        const prev = sel.value || sel.dataset.pending || '';
+        sel.innerHTML = '';
+        devices.forEach((d) => {
+          const o = document.createElement('option');
+          o.value = d.device_id;
+          o.textContent = `${d.device_id} (${d.verdict_count}v/${d.crash_count}c) L${d.latest_level ?? '?'}`;
+          sel.appendChild(o);
+        });
+        if (prev && [...sel.options].some((o) => o.value === prev)) sel.value = prev;
+        else if (sel.options.length) sel.value = sel.options[0].value;
+
+        $('fusionLevel').textContent = levelName(fusion.fused_level);
+        $('fusionLevel').className = 'fusion ' + levelClass(fusion.fused_level);
+        $('fusionMeta').textContent =
+          `${fusion.reporting_count}/${fusion.device_count} reporting · confidence ${(fusion.confidence * 100).toFixed(0)}%`;
+
+        const dev = sel.value;
+        if (!dev) {
+          $('statusBar').textContent = 'No devices in group.';
+          return;
+        }
+
+        const groupScope = document.querySelector('input[name="crashScope"]:checked')?.value === 'group';
+        const crashPath = groupScope
+          ? '/crashes?group_id=' + group + '&limit=50'
+          : '/devices/' + encodeURIComponent(dev) + '/crashes?limit=30';
+
+        const [verdicts, spectra, crashes] = await Promise.all([
+          apiGet('/devices/' + encodeURIComponent(dev) + '/verdicts?limit=30'),
+          apiGet('/devices/' + encodeURIComponent(dev) + '/spectra?limit=1'),
+          apiGet(crashPath),
+        ]);
+
+        const tbody = $('verdictRows');
+        tbody.innerHTML = '';
+        verdicts.forEach((v) => {
+          const tr = document.createElement('tr');
+          tr.innerHTML =
+            `<td>${fmtTs(v.ts_ms)}</td><td>${v.seq}</td>` +
+            `<td class="${levelClass(v.level)}">${levelName(v.level)}</td>` +
+            `<td>${v.rms?.toFixed(4) ?? '—'}</td><td>${v.peak?.toFixed(4) ?? '—'}</td>` +
+            `<td>${v.corr?.toFixed(3) ?? '—'}</td><td>${v.rms_delta?.toFixed(4) ?? '—'}</td>` +
+            `<td>${v.edge_score != null ? v.edge_score.toFixed(2) + (v.edge_risk ? ' ' + v.edge_risk : '') : '—'}</td>`;
+          tbody.appendChild(tr);
+        });
+
+        drawSpectrum(spectra[0] || null);
+        renderCrashSummary(crashes, devices);
+        renderCrashes(crashes, groupScope);
+        await loadDeviceConfig();
+        $('statusBar').textContent =
+          `Updated ${new Date().toLocaleTimeString()} · ${verdicts.length} verdicts · ${crashes.length} crashes`;
+      } catch (e) {
+        $('statusBar').textContent = 'Error: ' + e.message;
+      }
+    }
+
+    function phoneSetupLink() {
+      const key = $('apiKey').value.trim();
+      if (!key) throw new Error('API key required');
+      const base = window.location.origin + '/app/good_vibes';
+      const params = new URLSearchParams({
+        u: base,
+        k: key,
+        g: $('groupId').value.trim() || 'default',
+      });
+      const dev = $('deviceId').value.trim();
+      if (dev) params.set('d', dev);
+      return 'goodvibes://cloud?' + params.toString();
+    }
+
+    loadSettings();
+    applyDemoHints();
+    $('copyApiKeyBtn').addEventListener('click', async () => {
+      const key = $('apiKey').value.trim();
+      if (!key) return;
+      try {
+        await navigator.clipboard.writeText(key);
+        $('statusBar').textContent = 'API key copied to clipboard.';
+      } catch {
+        $('statusBar').textContent = 'Copy failed — select the key manually.';
+      }
+    });
+    $('phoneSetupBtn').addEventListener('click', async () => {
+      try {
+        const link = phoneSetupLink();
+        await navigator.clipboard.writeText(link);
+        $('statusBar').textContent = 'Phone setup link copied — paste in app or tap link on phone.';
+      } catch (e) {
+        $('statusBar').textContent = 'Error: ' + e.message;
+      }
+    });
+    $('refreshBtn').addEventListener('click', refreshAll);
+    $('configLoadBtn').addEventListener('click', loadDeviceConfig);
+    $('configSaveBtn').addEventListener('click', () => saveDeviceConfig().catch((e) => {
+      $('statusBar').textContent = 'Error: ' + e.message;
+    }));
+    $('crashModalClose').addEventListener('click', () => $('crashModal').close());
+    document.querySelectorAll('input[name="crashScope"]').forEach((el) => {
+      el.addEventListener('change', refreshAll);
+    });
+    setInterval(refreshAll, 30000);
+    if ($('apiKey').value.trim()) refreshAll();
+  </script>
+</body>
+</html>

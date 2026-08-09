@@ -1,0 +1,27 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://apps.f0xx.org/schema/crash.v1.json",
+  "title": "imu.crash.v1",
+  "type": "object",
+  "required": ["type", "ts_ms", "seq"],
+  "additionalProperties": false,
+  "properties": {
+    "type": { "const": "crash" },
+    "ts_ms": { "type": "integer", "minimum": 0 },
+    "seq": { "type": "integer", "minimum": 0 },
+    "reason": { "type": "string", "maxLength": 128 },
+    "pc": { "type": "integer", "minimum": 0 },
+    "exccause": { "type": "integer", "minimum": 0 },
+    "excvaddr": { "type": "integer", "minimum": 0 },
+    "thread_name": { "type": "string", "maxLength": 32 },
+    "fw_version": { "type": "string", "maxLength": 64 },
+    "reset_reason": { "type": "integer", "minimum": 0 },
+    "uptime_ms": { "type": "integer", "minimum": 0 },
+    "backtrace": {
+      "type": "array",
+      "maxItems": 32,
+      "items": { "type": "integer", "minimum": 0 }
+    },
+    "detail": { "type": "object" }
+  }
+}

@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/black"
+    android:baselineAligned="false"
+    android:orientation="horizontal"
+    android:padding="8dp">
+
+    <com.esp32s3.imusim.ImuSceneView
+        android:id="@+id/sceneView"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1" />
+
+    <ScrollView
+        android:layout_width="260dp"
+        android:layout_height="match_parent"
+        android:layout_marginStart="8dp"
+        android:fillViewport="true">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/statusText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:paddingBottom="4dp"
+                android:text="@string/status_disconnected"
+                android:textColor="@android:color/white"
+                android:textSize="12sp" />
+
+            <RadioGroup
+                android:id="@+id/modeGroup"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical">
+
+                <RadioButton
+                    android:id="@+id/modeRaw"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="@string/mode_raw"
+                    android:textColor="@android:color/white" />
+
+                <RadioButton
+                    android:id="@+id/modeComputed"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:checked="true"
+                    android:text="@string/mode_computed"
+                    android:textColor="@android:color/white" />
+
+                <RadioButton
+                    android:id="@+id/modeScene"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="@string/mode_scene"
+                    android:textColor="@android:color/white" />
+            </RadioGroup>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/poll_ms"
+                    android:textColor="@android:color/white"
+                    android:textSize="12sp" />
+
+                <EditText
+                    android:id="@+id/pollEdit"
+                    android:layout_width="56dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:inputType="number"
+                    android:text="33"
+                    android:textColor="@android:color/white" />
+
+                <Button
+                    android:id="@+id/connectButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:layout_weight="1"
+                    android:text="@string/connect" />
+            </LinearLayout>
+
+            <Button
+                android:id="@+id/espScreenButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="@string/esp_screen_off" />
+
+            <Button
+                android:id="@+id/vibroMenuButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="@string/menu_vibro" />
+
+            <Button
+                android:id="@+id/deviceMenuButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/menu_device" />
+
+            <TextView
+                android:id="@+id/vibroText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:paddingTop="4dp"
+                android:text="@string/vibro_idle"
+                android:textColor="#88ccff"
+                android:textSize="11sp" />
+        </LinearLayout>
+    </ScrollView>
+</LinearLayout>
