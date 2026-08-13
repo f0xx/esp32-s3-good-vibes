@@ -134,6 +134,54 @@
       padding: 0.25rem 0.5rem;
       font-size: 0.78rem;
     }
+    .latest-crash-card {
+      cursor: pointer;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease;
+    }
+    .latest-crash-card:not(.latest-crash-empty):hover {
+      border-color: var(--accent);
+      box-shadow: 0 0 14px rgba(88, 166, 255, 0.4);
+    }
+    .latest-crash-empty { cursor: default; }
+    .table-scroll { overflow-x: auto; }
+    .crash-table { table-layout: fixed; min-width: 100%; }
+    .crash-table th {
+      position: relative;
+      user-select: none;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .crash-table th.dragging { opacity: 0.45; }
+    .crash-table th.drag-over { box-shadow: inset 0 -2px 0 var(--accent); }
+    .col-resize-handle {
+      position: absolute;
+      top: 0;
+      right: 0;
+      width: 6px;
+      height: 100%;
+      cursor: col-resize;
+    }
+    .col-resize-handle:hover { background: rgba(88, 166, 255, 0.25); }
+    .crash-row-highlight {
+      background: rgba(88, 166, 255, 0.12) !important;
+      box-shadow: inset 0 0 0 1px var(--accent);
+    }
+    .pagination-bar {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+      align-items: center;
+      margin-top: 0.75rem;
+      font-size: 0.85rem;
+      color: var(--muted);
+    }
+    .pagination-bar button { margin: 0; flex: 0; }
+    .pagination-bar button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+      border-color: var(--border);
+    }
   </style>
 </head>
 <body>
@@ -193,7 +241,7 @@
         <div id="fusionLevel" class="fusion lvl-0">—</div>
         <div id="fusionMeta" style="color:var(--muted);font-size:0.85rem"></div>
       </section>
-      <section class="card">
+      <section class="card latest-crash-card latest-crash-empty" id="latestCrashCard" title="Jump to crash in table">
         <h2>Latest crash</h2>
         <div id="crashSummary" class="fusion lvl-0" style="font-size:1rem">—</div>
         <div id="crashSummaryMeta" style="color:var(--muted);font-size:0.85rem"></div>
@@ -205,7 +253,7 @@
       </section>
     </div>
 
-    <section class="card" style="margin-top:1rem">
+    <section class="card" style="margin-top:1rem" id="verdictsSection">
       <h2>Recent verdicts</h2>
       <table>
         <thead>
@@ -213,6 +261,7 @@
         </thead>
         <tbody id="verdictRows"></tbody>
       </table>
+      <div id="verdictPagination" class="pagination-bar"></div>
     </section>
 
     <section class="card" style="margin-top:1rem">
@@ -233,12 +282,13 @@
       </div>
     </section>
 
-    <section class="card" style="margin-top:1rem">
+    <section class="card" style="margin-top:1rem" id="crashReportsSection">
       <h2>Crash reports</h2>
       <p class="empty-hint" id="crashHint">
         Post-mortem from ESP32 fatal errors (panic, WDT, stack overflow). Relay path:
         device → BLE → phone → <code>POST /v1/ingest/crashes</code> → this table.
         Debug builds: phone <strong>Device → Crash debug (dev)</strong> to inject faults or run BIST.
+        Drag column headers to reorder; drag the right edge to resize — layout is saved in this browser.
       </p>
       <div class="row" style="margin-bottom:0.75rem">
         <div style="flex:0">
@@ -248,15 +298,14 @@
           <label><input type="radio" name="crashScope" value="group" /> Whole group</label>
         </div>
       </div>
-      <table>
-        <thead>
-          <tr>
-            <th>Time</th><th>Device</th><th>Seq</th><th>Reason</th><th>PC</th><th>Cause</th>
-            <th>Thread</th><th>FW</th><th>Uptime</th><th>Backtrace</th>
-          </tr>
-        </thead>
-        <tbody id="crashRows"></tbody>
-      </table>
+      <div class="table-scroll">
+        <table id="crashTable" class="crash-table">
+          <colgroup id="crashColgroup"></colgroup>
+          <thead id="crashThead"></thead>
+          <tbody id="crashRows"></tbody>
+        </table>
+      </div>
+      <div id="crashPagination" class="pagination-bar"></div>
     </section>
 
     <dialog id="crashModal" class="crash-modal">
@@ -350,6 +399,202 @@
     }
 
     let lastCrashes = [];
+    let lastVerdicts = [];
+    let latestCrashKey = null;
+    let crashPageOffset = 0;
+    let verdictPageOffset = 0;
+    let highlightCrashKey = null;
+    const PAGE_SIZE = 25;
+    const FETCH_LIMIT = 500;
+
+    const CRASH_COL_DEFS = [
+      { id: 'time', label: 'Time', min: 72, default: 140 },
+      { id: 'device', label: 'Device', min: 64, default: 96 },
+      { id: 'seq', label: 'Seq', min: 40, default: 48 },
+      { id: 'reason', label: 'Reason', min: 72, default: 120 },
+      { id: 'pc', label: 'PC', min: 72, default: 96 },
+      { id: 'cause', label: 'Cause', min: 80, default: 130 },
+      { id: 'thread', label: 'Thread', min: 64, default: 88 },
+      { id: 'fw', label: 'FW', min: 64, default: 100 },
+      { id: 'uptime', label: 'Uptime', min: 56, default: 72 },
+      { id: 'backtrace', label: 'Backtrace', min: 120, default: 220 },
+    ];
+
+    function crashRowKey(c) {
+      return `${c.device_id || ''}|${c.seq}|${c.pc ?? ''}|${c.ts_ms ?? ''}`;
+    }
+
+    function loadCrashColPrefs() {
+      let order = CRASH_COL_DEFS.map((c) => c.id);
+      let widths = {};
+      CRASH_COL_DEFS.forEach((c) => { widths[c.id] = c.default; });
+      try {
+        const savedOrder = JSON.parse(localStorage.getItem('gv_crash_col_order') || 'null');
+        const savedWidths = JSON.parse(localStorage.getItem('gv_crash_col_widths') || 'null');
+        if (Array.isArray(savedOrder) && savedOrder.length === CRASH_COL_DEFS.length &&
+            savedOrder.every((id) => CRASH_COL_DEFS.some((c) => c.id === id))) {
+          order = savedOrder;
+        }
+        if (savedWidths && typeof savedWidths === 'object') {
+          CRASH_COL_DEFS.forEach((c) => {
+            const w = savedWidths[c.id];
+            if (typeof w === 'number' && w >= c.min) widths[c.id] = w;
+          });
+        }
+      } catch { /* ignore corrupt prefs */ }
+      return { order, widths };
+    }
+
+    let crashColPrefs = loadCrashColPrefs();
+
+    function saveCrashColPrefs() {
+      localStorage.setItem('gv_crash_col_order', JSON.stringify(crashColPrefs.order));
+      localStorage.setItem('gv_crash_col_widths', JSON.stringify(crashColPrefs.widths));
+    }
+
+    function crashCellHtml(colId, c, showDevice) {
+      switch (colId) {
+        case 'time': return fmtTs(c.ts_ms);
+        case 'device': return showDevice ? (c.device_id || '—') : '—';
+        case 'seq': return String(c.seq);
+        case 'reason': return c.reason || '—';
+        case 'pc': return fmtPc(c.pc);
+        case 'cause': return fmtExcCause(c.exccause);
+        case 'thread': return c.thread_name || '—';
+        case 'fw': return c.fw_version || '—';
+        case 'uptime':
+          return c.uptime_ms != null ? (c.uptime_ms / 1000).toFixed(1) + 's' : '—';
+        case 'backtrace': return fmtBacktrace(c.backtrace, c.detail);
+        default: return '—';
+      }
+    }
+
+    function buildCrashThead() {
+      const thead = $('crashThead');
+      const colgroup = $('crashColgroup');
+      thead.innerHTML = '';
+      colgroup.innerHTML = '';
+      const tr = document.createElement('tr');
+
+      crashColPrefs.order.forEach((colId, idx) => {
+        const def = CRASH_COL_DEFS.find((c) => c.id === colId);
+        if (!def) return;
+        const col = document.createElement('col');
+        col.style.width = crashColPrefs.widths[colId] + 'px';
+        colgroup.appendChild(col);
+
+        const th = document.createElement('th');
+        th.textContent = def.label;
+        th.draggable = true;
+        th.dataset.colId = colId;
+        th.title = 'Drag to reorder · drag right edge to resize';
+
+        th.addEventListener('dragstart', (e) => {
+          th.classList.add('dragging');
+          e.dataTransfer.setData('text/plain', colId);
+          e.dataTransfer.effectAllowed = 'move';
+        });
+        th.addEventListener('dragend', () => th.classList.remove('dragging'));
+        th.addEventListener('dragover', (e) => {
+          e.preventDefault();
+          th.classList.add('drag-over');
+        });
+        th.addEventListener('dragleave', () => th.classList.remove('drag-over'));
+        th.addEventListener('drop', (e) => {
+          e.preventDefault();
+          th.classList.remove('drag-over');
+          const fromId = e.dataTransfer.getData('text/plain');
+          const toId = colId;
+          if (!fromId || fromId === toId) return;
+          const order = [...crashColPrefs.order];
+          const fromIdx = order.indexOf(fromId);
+          const toIdx = order.indexOf(toId);
+          if (fromIdx < 0 || toIdx < 0) return;
+          order.splice(fromIdx, 1);
+          order.splice(toIdx, 0, fromId);
+          crashColPrefs.order = order;
+          saveCrashColPrefs();
+          buildCrashThead();
+          renderCrashes(lastCrashes, document.querySelector('input[name="crashScope"]:checked')?.value === 'group');
+        });
+
+        if (idx < crashColPrefs.order.length - 1) {
+          const handle = document.createElement('span');
+          handle.className = 'col-resize-handle';
+          handle.title = 'Resize column';
+          handle.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const startX = e.clientX;
+            const startW = crashColPrefs.widths[colId];
+            const minW = def.min;
+            function onMove(ev) {
+              crashColPrefs.widths[colId] = Math.max(minW, startW + (ev.clientX - startX));
+              col.style.width = crashColPrefs.widths[colId] + 'px';
+            }
+            function onUp() {
+              document.removeEventListener('mousemove', onMove);
+              document.removeEventListener('mouseup', onUp);
+              saveCrashColPrefs();
+            }
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+          });
+          th.appendChild(handle);
+        }
+
+        tr.appendChild(th);
+      });
+      thead.appendChild(tr);
+    }
+
+    function renderPaginationBar(containerId, total, pageOffset, onChange) {
+      const el = $(containerId);
+      el.innerHTML = '';
+      if (total <= PAGE_SIZE) return;
+      const start = pageOffset + 1;
+      const end = Math.min(pageOffset + PAGE_SIZE, total);
+      const span = document.createElement('span');
+      span.textContent = `Showing ${start}–${end} of ${total}`;
+      const prev = document.createElement('button');
+      prev.type = 'button';
+      prev.textContent = '−25 prev';
+      prev.disabled = pageOffset <= 0;
+      prev.addEventListener('click', () => onChange(Math.max(0, pageOffset - PAGE_SIZE)));
+      const next = document.createElement('button');
+      next.type = 'button';
+      next.textContent = '+25 next';
+      next.disabled = pageOffset + PAGE_SIZE >= total;
+      next.addEventListener('click', () => onChange(pageOffset + PAGE_SIZE));
+      el.appendChild(prev);
+      el.appendChild(next);
+      el.appendChild(span);
+    }
+
+    function scrollToCrashRow(key) {
+      if (!key) return;
+      const rows = document.querySelectorAll('#crashRows tr[data-crash-key]');
+      for (const row of rows) {
+        if (row.dataset.crashKey === key) {
+          row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          row.classList.add('crash-row-highlight');
+          setTimeout(() => row.classList.remove('crash-row-highlight'), 4000);
+          break;
+        }
+      }
+    }
+
+    function jumpToLatestCrash() {
+      if (!latestCrashKey || !lastCrashes.length) return;
+      const idx = lastCrashes.findIndex((c) => crashRowKey(c) === latestCrashKey);
+      if (idx < 0) return;
+      crashPageOffset = Math.floor(idx / PAGE_SIZE) * PAGE_SIZE;
+      highlightCrashKey = latestCrashKey;
+      const groupScope = document.querySelector('input[name="crashScope"]:checked')?.value === 'group';
+      renderCrashes(lastCrashes, groupScope);
+      $('crashReportsSection').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      requestAnimationFrame(() => scrollToCrashRow(latestCrashKey));
+    }
 
     function crashDetailText(c) {
       const lines = [
@@ -383,20 +628,51 @@
     function renderCrashSummary(crashes, devices) {
       const el = $('crashSummary');
       const meta = $('crashSummaryMeta');
+      const card = $('latestCrashCard');
       if (!crashes.length) {
         el.textContent = 'No crashes';
         el.className = 'fusion lvl-0';
         const total = devices.reduce((s, d) => s + (d.crash_count || 0), 0);
         meta.textContent = total > 0
           ? `${total} crash(es) in DB — select device or group scope`
-          : 'Inject a test fault from debug firmware to populate';
+          : 'Tap to jump when a crash is loaded';
+        latestCrashKey = null;
+        card.classList.add('latest-crash-empty');
+        card.title = '';
         return;
       }
       const c = crashes[0];
+      latestCrashKey = crashRowKey(c);
+      card.classList.remove('latest-crash-empty');
+      card.title = 'Jump to this crash in the table below';
       el.textContent = c.reason || 'crash';
       el.className = 'fusion lvl-2';
       meta.textContent =
-        `${fmtTs(c.ts_ms)} · ${c.device_id} · PC ${fmtPc(c.pc)} · ${crashes.length} shown`;
+        `${fmtTs(c.ts_ms)} · ${c.device_id} · PC ${fmtPc(c.pc)} · ${crashes.length} loaded`;
+    }
+
+    function renderVerdicts(verdicts) {
+      lastVerdicts = verdicts;
+      const tbody = $('verdictRows');
+      tbody.innerHTML = '';
+      if (verdictPageOffset >= verdicts.length && verdicts.length > 0) {
+        verdictPageOffset = Math.max(0, verdicts.length - PAGE_SIZE);
+      }
+      const slice = verdicts.slice(verdictPageOffset, verdictPageOffset + PAGE_SIZE);
+      slice.forEach((v) => {
+        const tr = document.createElement('tr');
+        tr.innerHTML =
+          `<td>${fmtTs(v.ts_ms)}</td><td>${v.seq}</td>` +
+          `<td class="${levelClass(v.level)}">${levelName(v.level)}</td>` +
+          `<td>${v.rms?.toFixed(4) ?? '—'}</td><td>${v.peak?.toFixed(4) ?? '—'}</td>` +
+          `<td>${v.corr?.toFixed(3) ?? '—'}</td><td>${v.rms_delta?.toFixed(4) ?? '—'}</td>` +
+          `<td>${v.edge_score != null ? v.edge_score.toFixed(2) + (v.edge_risk ? ' ' + v.edge_risk : '') : '—'}</td>`;
+        tbody.appendChild(tr);
+      });
+      renderPaginationBar('verdictPagination', verdicts.length, verdictPageOffset, (off) => {
+        verdictPageOffset = off;
+        renderVerdicts(lastVerdicts);
+      });
     }
 
     function renderCrashes(crashes, showDevice) {
@@ -406,26 +682,38 @@
       lastCrashes = crashes;
       if (!crashes.length) {
         hint.style.display = 'block';
+        renderPaginationBar('crashPagination', 0, 0, () => {});
         return;
       }
       hint.style.display = 'none';
-      crashes.forEach((c, idx) => {
+      if (crashPageOffset >= crashes.length) {
+        crashPageOffset = Math.max(0, crashes.length - PAGE_SIZE);
+      }
+      const slice = crashes.slice(crashPageOffset, crashPageOffset + PAGE_SIZE);
+      slice.forEach((c) => {
+        const key = crashRowKey(c);
         const tr = document.createElement('tr');
         tr.className = 'crash-row';
-        tr.innerHTML =
-          `<td>${fmtTs(c.ts_ms)}</td>` +
-          `<td>${showDevice ? (c.device_id || '—') : '—'}</td>` +
-          `<td>${c.seq}</td>` +
-          `<td>${c.reason || '—'}</td>` +
-          `<td class="crash-pc">${fmtPc(c.pc)}</td>` +
-          `<td>${fmtExcCause(c.exccause)}</td>` +
-          `<td>${c.thread_name || '—'}</td>` +
-          `<td>${c.fw_version || '—'}</td>` +
-          `<td>${c.uptime_ms != null ? (c.uptime_ms / 1000).toFixed(1) + 's' : '—'}</td>` +
-          `<td class="crash-pc">${fmtBacktrace(c.backtrace, c.detail)}</td>`;
+        tr.dataset.crashKey = key;
+        const cells = crashColPrefs.order.map((colId) => {
+          const cls = (colId === 'pc' || colId === 'backtrace') ? ' class="crash-pc"' : '';
+          return `<td${cls}>${crashCellHtml(colId, c, showDevice)}</td>`;
+        });
+        tr.innerHTML = cells.join('');
         tr.addEventListener('click', () => showCrashModal(c));
+        if (highlightCrashKey === key) {
+          tr.classList.add('crash-row-highlight');
+        }
         tbody.appendChild(tr);
       });
+      renderPaginationBar('crashPagination', crashes.length, crashPageOffset, (off) => {
+        crashPageOffset = off;
+        renderCrashes(lastCrashes, showDevice);
+      });
+      if (highlightCrashKey) {
+        requestAnimationFrame(() => scrollToCrashRow(highlightCrashKey));
+        highlightCrashKey = null;
+      }
     }
 
     function drawSpectrum(spec) {
@@ -550,28 +838,16 @@
 
         const groupScope = document.querySelector('input[name="crashScope"]:checked')?.value === 'group';
         const crashPath = groupScope
-          ? '/crashes?group_id=' + group + '&limit=50'
-          : '/devices/' + encodeURIComponent(dev) + '/crashes?limit=30';
+          ? '/crashes?group_id=' + group + '&limit=' + FETCH_LIMIT
+          : '/devices/' + encodeURIComponent(dev) + '/crashes?limit=' + FETCH_LIMIT;
 
         const [verdicts, spectra, crashes] = await Promise.all([
-          apiGet('/devices/' + encodeURIComponent(dev) + '/verdicts?limit=30'),
+          apiGet('/devices/' + encodeURIComponent(dev) + '/verdicts?limit=' + FETCH_LIMIT),
           apiGet('/devices/' + encodeURIComponent(dev) + '/spectra?limit=1'),
           apiGet(crashPath),
         ]);
 
-        const tbody = $('verdictRows');
-        tbody.innerHTML = '';
-        verdicts.forEach((v) => {
-          const tr = document.createElement('tr');
-          tr.innerHTML =
-            `<td>${fmtTs(v.ts_ms)}</td><td>${v.seq}</td>` +
-            `<td class="${levelClass(v.level)}">${levelName(v.level)}</td>` +
-            `<td>${v.rms?.toFixed(4) ?? '—'}</td><td>${v.peak?.toFixed(4) ?? '—'}</td>` +
-            `<td>${v.corr?.toFixed(3) ?? '—'}</td><td>${v.rms_delta?.toFixed(4) ?? '—'}</td>` +
-            `<td>${v.edge_score != null ? v.edge_score.toFixed(2) + (v.edge_risk ? ' ' + v.edge_risk : '') : '—'}</td>`;
-          tbody.appendChild(tr);
-        });
-
+        renderVerdicts(verdicts);
         drawSpectrum(spectra[0] || null);
         renderCrashSummary(crashes, devices);
         renderCrashes(crashes, groupScope);
@@ -599,6 +875,8 @@
 
     loadSettings();
     applyDemoHints();
+    buildCrashThead();
+    $('latestCrashCard').addEventListener('click', jumpToLatestCrash);
     $('copyApiKeyBtn').addEventListener('click', async () => {
       const key = $('apiKey').value.trim();
       if (!key) return;

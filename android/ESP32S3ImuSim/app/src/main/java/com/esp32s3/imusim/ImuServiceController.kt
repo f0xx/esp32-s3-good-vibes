@@ -29,12 +29,16 @@ class ImuServiceController(
         fun onNetProfiles(json: String) {}
         fun onNetStatus(json: String) {}
         fun onVibroCaption(caption: String) {}
+        fun onVibroRefList(json: String) {}
         fun onBanner(level: StatusBannerLevel, message: String) {}
         fun onEspScreenState(on: Boolean) {}
+        fun onCaptionEpoch(epoch: Int) {}
+        fun onClockState(synced: Boolean, tzMin: Int) {}
     }
 
     private var service: IImuBleService? = null
     private var bound = false
+    private var desiredUiVisible = false
 
     private val callback = object : IImuBleCallback.Stub() {
         override fun onConnectionChanged(connected: Boolean) {
@@ -101,6 +105,10 @@ class ImuServiceController(
             events.onVibroCaption(caption)
         }
 
+        override fun onVibroRefList(json: String) {
+            events.onVibroRefList(json)
+        }
+
         override fun onBanner(level: Int, message: String) {
             val mapped = when (level) {
                 1 -> StatusBannerLevel.WARN
@@ -113,6 +121,14 @@ class ImuServiceController(
         override fun onEspScreenState(on: Boolean) {
             events.onEspScreenState(on)
         }
+
+        override fun onCaptionEpoch(epoch: Int) {
+            events.onCaptionEpoch(epoch)
+        }
+
+        override fun onClockState(synced: Boolean, tzMin: Int) {
+            events.onClockState(synced, tzMin)
+        }
     }
 
     private val connection = object : ServiceConnection {
@@ -121,6 +137,7 @@ class ImuServiceController(
             bound = true
             try {
                 service?.registerCallback(callback)
+                service?.setUiVisible(desiredUiVisible)
                 service?.let { events.onServiceReady(it) }
                 requestState()
             } catch (e: Exception) {
@@ -136,7 +153,9 @@ class ImuServiceController(
     }
 
     fun startAndBind() {
-        val intent = Intent(context, ImuBleForegroundService::class.java)
+        val intent = Intent(context, ImuBleForegroundService::class.java).apply {
+            action = ImuBleForegroundService.ACTION_BLE_RELAY
+        }
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
             context.startForegroundService(intent)
         } else {
@@ -162,6 +181,17 @@ class ImuServiceController(
             service?.requestState()
         } catch (e: Exception) {
             Log.w(TAG, "requestState failed", e)
+        }
+    }
+
+    /** Call from onStart()/onStop(). Stored even if the service isn't bound yet — replayed as
+     *  soon as onServiceConnected fires. */
+    fun setUiVisible(active: Boolean) {
+        desiredUiVisible = active
+        try {
+            service?.setUiVisible(active)
+        } catch (e: Exception) {
+            Log.w(TAG, "setUiVisible failed", e)
         }
     }
 

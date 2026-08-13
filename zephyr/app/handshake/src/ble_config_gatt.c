@@ -13,6 +13,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/sys/atomic.h>
 #include <zephyr/sys/reboot.h>
+#include <zephyr/sys/util.h>
 
 LOG_MODULE_REGISTER(ble_cfg, LOG_LEVEL_INF);
 
@@ -22,10 +23,18 @@ LOG_MODULE_REGISTER(ble_cfg, LOG_LEVEL_INF);
 	BT_UUID_128_ENCODE(0x4a6e0102, 0x0000, 0x1000, 0x8000, 0x00805f9b34fb)
 #define BT_UUID_CONFIG_CMD_VAL \
 	BT_UUID_128_ENCODE(0x4a6e0103, 0x0000, 0x1000, 0x8000, 0x00805f9b34fb)
+/** Read-only: compact JSON list of the 5 reference-profile slots (name/
+ * duration/rms/valid + which one is active). See vibro_ref_store.h. */
+#define BT_UUID_CONFIG_REFLIST_VAL \
+	BT_UUID_128_ENCODE(0x4a6e0104, 0x0000, 0x1000, 0x8000, 0x00805f9b34fb)
 
 static struct bt_uuid_128 cfg_svc_uuid = BT_UUID_INIT_128(BT_UUID_CONFIG_SVC_VAL);
 static struct bt_uuid_128 cfg_data_uuid = BT_UUID_INIT_128(BT_UUID_CONFIG_DATA_VAL);
 static struct bt_uuid_128 cfg_cmd_uuid = BT_UUID_INIT_128(BT_UUID_CONFIG_CMD_VAL);
+static struct bt_uuid_128 cfg_reflist_uuid = BT_UUID_INIT_128(BT_UUID_CONFIG_REFLIST_VAL);
+
+static char g_reflist_json[640];
+static size_t g_reflist_len;
 
 static struct device_config_v1 g_cfg;
 
@@ -84,6 +93,26 @@ static ssize_t write_data(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 	return len;
 }
 
+static ssize_t read_reflist(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
+			    uint16_t len, uint16_t offset)
+{
+	ARG_UNUSED(conn);
+	ARG_UNUSED(attr);
+
+	/* Rebuild only at the start of a read sequence — see the STATUS/DATA
+	 * torn-read comment in ble_imu_gatt.c for why a multi-part ATT long
+	 * read must stay on one generation of the buffer for its whole
+	 * transfer. This store isn't touched by any background poll, so a
+	 * single static buffer (no double-buffering) is sufficient. */
+	if (offset == 0U) {
+		const int n = vibro_capture_list_references_json(g_reflist_json,
+								  sizeof(g_reflist_json));
+
+		g_reflist_len = (n > 0) ? (size_t)n : 0U;
+	}
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, g_reflist_json, g_reflist_len);
+}
+
 static ssize_t write_cmd(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf,
 			 uint16_t len, uint16_t offset, uint8_t flags)
 {
@@ -108,13 +137,39 @@ static ssize_t write_cmd(struct bt_conn *conn, const struct bt_gatt_attr *attr, 
 		imu_pipeline_apply_config();
 		LOG_INF("devcfg commit applied");
 		break;
-	case 3:
-		(void)vibro_capture_start_reference();
-		LOG_INF("vibro reference recording started");
+	case 3: {
+		/* Payload: [3][slot][name...] — slot/name optional for back-compat
+		 * (bare [3] == slot 0, auto-named). */
+		const uint8_t slot = (len >= 2) ? bytes[1] : 0U;
+		char name[VIBRO_REF_NAME_MAX];
+
+		name[0] = '\0';
+		if (len > 2) {
+			const size_t name_len = MIN((size_t)(len - 2), sizeof(name) - 1U);
+
+			memcpy(name, &bytes[2], name_len);
+			name[name_len] = '\0';
+		}
+		(void)vibro_capture_start_reference(slot, name);
 		break;
+	}
 	case 4:
 		(void)vibro_capture_stop_reference();
 		LOG_INF("vibro reference stopped len=%u", (unsigned)vibro_capture_reference_len());
+		break;
+	case 7:
+		if (len >= 2) {
+			const int err = vibro_capture_select_reference(bytes[1]);
+
+			LOG_INF("vibro reference select slot=%u -> %d", bytes[1], err);
+		}
+		break;
+	case 8:
+		if (len >= 2) {
+			const int err = vibro_capture_delete_reference(bytes[1]);
+
+			LOG_INF("vibro reference delete slot=%u -> %d", bytes[1], err);
+		}
 		break;
 	case 5:
 		if (len >= 5) {
@@ -144,7 +199,9 @@ BT_GATT_SERVICE_DEFINE(
 	BT_GATT_CHARACTERISTIC(&cfg_data_uuid.uuid, BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
 			       BT_GATT_PERM_READ | BT_GATT_PERM_WRITE, read_data, write_data, NULL),
 	BT_GATT_CHARACTERISTIC(&cfg_cmd_uuid.uuid, BT_GATT_CHRC_WRITE, BT_GATT_PERM_WRITE, NULL,
-			       write_cmd, NULL), );
+			       write_cmd, NULL),
+	BT_GATT_CHARACTERISTIC(&cfg_reflist_uuid.uuid, BT_GATT_CHRC_READ, BT_GATT_PERM_READ,
+			       read_reflist, NULL, NULL), );
 
 int ble_config_gatt_init(void)
 {

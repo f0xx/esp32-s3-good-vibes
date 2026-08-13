@@ -6,19 +6,31 @@ object ConfigProtocol {
     val SERVICE_UUID: UUID = UUID.fromString("4a6e0101-0000-1000-8000-00805f9b34fb")
     val CHAR_DATA_UUID: UUID = UUID.fromString("4a6e0102-0000-1000-8000-00805f9b34fb")
     val CHAR_CMD_UUID: UUID = UUID.fromString("4a6e0103-0000-1000-8000-00805f9b34fb")
+    /** Read-only: compact JSON list of the 5 reference-profile slots. See vibro_ref_store.h. */
+    val CHAR_REFLIST_UUID: UUID = UUID.fromString("4a6e0104-0000-1000-8000-00805f9b34fb")
 
     /** Must match packed `DeviceConfigV1` on the ESP32 sketch. */
     const val BLOB_SIZE = 188
 
+    /** profiles.txt #2: up to 5 reference-profile slots, 0..VIBRO_REF_STORE_SLOTS-1. */
+    const val VIBRO_REF_SLOT_COUNT = 5
+    /** Must stay under firmware's VIBRO_REF_NAME_MAX (24, incl. nul terminator). */
+    const val VIBRO_REF_NAME_MAX_LEN = 20
+
     const val CMD_RELOAD = 0
     const val CMD_COMMIT = 1
     const val CMD_FACTORY = 2
+    /** Payload: opcode + slot + name bytes; slot/name optional (bare opcode == slot 0, auto-named). */
     const val CMD_VIBRO_REF_START = 3
     const val CMD_VIBRO_REF_STOP = 4
-    /** Payload: [5] + uint32 LE seq — phone confirms verdict/sample offload (F5-rotate). */
+    /** Payload: opcode + uint32 LE seq — phone confirms verdict/sample offload (F5-rotate). */
     const val CMD_OFFLOAD_ACK = 5
     /** Erase Zephyr settings storage partition + reboot (fixes corrupt NVS). */
     const val CMD_ERASE_NVS = 6
+    /** Payload: opcode + slot — load a stored slot as the live/active reference. */
+    const val CMD_VIBRO_REF_SELECT = 7
+    /** Payload: opcode + slot — erase a slot (clears live reference if it was active). */
+    const val CMD_VIBRO_REF_DELETE = 8
 }
 
 object OtaProtocol {

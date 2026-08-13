@@ -19,7 +19,7 @@
 
 LOG_MODULE_REGISTER(crash_rpt, LOG_LEVEL_INF);
 
-#define CRASH_FW_VERSION "handshake v102"
+#define CRASH_FW_VERSION "handshake v121"
 #define CRASH_PARSE_BUF  512U
 
 static uint8_t g_reset_code;
@@ -307,12 +307,15 @@ int crash_report_info_json(char *buf, size_t len)
 		return snprintf(buf, len, "{\"pending\":0,\"fw\":\"%s\"}", CRASH_FW_VERSION);
 	}
 
-	if (g_active_slot >= 0 && crash_ring_slot_pending((uint8_t)g_active_slot)) {
-		return crash_ring_info_json((uint8_t)g_active_slot, buf, len);
-	}
-
+	/* Single-slot detail shortcut only applies while exactly one crash is pending — with 2+
+	 * pending, g_active_slot (set at boot by persist_boot_crash()) being pending is not enough
+	 * to justify skipping the bulk list, since it would silently hide every other pending
+	 * slot from the caller (this previously made the phone/cloud believe only the most
+	 * recently-booted crash existed whenever 2+ had accumulated). */
 	if (pending == 1U) {
-		const int slot = crash_ring_first_pending_slot();
+		const int slot = (g_active_slot >= 0 && crash_ring_slot_pending((uint8_t)g_active_slot))
+					  ? g_active_slot
+					  : crash_ring_first_pending_slot();
 
 		if (slot >= 0) {
 			g_active_slot = (int8_t)slot;
@@ -334,6 +337,23 @@ void crash_report_clear_slot(uint8_t slot)
 	(void)crash_ring_clear_slot(slot);
 	if (g_active_slot == (int8_t)slot) {
 		g_active_slot = -1;
+	}
+	if (crash_ring_pending_count() == 0U) {
+		g_has_pending = false;
+		memset(&g_pending, 0, sizeof(g_pending));
+	}
+}
+
+/* Clears several slots in one flash erase+rewrite cycle instead of N — see
+ * crash_ring_clear_slots()'s doc comment for why chaining N single-slot clears from a BLE GATT
+ * write callback could starve the main-loop stall watchdog and reboot the device mid-clear. */
+void crash_report_clear_slots(const uint8_t *slots, size_t n)
+{
+	(void)crash_ring_clear_slots(slots, n);
+	for (size_t i = 0; i < n; i++) {
+		if (g_active_slot == (int8_t)slots[i]) {
+			g_active_slot = -1;
+		}
 	}
 	if (crash_ring_pending_count() == 0U) {
 		g_has_pending = false;

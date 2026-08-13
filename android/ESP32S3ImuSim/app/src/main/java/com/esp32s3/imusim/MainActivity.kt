@@ -7,6 +7,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.Choreographer
 import android.view.WindowManager
 import android.widget.Button
@@ -17,6 +18,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import org.json.JSONObject
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicReference
 
@@ -40,10 +42,19 @@ class MainActivity : AppCompatActivity() {
     private var imuService: IImuBleService? = null
     private var connected = false
     private var espScreenOn = true
+    /** Last CPU/IMU override choices sent from this UI (0 = auto). Not read back from the
+     *  device — the dialog just remembers what the user picked last within this session. */
+    private var lastCpuMhzOverride = 0
+    private var lastImuHzOverride = 0
+    private var drawFpsCap = 0
+    private var lastDrawApplyUptimeMs = 0L
+    private var blockPreConnectCaptions = false
+    private var captionEpoch = 0
     private var renderMode = ImuProtocol.MODE_COMPUTED
     private var restoringUi = false
     private var crashDebugFirmware = false
     private var sessionCaps = 0
+    private var pendingVibroRefListCallback: ((String) -> Unit)? = null
 
     private val fpsMeter = FpsMeter()
     private var fpsHudRunnable: Runnable? = null
@@ -54,10 +65,26 @@ class MainActivity : AppCompatActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val pendingBatchJson = AtomicReference<String?>(null)
     private var frameCallbackPosted = false
+    private val renderGeneration = java.util.concurrent.atomic.AtomicInteger(0)
     private val frameCallback = Choreographer.FrameCallback {
         frameCallbackPosted = false
         val json = pendingBatchJson.getAndSet(null) ?: return@FrameCallback
-        renderExecutor.execute { prepareAndApplyBatch(json) }
+        val minInterval = drawMinIntervalMs()
+        if (minInterval > 0L) {
+            val now = SystemClock.uptimeMillis()
+            val elapsed = now - lastDrawApplyUptimeMs
+            if (elapsed < minInterval) {
+                pendingBatchJson.set(json)
+                mainHandler.postDelayed({
+                    frameCallbackPosted = false
+                    scheduleNextDrawFrame()
+                }, minInterval - elapsed)
+                return@FrameCallback
+            }
+            lastDrawApplyUptimeMs = now
+        }
+        val gen = renderGeneration.incrementAndGet()
+        renderExecutor.execute { prepareAndApplyBatch(json, gen) }
     }
 
     private sealed class PreparedUi {
@@ -102,6 +129,8 @@ class MainActivity : AppCompatActivity() {
         bindViews()
         sceneView.fpsMeter = fpsMeter
         sessionStore = ImuSessionStore(this)
+        drawFpsCap = sessionStore.drawFpsCap
+        fpsMeter.setDrawFpsCap(drawFpsCap)
         cloudSettings = CloudSettings(this)
         verdictStore = VerdictStore(this)
         serviceController = ImuServiceController(applicationContext, serviceEvents)
@@ -120,12 +149,16 @@ class MainActivity : AppCompatActivity() {
         super.onStart()
         AppEventHub.onBanner = { level, message -> statusBanner.show(level, message) }
         if (::serviceController.isInitialized) {
+            serviceController.setUiVisible(true)
             serviceController.requestState()
         }
     }
 
     override fun onStop() {
         AppEventHub.onBanner = null
+        if (::serviceController.isInitialized) {
+            serviceController.setUiVisible(false)
+        }
         super.onStop()
     }
 
@@ -186,10 +219,11 @@ class MainActivity : AppCompatActivity() {
         deviceMenuButton.setOnClickListener { showDeviceMenu() }
     }
 
-    private enum class VibroMenuItem { REF_START, REF_STOP, HISTORY, FFT, MODE }
+    private enum class VibroMenuItem { REF_PROFILES, HISTORY, FFT, MODE }
 
     private enum class DeviceMenuItem {
         PROFILE, CONFIG_EDITOR, MIX, ERASE_NVS, CRASH_DEBUG, WIFI, SYNC, OTA, CLOUD, SCREEN,
+        PERFORMANCE, DRAW_FPS,
     }
 
     private fun showVibroMenu() {
@@ -198,16 +232,7 @@ class MainActivity : AppCompatActivity() {
             .setTitle(R.string.menu_vibro)
             .setItems(items.map { vibroMenuLabel(it) }.toTypedArray()) { _, which ->
                 when (items[which]) {
-                    VibroMenuItem.REF_START -> {
-                        if (!requireBleConnected { showVibroMenu() }) return@setItems
-                        statusText.text = "Ref start…"
-                        imuService?.vibroRefStart()
-                    }
-                    VibroMenuItem.REF_STOP -> {
-                        if (!requireBleConnected { showVibroMenu() }) return@setItems
-                        statusText.text = "Ref stop…"
-                        imuService?.vibroRefStop()
-                    }
+                    VibroMenuItem.REF_PROFILES -> showVibroRefProfilesMenu()
                     VibroMenuItem.HISTORY -> showVerdictHistory()
                     VibroMenuItem.FFT -> {
                         if (!requireBleConnected { showVibroMenu() }) return@setItems
@@ -239,7 +264,7 @@ class MainActivity : AppCompatActivity() {
                         if (!requireBleConnected { showDeviceMenu() }) return@setItems
                         confirmEraseNvs()
                     }
-                    DeviceMenuItem.CRASH_DEBUG -> showCrashDebugDialog()
+                    DeviceMenuItem.CRASH_DEBUG -> CrashDebugActivity.open(this)
                     DeviceMenuItem.WIFI -> {
                         if (!requireBleConnected { showDeviceMenu() }) return@setItems
                         startActivity(Intent(this, WifiWizardActivity::class.java))
@@ -261,14 +286,15 @@ class MainActivity : AppCompatActivity() {
                     }
                     DeviceMenuItem.CLOUD -> CloudSettingsActivity.open(this)
                     DeviceMenuItem.SCREEN -> espScreenButton.performClick()
+                    DeviceMenuItem.PERFORMANCE -> showPerformanceDialog()
+                    DeviceMenuItem.DRAW_FPS -> showDrawFpsDialog()
                 }
             }
             .show()
     }
 
     private fun vibroMenuLabel(item: VibroMenuItem): String = when (item) {
-        VibroMenuItem.REF_START -> getString(R.string.vibro_ref_start)
-        VibroMenuItem.REF_STOP -> getString(R.string.vibro_ref_stop)
+        VibroMenuItem.REF_PROFILES -> getString(R.string.vibro_ref_profiles)
         VibroMenuItem.HISTORY -> getString(R.string.vibro_history)
         VibroMenuItem.FFT -> getString(R.string.vibro_fft)
         VibroMenuItem.MODE -> getString(R.string.vibro_mode)
@@ -284,6 +310,8 @@ class MainActivity : AppCompatActivity() {
         DeviceMenuItem.SYNC -> "Sync cfg"
         DeviceMenuItem.OTA -> getString(R.string.ota_file)
         DeviceMenuItem.CLOUD -> getString(R.string.cloud_settings)
+        DeviceMenuItem.PERFORMANCE -> "CPU / IMU speed"
+        DeviceMenuItem.DRAW_FPS -> "Draw FPS cap"
         DeviceMenuItem.SCREEN -> if (espScreenOn) {
             getString(R.string.esp_screen_off)
         } else {
@@ -374,10 +402,133 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+    private fun showVibroRefProfilesMenu() {
+        if (!requireBleConnected { showVibroRefProfilesMenu() }) return
+        statusText.text = "Loading reference slots…"
+        pendingVibroRefListCallback = { json -> renderVibroRefListDialog(json) }
+        imuService?.requestVibroRefList()
+    }
+
+    private fun renderVibroRefListDialog(json: String) {
+        val root = try {
+            JSONObject(json)
+        } catch (e: Exception) {
+            null
+        }
+        val slots = root?.optJSONArray("slots")
+        if (root == null || slots == null) {
+            statusText.text = "Ref list parse error"
+            return
+        }
+        val activeSlot = root.optInt("active", -1)
+        val labels = (0 until slots.length()).map { i ->
+            val s = slots.getJSONObject(i)
+            val slotIdx = s.optInt("slot", i)
+            if (s.optInt("valid", 0) == 1) {
+                val activeTag = if (slotIdx == activeSlot) " [ACTIVE]" else ""
+                String.format(
+                    java.util.Locale.US,
+                    "%d: %s (%.1fs)%s",
+                    slotIdx,
+                    s.optString("name", ""),
+                    s.optInt("dur_ms", 0) / 1000.0,
+                    activeTag,
+                )
+            } else {
+                "$slotIdx: (empty)"
+            }
+        }
+        statusText.text = getString(R.string.vibro_ref_profiles)
+        AlertDialog.Builder(this)
+            .setTitle(R.string.vibro_ref_profiles)
+            .setItems(labels.toTypedArray()) { _, which ->
+                val s = slots.getJSONObject(which)
+                val slotIdx = s.optInt("slot", which)
+                showVibroRefSlotActionsDialog(
+                    slot = slotIdx,
+                    valid = s.optInt("valid", 0) == 1,
+                    isActive = slotIdx == activeSlot,
+                    name = s.optString("name", ""),
+                )
+            }
+            .show()
+    }
+
+    private fun showVibroRefSlotActionsDialog(slot: Int, valid: Boolean, isActive: Boolean, name: String) {
+        val actions = buildList {
+            if (valid) {
+                if (!isActive) add("Select as active")
+                add("Re-record")
+                add("Delete")
+            } else {
+                add("Record here")
+            }
+        }
+        AlertDialog.Builder(this)
+            .setTitle(if (valid) "Slot $slot: $name" else "Slot $slot (empty)")
+            .setItems(actions.toTypedArray()) { _, which ->
+                when (actions[which]) {
+                    "Select as active" -> {
+                        statusText.text = "Selecting slot $slot…"
+                        imuService?.vibroRefSelect(slot)
+                    }
+                    "Record here", "Re-record" -> promptVibroRefRecordName(slot)
+                    "Delete" -> confirmVibroRefDelete(slot)
+                }
+            }
+            .show()
+    }
+
+    private fun confirmVibroRefDelete(slot: Int) {
+        AlertDialog.Builder(this)
+            .setTitle("Delete slot $slot?")
+            .setMessage("This reference profile will be permanently erased from the device.")
+            .setPositiveButton(android.R.string.ok) { _, _ ->
+                statusText.text = "Deleting slot $slot…"
+                imuService?.vibroRefDelete(slot)
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun promptVibroRefRecordName(slot: Int) {
+        val input = EditText(this).apply {
+            hint = "Profile name (optional)"
+            setText("slot $slot")
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Record slot $slot")
+            .setMessage("Up to 30s. Put the device in its normal running state, then tap Start.")
+            .setView(input)
+            .setPositiveButton("Start") { _, _ ->
+                val name = input.text?.toString()?.trim().orEmpty()
+                statusText.text = "Recording slot $slot…"
+                imuService?.vibroRefStart(slot, name)
+                showVibroRefRecordingDialog(slot)
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun showVibroRefRecordingDialog(slot: Int) {
+        AlertDialog.Builder(this)
+            .setTitle("Recording slot $slot")
+            .setMessage("Shake/run the device now. Tap Stop when done (auto-stops at 30s).")
+            .setPositiveButton("Stop") { _, _ ->
+                statusText.text = "Stopping…"
+                imuService?.vibroRefStop()
+            }
+            .setCancelable(false)
+            .show()
+    }
+
     private val serviceEvents = object : ImuServiceController.Events {
         override fun onServiceReady(service: IImuBleService) {
             imuService = service
-            runOnUiThread { serviceController.requestState() }
+            runOnUiThread {
+                serviceController.requestState()
+                serviceController.setUiVisible(true)
+            }
         }
 
         override fun onServiceLost() {
@@ -397,16 +548,45 @@ class MainActivity : AppCompatActivity() {
             showDisconnect: Boolean,
         ) {
             runOnUiThread {
+                if (bleConnected && state == RelayFsmState.CONNECTED) {
+                    blockPreConnectCaptions = false
+                    statusBanner.hide()
+                }
                 updateConnectedUi(bleConnected, showDisconnect)
-                if (caption.isNotBlank()) {
-                    statusText.text = caption
-                    val level = when (state) {
-                        RelayFsmState.CONNECTED, RelayFsmState.CLOUD_SYNC -> StatusBannerLevel.OK
-                        RelayFsmState.STARTING, RelayFsmState.BT_WARMUP,
-                        RelayFsmState.SCAN_CONNECT, RelayFsmState.PAUSE,
-                        -> StatusBannerLevel.WARN
+                if (connected && state != RelayFsmState.CONNECTED && state != RelayFsmState.CLOUD_SYNC) {
+                    return@runOnUiThread
+                }
+                if (caption.isNotBlank() && !(blockPreConnectCaptions && !bleConnected)) {
+                    if (state == RelayFsmState.CONNECTED) {
+                        statusText.text = caption
+                        statusBanner.show(StatusBannerLevel.OK, caption)
+                    } else if (!connected) {
+                        statusText.text = caption
+                        val level = when (state) {
+                            RelayFsmState.CONNECTED, RelayFsmState.CLOUD_SYNC -> StatusBannerLevel.OK
+                            RelayFsmState.STARTING, RelayFsmState.BT_WARMUP,
+                            RelayFsmState.SCAN_CONNECT, RelayFsmState.PAUSE,
+                            -> StatusBannerLevel.WARN
+                        }
+                        statusBanner.show(level, caption)
                     }
-                    statusBanner.show(level, caption)
+                }
+            }
+        }
+
+        override fun onCaptionEpoch(epoch: Int) {
+            runOnUiThread {
+                captionEpoch = epoch
+                blockPreConnectCaptions = false
+                statusBanner.hide()
+            }
+        }
+
+        override fun onClockState(synced: Boolean, tzMin: Int) {
+            runOnUiThread {
+                sceneView.setClockSynced(synced)
+                if (tzMin != 0) {
+                    sceneView.setClockTzMin(tzMin)
                 }
             }
         }
@@ -416,17 +596,30 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun onConnectionChanged(connected: Boolean) {
-            runOnUiThread { updateConnectedUi(connected, connected) }
+            runOnUiThread {
+                if (connected) {
+                    blockPreConnectCaptions = false
+                }
+                updateConnectedUi(connected, connected)
+            }
         }
 
         override fun onStatus(text: String) {
-            runOnUiThread { statusText.text = text }
+            runOnUiThread {
+                if (blockPreConnectCaptions && !connected) return@runOnUiThread
+                if (connected && isStaleFsmCaption(text)) return@runOnUiThread
+                statusText.text = text
+            }
         }
 
         override fun onBanner(level: StatusBannerLevel, message: String) {
             runOnUiThread {
+                if (blockPreConnectCaptions && !connected) return@runOnUiThread
+                if (connected && isStaleFsmCaption(message)) return@runOnUiThread
                 statusBanner.show(level, message)
-                statusText.text = message
+                if (!connected) {
+                    statusText.text = message
+                }
             }
         }
 
@@ -454,6 +647,13 @@ class MainActivity : AppCompatActivity() {
                     if (ok) StatusBannerLevel.OK else StatusBannerLevel.ERROR,
                     if (ok) "OK!" else "OTA failed: $message",
                 )
+            }
+        }
+
+        override fun onVibroRefList(json: String) {
+            runOnUiThread {
+                pendingVibroRefListCallback?.invoke(json)
+                pendingVibroRefListCallback = null
             }
         }
 
@@ -486,9 +686,11 @@ class MainActivity : AppCompatActivity() {
             else -> modeGroup.check(R.id.modeComputed)
         }
         snap.getString(ImuSessionStore.KEY_RELAY_CAPTION)
-            ?.takeIf { it.isNotBlank() }
+            ?.takeIf { it.isNotBlank() && !connected }
             ?.let { statusText.text = it }
-            ?: snap.getString(ImuSessionStore.KEY_STATUS)?.let { statusText.text = it }
+            ?: if (!connected) {
+                snap.getString(ImuSessionStore.KEY_STATUS)?.let { statusText.text = it }
+            } else Unit
         crashDebugFirmware = snap.getBoolean(ImuSessionStore.KEY_CRASH_DEBUG, false)
         sessionCaps = snap.getInt(ImuSessionStore.KEY_CAPS, 0)
         if (ImuProtocol.crashDebugFromCaps(sessionCaps)) {
@@ -512,14 +714,14 @@ class MainActivity : AppCompatActivity() {
     private fun scheduleBatchRender(batchJson: String) {
         pendingBatchJson.set(batchJson)
         if (frameCallbackPosted) return
-        frameCallbackPosted = true
-        runOnUiThread {
-            Choreographer.getInstance().postFrameCallback(frameCallback)
-        }
+        scheduleNextDrawFrame()
     }
 
-    private fun prepareAndApplyBatch(json: String) {
+    private fun prepareAndApplyBatch(json: String, generation: Int) {
         val prepared = prepareBatch(json)
+        if (generation != renderGeneration.get()) {
+            return
+        }
         runOnUiThread { applyPreparedBatch(prepared) }
     }
 
@@ -571,7 +773,16 @@ class MainActivity : AppCompatActivity() {
             }
         }
         if (pendingBatchJson.get() != null && !frameCallbackPosted) {
-            frameCallbackPosted = true
+            scheduleNextDrawFrame()
+        }
+    }
+
+    private fun drawMinIntervalMs(): Long =
+        if (drawFpsCap <= 0) 0L else (1000L / drawFpsCap)
+
+    private fun scheduleNextDrawFrame() {
+        frameCallbackPosted = true
+        runOnUiThread {
             Choreographer.getInstance().postFrameCallback(frameCallback)
         }
     }
@@ -605,6 +816,22 @@ class MainActivity : AppCompatActivity() {
         }
         fpsHudRunnable = tick
         statusText.postDelayed(tick, 1000L)
+    }
+
+    private fun isStaleFsmCaption(text: String): Boolean {
+        val lower = text.lowercase()
+        return lower.contains("link lost") ||
+            lower.contains("retry") ||
+            lower.contains("auto connect") ||
+            lower.contains("pause") ||
+            lower.contains("scanning") ||
+            lower.contains("scan + connect") ||
+            lower.contains("relay done") ||
+            lower.contains("cloud ok") ||
+            lower.contains("warmup") ||
+            lower.contains("direct connect") ||
+            lower.contains("waiting for esp grace") ||
+            lower.contains("disconnected")
     }
 
     private fun refreshStatusLine() {
@@ -652,6 +879,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun connectBle() {
+        blockPreConnectCaptions = true
         val pollMs = pollEdit.text.toString().toIntOrNull()?.coerceIn(
             ImuProtocol.MIN_POLL_MS,
             2000,
@@ -722,45 +950,6 @@ class MainActivity : AppCompatActivity() {
         return false
     }
 
-    private fun showCrashDebugDialog() {
-        if (!requireBleConnected { showCrashDebugDialog() }) return
-        val fwNote = if (crashDebugFirmware || ImuProtocol.crashDebugFromCaps(sessionCaps)) {
-            "Debug firmware detected (STATUS dbg=1 or caps DBG)."
-        } else {
-            "No dbg=1 / caps DBG — inject/BIST need v49+ with CRASH_DEBUG=1. Try Erase NVS first."
-        }
-        val kinds = arrayOf(
-            "Erase NVS (settings) → ESP reboot",
-            "Run BIST (self-test)",
-            "Inject: k_panic",
-            "Inject: __ASSERT",
-            "Inject: null deref",
-            "Inject: divide by zero",
-            "Inject: stack overflow",
-            "Inject: WDT stall",
-        )
-        AlertDialog.Builder(this)
-            .setTitle(R.string.crash_debug_menu)
-            .setMessage(
-                "$fwNote\n\nStart with NVS erase if inject/config misbehave. " +
-                    "Injections reboot the ESP; phone relays crash to Good Vibes.",
-            )
-            .setItems(kinds) { _, which ->
-                val svc = imuService ?: return@setItems
-                when (which) {
-                    0 -> confirmEraseNvs()
-                    1 -> svc.runDeviceBist()
-                    2 -> confirmCrashInject("panic")
-                    3 -> confirmCrashInject("assert")
-                    4 -> confirmCrashInject("null")
-                    5 -> confirmCrashInject("div0")
-                    6 -> confirmCrashInject("stack")
-                    7 -> confirmCrashInject("wdt")
-                }
-            }
-            .show()
-    }
-
     private fun confirmEraseNvs() {
         AlertDialog.Builder(this)
             .setTitle("Erase ESP NVS?")
@@ -773,18 +962,6 @@ class MainActivity : AppCompatActivity() {
             .setPositiveButton("Erase") { _, _ ->
                 imuService?.eraseDeviceNvs()
                 statusText.text = "NVS erase sent — wait for ESP reboot…"
-            }
-            .setNegativeButton(android.R.string.cancel, null)
-            .show()
-    }
-
-    private fun confirmCrashInject(kind: String) {
-        AlertDialog.Builder(this)
-            .setTitle("Inject crash?")
-            .setMessage("Trigger \"$kind\" fault on ESP. Device will reboot. Continue?")
-            .setPositiveButton("Inject") { _, _ ->
-                imuService?.injectCrash(kind)
-                statusText.text = "Crash inject ($kind) — wait for reboot + BLE relay…"
             }
             .setNegativeButton(android.R.string.cancel, null)
             .show()
@@ -843,6 +1020,119 @@ class MainActivity : AppCompatActivity() {
                 sessionStore.saveLocalConfig(blob)
                 imuService?.pushConfig(blob, true)
                 statusText.text = "Mix: ${VibroMixConfig.format(mix)}"
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun showPerformanceDialog() {
+        if (!requireBleConnected { showPerformanceDialog() }) return
+        val cpuOptions = listOf(
+            0 to "Auto (mode default)",
+            80 to "80 MHz (power save)",
+            160 to "160 MHz",
+            240 to "240 MHz (max)",
+        )
+        val imuOptions = listOf(
+            0 to "Auto (mode default)",
+            10 to "10 Hz",
+            30 to "30 Hz",
+            50 to "50 Hz",
+            100 to "100 Hz (max)",
+        )
+        val layout = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(48, 24, 48, 8)
+        }
+        layout.addView(
+            android.widget.TextView(this).apply {
+                text = "CPU clock override"
+                setTextColor(android.graphics.Color.WHITE)
+            },
+        )
+        val cpuGroup = android.widget.RadioGroup(this)
+        cpuOptions.forEach { (mhz, label) ->
+            cpuGroup.addView(
+                android.widget.RadioButton(this).apply {
+                    text = label
+                    id = mhz + 1000
+                    isChecked = mhz == lastCpuMhzOverride
+                    setTextColor(android.graphics.Color.WHITE)
+                },
+            )
+        }
+        layout.addView(cpuGroup)
+        layout.addView(
+            android.widget.TextView(this).apply {
+                text = "IMU sample-rate override"
+                setTextColor(android.graphics.Color.WHITE)
+                setPadding(0, 32, 0, 0)
+            },
+        )
+        val imuGroup = android.widget.RadioGroup(this)
+        imuOptions.forEach { (hz, label) ->
+            imuGroup.addView(
+                android.widget.RadioButton(this).apply {
+                    text = label
+                    id = hz + 2000
+                    isChecked = hz == lastImuHzOverride
+                    setTextColor(android.graphics.Color.WHITE)
+                },
+            )
+        }
+        layout.addView(imuGroup)
+        AlertDialog.Builder(this)
+            .setTitle("CPU / IMU speed override")
+            .setMessage(
+                "CPU override wins over the demo/staging preset and now applies immediately, " +
+                    "even while connected over Bluetooth — 80/160/240 MHz are all safe to switch " +
+                    "live (they're just divider taps on the same PLL). Lower speeds save power " +
+                    "but IMU/render/BLE processing takes longer per cycle. IMU rate override " +
+                    "always takes effect immediately. Auto restores normal power-saving behavior.",
+            )
+            .setView(layout)
+            .setPositiveButton("Apply") { _, _ ->
+                val mhz = (cpuGroup.checkedRadioButtonId - 1000).coerceIn(0, 240)
+                val hz = (imuGroup.checkedRadioButtonId - 2000).coerceIn(0, 120)
+                imuService?.setCpuMhzOverride(mhz)
+                imuService?.setImuHzOverride(hz)
+                lastCpuMhzOverride = mhz
+                lastImuHzOverride = hz
+                statusText.text = "CPU=${if (mhz == 0) "auto" else "${mhz}MHz"} " +
+                    "IMU=${if (hz == 0) "auto" else "${hz}Hz"}"
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun showDrawFpsDialog() {
+        val options = listOf(
+            0 to "Auto (unlimited)",
+            5 to "5 FPS",
+            10 to "10 FPS",
+            15 to "15 FPS",
+            20 to "20 FPS",
+            25 to "25 FPS",
+        )
+        val labels = options.map { it.second }.toTypedArray()
+        val checked = options.indexOfFirst { it.first == drawFpsCap }.coerceAtLeast(0)
+        AlertDialog.Builder(this)
+            .setTitle("On-screen draw FPS cap")
+            .setMessage(
+                "Limits only how fast the phone redraws IMU/scene frames. BLE polling and " +
+                    "ESP IMU sampling follow poll interval and CPU/IMU speed settings.",
+            )
+            .setSingleChoiceItems(labels, checked) { dialog, which ->
+                drawFpsCap = options[which].first
+                sessionStore.drawFpsCap = drawFpsCap
+                fpsMeter.setDrawFpsCap(drawFpsCap)
+                lastDrawApplyUptimeMs = 0L
+                statusText.text = if (drawFpsCap == 0) {
+                    "Draw FPS: auto (unlimited)"
+                } else {
+                    "Draw FPS cap: $drawFpsCap"
+                }
+                dialog.dismiss()
             }
             .setNegativeButton(android.R.string.cancel, null)
             .show()

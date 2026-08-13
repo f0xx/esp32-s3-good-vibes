@@ -279,7 +279,7 @@ int vibro_verdict_store_append(uint32_t seq, uint32_t uptime_ms,
 		return -EIO;
 	}
 
-	LOG_INF("verdict spool slot=%u seq=%u level=%u", slot, seq, rec.level);
+	LOG_DBG("verdict spool slot=%u seq=%u level=%u", slot, seq, rec.level);
 	return 0;
 }
 

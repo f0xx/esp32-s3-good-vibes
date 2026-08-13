@@ -13,7 +13,8 @@ struct crash_ring_telemetry;
 void power_manager_set_display(const struct device *display);
 void power_manager_set_imu_reschedule_cb(void (*cb)(void));
 void power_manager_set_ble_active(bool active);
-/** BT controller enabled (bt_enable) — keep 240 MHz until off; downclock hangs after init. */
+/** BT controller enabled (bt_enable). CPU 80/160/240 MHz tiers apply live regardless — see
+ *  apply_cpu_mhz_fast() in power_manager.c for why that's safe on this chip/SDK. */
 void power_manager_set_bt_controller_on(bool on);
 void power_manager_set_panel_hw_fn(bool (*fn)(bool on));
 void power_manager_set_display_busy_query(bool (*fn)(void));
@@ -27,6 +28,12 @@ bool power_manager_staging_mode(void);
 /** BOOT tap handler: flips demo<->staging, persists, re-applies targets immediately. */
 void power_manager_toggle_mode(void);
 bool power_manager_tft_render_enabled(void);
+/** Manual override of the mode-derived CPU clock (0 = auto). Persists via device_config. */
+void power_manager_set_cpu_mhz_override(uint8_t mhz);
+uint8_t power_manager_cpu_mhz_override(void);
+/** Manual override of the mode-derived IMU sample rate (0 = auto). Persists via device_config. */
+void power_manager_set_imu_hz_override(uint8_t hz);
+uint8_t power_manager_imu_hz_override(void);
 /** Queue panel blanking/backlight change (applied on render thread). */
 void power_manager_request_panel_hw(bool on);
 /** Panel blanking/backlight (render thread only). */
@@ -38,15 +45,22 @@ void power_manager_reapply_backlight_if_screen_on(void);
 uint32_t power_manager_imu_interval_ms(void);
 uint32_t power_manager_render_interval_ms(void);
 
-/** Last value passed to clock_control_configure (may lag actual PLL). */
+/** Last value applied via the fast PLL-divider CPU switch (may lag actual for one tick). */
 uint8_t power_manager_cpu_mhz_settled(void);
 /** Target from current screen/profile policy. */
 uint8_t power_manager_cpu_mhz_target(void);
+/** Mode/override-derived MHz (same as target — no BLE floor remains for 80/160/240). */
+uint8_t power_manager_cpu_mhz_desired(void);
+/** Reserved: true if a requested tier couldn't be applied live while BT is on (currently
+ *  never — 80/160/240 all apply live; would only trip for a future <80 MHz XTAL tier). */
+bool power_manager_cpu_ble_clamped(void);
 /** Measured from SoC clock tree (Hz/1e6). */
 uint8_t power_manager_cpu_mhz_actual(void);
 uint8_t power_manager_apb_mhz_actual(void);
 uint8_t power_manager_render_hz_target(void);
 uint8_t power_manager_imu_hz_target(void);
+/** Suggested main-loop sleep when render is off (derived from IMU interval). */
+uint32_t power_manager_main_sleep_ms(void);
 
 void power_manager_log_telemetry(uint32_t render_frames, uint32_t imu_ticks,
 				 uint32_t window_ms, uint32_t flush_ms);

@@ -15,7 +15,7 @@ class CloudUploader(private val context: Context) {
     private val offload = OffloadExporter(context)
     private val verdictStore = VerdictStore(context)
 
-    data class Result(val ok: Boolean, val message: String, val accepted: Int = 0)
+    data class Result(val ok: Boolean, val message: String, val accepted: Int = 0, val duplicates: Int = 0)
 
     data class BatchResult(
         val verdicts: Result,
@@ -305,7 +305,8 @@ class CloudUploader(private val context: Context) {
             }
             val resp = JSONObject(text)
             val accepted = resp.optInt("accepted", linesAcceptedFallback(text))
-            return Result(true, "uploaded $accepted", accepted)
+            val duplicates = resp.optInt("duplicates", 0)
+            return Result(true, "uploaded $accepted", accepted, duplicates)
         } finally {
             conn.disconnect()
         }

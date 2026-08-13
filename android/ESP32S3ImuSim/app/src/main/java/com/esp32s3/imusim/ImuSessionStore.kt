@@ -15,6 +15,15 @@ class ImuSessionStore(context: Context) {
         get() = prefs.getInt(KEY_MODE, ImuProtocol.MODE_COMPUTED)
         set(value) = prefs.edit().putInt(KEY_MODE, value).apply()
 
+    /** 0 = auto (unlimited on-screen draw); else caps UI apply FPS only. */
+    var drawFpsCap: Int
+        get() = prefs.getInt(KEY_DRAW_FPS_CAP, 0)
+        set(value) = prefs.edit().putInt(KEY_DRAW_FPS_CAP, value.coerceIn(0, 25)).apply()
+
+    var lastBleAddress: String?
+        get() = prefs.getString(KEY_BLE_ADDRESS, null)
+        set(value) = prefs.edit().putString(KEY_BLE_ADDRESS, value).apply()
+
     var lastStatus: String
         get() = prefs.getString(KEY_STATUS, "") ?: ""
         set(value) = prefs.edit().putString(KEY_STATUS, value).apply()
@@ -59,6 +68,7 @@ class ImuSessionStore(context: Context) {
         putBoolean(KEY_SHOW_DISCONNECT, showDisconnectButton)
         putInt(KEY_POLL_MS, pollMs)
         putInt(KEY_MODE, renderMode)
+        putInt(KEY_DRAW_FPS_CAP, drawFpsCap)
         putString(KEY_STATUS, lastStatus)
         putInt(KEY_CAPS, caps)
         putBoolean(KEY_CRASH_DEBUG, crashDebug)
@@ -89,6 +99,8 @@ class ImuSessionStore(context: Context) {
         const val KEY_SHOW_DISCONNECT = "show_disconnect"
         const val KEY_POLL_MS = "poll_ms"
         const val KEY_MODE = "render_mode"
+        const val KEY_DRAW_FPS_CAP = "draw_fps_cap"
+        const val KEY_BLE_ADDRESS = "last_ble_address"
         const val KEY_STATUS = "status"
         const val KEY_CAPS = "caps"
         const val KEY_POWER_SOURCE = "power_source"

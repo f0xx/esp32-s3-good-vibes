@@ -58,7 +58,9 @@ bool clock_sync_set_from_phone(int64_t unix_ms, int16_t tz_offset_min)
 		return false;
 	}
 
-	g_last_drift_ms = clock_sync_drift_ms(unix_ms);
+	/* Before the first-ever sync, clock_sync_now_ms() returns raw uptime, not wall clock —
+	 * diffing against it would print a meaningless multi-year "drift". */
+	g_last_drift_ms = g_synced ? clock_sync_drift_ms(unix_ms) : 0;
 
 	if (g_synced && g_last_drift_ms > -CLOCK_SYNC_DRIFT_APPLY_MS &&
 	    g_last_drift_ms < CLOCK_SYNC_DRIFT_APPLY_MS) {
@@ -82,7 +84,7 @@ bool clock_sync_set_from_ntp(int64_t unix_ms)
 		return false;
 	}
 
-	g_last_drift_ms = clock_sync_drift_ms(unix_ms);
+	g_last_drift_ms = g_synced ? clock_sync_drift_ms(unix_ms) : 0;
 	return apply_wall_clock(unix_ms, 0, CLOCK_SYNC_SRC_NTP);
 }
 
@@ -145,6 +147,10 @@ int clock_sync_append_status_json(char *buf, size_t cap, int written)
 
 	if (n < 0) {
 		return written;
+	}
+
+	if ((size_t)n >= cap - (size_t)written) {
+		return (int)cap;
 	}
 
 	return written + n;

@@ -2,6 +2,11 @@
 
 #include <zephyr/bluetooth/conn.h>
 
+/** Post-connect quiet window — phone should defer MODE/TIME/poll/crash/offload until this
+ *  elapses (see ble_imu_gatt.c ble_traffic_ready()). Android ImuProtocol.ESP_CONNECT_SETTLE_MS. */
+#define BLE_IMU_CONNECT_GRACE_MS 12000
+#define BLE_IMU_POST_GRACE_MS    2000
+
 int ble_imu_gatt_init(void);
 void ble_imu_gatt_set_traffic_paused(bool paused);
 bool ble_imu_link_active(void);

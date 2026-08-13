@@ -1,6 +1,7 @@
 #include "vibro_capture.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <zephyr/kernel.h>
@@ -9,6 +10,7 @@
 #include "device_config.h"
 #include "vibro_features.h"
 #include "vibro_band_rms.h"
+#include "vibro_ref_store.h"
 #include "vibro_schedule.h"
 #include "clock_sync.h"
 #include "vibro_verdict_store.h"
@@ -19,55 +21,42 @@ struct vibro_capture_state {
 	struct imu_sample ring[VIBRO_CAPTURE_MAX_SAMPLES];
 	size_t ring_len;
 	size_t ring_head;
-	struct imu_sample ref[VIBRO_CAPTURE_MAX_SAMPLES];
+
+	/* Live/active reference — either mid-recording or loaded from a flash
+	 * slot (vibro_ref_store). Magnitude-only: verdicts never need the raw
+	 * 7-axis samples, only the scalar magnitude series (see pearson_corr /
+	 * band_vector_corr below), so this is ~14x more compact per sample
+	 * than the old struct imu_sample ref[] and lets a slot hold a much
+	 * longer (closer to the 30s vision target) recording for the same RAM. */
+	float ref_mag[VIBRO_REF_MAG_MAX];
 	size_t ref_len;
+	float ref_rms;
+	float ref_peak;
 	bool ref_recording;
+	uint8_t ref_recording_slot;
+	char ref_recording_name[VIBRO_REF_NAME_MAX];
+	uint32_t ref_record_start_ms;
+	uint32_t ref_record_start_unix;
+	size_t ref_max_record_samples;
+	double ref_rms_accum;
+
 	uint32_t last_verdict_seq;
 	uint32_t last_ack_seq;
 	uint16_t pending_count;
 	uint32_t decim_counter;
 	uint8_t decim_factor;
-	size_t ref_max_samples;
 	bool window_active;
 	uint32_t last_persist_seq;
+	uint32_t last_persist_ms;
 	struct vibro_band_rms bands;
 	struct vibro_band_rms ref_bands;
 };
 
 static struct vibro_capture_state g_vib;
 
-bool vibro_capture_refresh_ref_bands(void);
-
 static float magnitude_g(const struct imu_sample *s)
 {
 	return sqrtf(s->ax * s->ax + s->ay * s->ay + s->az * s->az);
-}
-
-static struct vibro_metrics compute_metrics(const struct imu_sample *samples, size_t count)
-{
-	struct vibro_metrics out = { 0 };
-
-	if (samples == NULL || count == 0) {
-		return out;
-	}
-
-	double sum_sq = 0.0;
-	float peak = 0.0f;
-
-	for (size_t i = 0; i < count; i++) {
-		const float mag = magnitude_g(&samples[i]);
-
-		sum_sq += (double)mag * (double)mag;
-		if (mag > peak) {
-			peak = mag;
-		}
-	}
-
-	out.rms_g = (float)sqrt(sum_sq / (double)count);
-	out.peak_g = peak;
-	out.samples = (uint32_t)count;
-	out.valid = true;
-	return out;
 }
 
 static float pearson_corr(const float *a, const float *b, size_t n)
@@ -197,7 +186,16 @@ static void rotate_after_ack(void)
 		return;
 	}
 
-	struct imu_sample compact[VIBRO_CAPTURE_MAX_SAMPLES];
+	/*
+	 * VIBRO_CAPTURE_MAX_SAMPLES * sizeof(imu_sample) = 256*28 = 7168 bytes — far
+	 * too large for a stack local on any of this app's worker threads/workqueues
+	 * (several are 2-8KB total). This function is only ever driven by the single
+	 * sequential g_vib state machine (no re-entrancy), so `static` is safe and
+	 * moves the buffer to BSS instead of risking a stack overflow (which on
+	 * Xtensa/ESP32 manifests as a double-exception -> hardware watchdog reset
+	 * that bypasses crash_report entirely).
+	 */
+	static struct imu_sample compact[VIBRO_CAPTURE_MAX_SAMPLES];
 	const size_t n = g_vib.ring_len;
 	size_t copied = 0;
 
@@ -220,8 +218,8 @@ void vibro_capture_init(void)
 {
 	memset(&g_vib, 0, sizeof(g_vib));
 	g_vib.decim_factor = 1;
-	g_vib.ref_max_samples = VIBRO_CAPTURE_MAX_SAMPLES;
 	(void)vibro_verdict_store_init();
+	(void)vibro_ref_store_init();
 
 	const uint32_t flash_seq = vibro_verdict_store_last_seq();
 	const uint16_t flash_pending = vibro_verdict_store_pending_count();
@@ -231,6 +229,15 @@ void vibro_capture_init(void)
 	}
 	if (flash_pending > g_vib.pending_count) {
 		g_vib.pending_count = flash_pending;
+	}
+
+	const int8_t active = vibro_ref_store_active_slot();
+
+	if (active >= 0) {
+		const int err = vibro_capture_select_reference((uint8_t)active);
+
+		LOG_INF("vibro ref auto-restore slot=%d -> %s", active,
+			err == 0 ? "ok" : "failed");
 	}
 }
 
@@ -242,30 +249,20 @@ void vibro_capture_apply_config(const struct device_config_v1 *cfg)
 
 	if (cfg->vibro_capture_tier >= 3) {
 		g_vib.decim_factor = 8;
-		g_vib.ref_max_samples = 64;
 	} else if (cfg->vibro_capture_tier >= 2) {
 		g_vib.decim_factor = 4;
-		g_vib.ref_max_samples = 64;
 	} else if (cfg->vibro_capture_tier >= 1) {
 		g_vib.decim_factor = 2;
-		g_vib.ref_max_samples = 128;
 	} else {
 		g_vib.decim_factor = 1;
-		g_vib.ref_max_samples = VIBRO_CAPTURE_MAX_SAMPLES;
 	}
 	g_vib.decim_counter = 0;
-	if (g_vib.ref_len > g_vib.ref_max_samples) {
-		g_vib.ref_len = g_vib.ref_max_samples;
-		g_vib.ref_recording = false;
-	}
 }
 
 void vibro_capture_reset(void)
 {
 	g_vib.ring_len = 0;
 	g_vib.ring_head = 0;
-	g_vib.ref_len = 0;
-	g_vib.ref_recording = false;
 }
 
 void vibro_capture_push(const struct imu_sample *sample)
@@ -295,11 +292,18 @@ void vibro_capture_push(const struct imu_sample *sample)
 		g_vib.ring_len++;
 	}
 
-	if (g_vib.ref_recording && g_vib.ref_len < g_vib.ref_max_samples) {
-		g_vib.ref[g_vib.ref_len++] = *sample;
-		if (g_vib.ref_len >= g_vib.ref_max_samples) {
-			g_vib.ref_recording = false;
-			(void)vibro_capture_refresh_ref_bands();
+	if (g_vib.ref_recording && g_vib.ref_len < g_vib.ref_max_record_samples &&
+	    g_vib.ref_len < VIBRO_REF_MAG_MAX) {
+		const float mag = magnitude_g(sample);
+
+		g_vib.ref_mag[g_vib.ref_len++] = mag;
+		g_vib.ref_rms_accum += (double)mag * (double)mag;
+		if (mag > g_vib.ref_peak) {
+			g_vib.ref_peak = mag;
+		}
+		if (g_vib.ref_len >= g_vib.ref_max_record_samples ||
+		    g_vib.ref_len >= VIBRO_REF_MAG_MAX) {
+			(void)vibro_capture_stop_reference();
 		}
 	}
 }
@@ -308,7 +312,7 @@ static float ref_mag_at(void *ctx, size_t index)
 {
 	struct vibro_capture_state *v = ctx;
 
-	return magnitude_g(&v->ref[index]);
+	return v->ref_mag[index];
 }
 
 static float sample_hz_for_capture(void)
@@ -322,31 +326,79 @@ static float sample_hz_for_capture(void)
 	return hz;
 }
 
-bool vibro_capture_refresh_ref_bands(void)
+bool vibro_capture_start_reference(uint8_t slot, const char *name)
 {
-	if (g_vib.ref_len < 16U) {
-		g_vib.ref_bands.valid = false;
+	const float hz = sample_hz_for_capture();
+	const uint32_t by_time =
+		(hz > 0.5f) ? (uint32_t)(VIBRO_REF_MAX_RECORD_SEC * hz) : VIBRO_REF_MAG_MAX;
+
+	if (slot >= VIBRO_REF_STORE_SLOTS) {
 		return false;
 	}
 
-	g_vib.ref_bands = vibro_band_rms_compute_series(g_vib.ref_len, sample_hz_for_capture(),
-							ref_mag_at, &g_vib);
-	return g_vib.ref_bands.valid;
-}
-
-bool vibro_capture_start_reference(void)
-{
 	g_vib.ref_len = 0;
 	g_vib.ref_recording = true;
+	g_vib.ref_recording_slot = slot;
+	g_vib.ref_max_record_samples = MIN(by_time, (uint32_t)VIBRO_REF_MAG_MAX);
+	g_vib.ref_record_start_ms = k_uptime_get_32();
+	g_vib.ref_record_start_unix =
+		clock_sync_is_synced() ? clock_sync_now_unix_sec() : 0U;
+	g_vib.ref_rms_accum = 0.0;
+	g_vib.ref_peak = 0.0f;
 	memset(&g_vib.ref_bands, 0, sizeof(g_vib.ref_bands));
+	if (name != NULL && name[0] != '\0') {
+		snprintf(g_vib.ref_recording_name, sizeof(g_vib.ref_recording_name), "%s", name);
+	} else {
+		snprintf(g_vib.ref_recording_name, sizeof(g_vib.ref_recording_name), "slot %u",
+			 slot);
+	}
+	LOG_INF("vibro reference recording started slot=%u max_samples=%u", slot,
+		(unsigned)g_vib.ref_max_record_samples);
 	return true;
 }
 
 bool vibro_capture_stop_reference(void)
 {
+	struct vibro_ref_profile prof;
+
+	if (!g_vib.ref_recording) {
+		return g_vib.ref_len > 0;
+	}
+
 	g_vib.ref_recording = false;
-	(void)vibro_capture_refresh_ref_bands();
-	return g_vib.ref_len > 0;
+	if (g_vib.ref_len < 16U) {
+		LOG_WRN("vibro reference stop: too short (len=%u), discarding",
+			(unsigned)g_vib.ref_len);
+		g_vib.ref_len = 0;
+		return false;
+	}
+
+	g_vib.ref_rms = sqrtf((float)(g_vib.ref_rms_accum / (double)g_vib.ref_len));
+	g_vib.ref_bands = vibro_band_rms_compute_series(g_vib.ref_len, sample_hz_for_capture(),
+							ref_mag_at, &g_vib);
+
+	memset(&prof, 0, sizeof(prof));
+	snprintf(prof.name, sizeof(prof.name), "%s", g_vib.ref_recording_name);
+	prof.created_unix = g_vib.ref_record_start_unix;
+	prof.updated_unix = prof.created_unix;
+	prof.duration_ms = k_uptime_get_32() - g_vib.ref_record_start_ms;
+	prof.sample_hz = sample_hz_for_capture();
+	prof.mag_len = g_vib.ref_len;
+	prof.rms = g_vib.ref_rms;
+	prof.peak = g_vib.ref_peak;
+	prof.band_valid = g_vib.ref_bands.valid;
+	memcpy(prof.band_rms, g_vib.ref_bands.bands, sizeof(prof.band_rms));
+	memcpy(prof.mag, g_vib.ref_mag, g_vib.ref_len * sizeof(float));
+
+	if (vibro_ref_store_write(g_vib.ref_recording_slot, &prof) != 0) {
+		LOG_ERR("vibro reference stop: flash write failed slot=%u",
+			g_vib.ref_recording_slot);
+		return false;
+	}
+	(void)vibro_ref_store_set_active(g_vib.ref_recording_slot);
+	LOG_INF("vibro reference stopped slot=%u len=%u dur=%ums", g_vib.ref_recording_slot,
+		(unsigned)g_vib.ref_len, prof.duration_ms);
+	return true;
 }
 
 bool vibro_capture_reference_ready(void)
@@ -357,6 +409,50 @@ bool vibro_capture_reference_ready(void)
 size_t vibro_capture_reference_len(void)
 {
 	return g_vib.ref_len;
+}
+
+int vibro_capture_select_reference(uint8_t slot)
+{
+	static struct vibro_ref_profile prof; /* ~2KB — off the stack, see vibro_ref_store.c */
+	int err = vibro_ref_store_read(slot, &prof);
+
+	if (err != 0) {
+		return err;
+	}
+
+	g_vib.ref_recording = false;
+	g_vib.ref_len = MIN(prof.mag_len, (uint32_t)VIBRO_REF_MAG_MAX);
+	memcpy(g_vib.ref_mag, prof.mag, g_vib.ref_len * sizeof(float));
+	g_vib.ref_rms = prof.rms;
+	g_vib.ref_peak = prof.peak;
+	g_vib.ref_bands.valid = prof.band_valid;
+	memcpy(g_vib.ref_bands.bands, prof.band_rms, sizeof(g_vib.ref_bands.bands));
+
+	return vibro_ref_store_set_active((int8_t)slot);
+}
+
+int vibro_capture_delete_reference(uint8_t slot)
+{
+	const bool was_active = vibro_ref_store_active_slot() == (int8_t)slot;
+	int err = vibro_ref_store_delete(slot);
+
+	if (err == 0 && was_active) {
+		g_vib.ref_len = 0;
+		g_vib.ref_rms = 0.0f;
+		g_vib.ref_peak = 0.0f;
+		memset(&g_vib.ref_bands, 0, sizeof(g_vib.ref_bands));
+	}
+	return err;
+}
+
+int8_t vibro_capture_active_reference_slot(void)
+{
+	return vibro_ref_store_active_slot();
+}
+
+int vibro_capture_list_references_json(char *buf, size_t len)
+{
+	return vibro_ref_store_list_json(buf, len);
 }
 
 struct vibro_metrics vibro_capture_metrics_live(void)
@@ -497,14 +593,14 @@ struct vibro_verdict vibro_capture_verdict(void)
 		return out;
 	}
 
-	const struct vibro_metrics ref = compute_metrics(g_vib.ref, g_vib.ref_len);
-
-	out.rms_delta = fabsf(live.rms_g - ref.rms_g);
-	out.peak_delta = fabsf(live.peak_g - ref.peak_g);
+	out.rms_delta = fabsf(live.rms_g - g_vib.ref_rms);
+	out.peak_delta = fabsf(live.peak_g - g_vib.ref_peak);
 
 	const size_t n = g_vib.ring_len < g_vib.ref_len ? g_vib.ring_len : g_vib.ref_len;
-	float live_mag[VIBRO_CAPTURE_MAX_SAMPLES];
-	float ref_mag[VIBRO_CAPTURE_MAX_SAMPLES];
+	/* 256 floats = 1KB — moved off the stack for the same reason as the
+	 * `compact` buffer in rotate_after_ack() above (single-sequential caller).
+	 * g_vib.ref_mag is already part of the static g_vib state, no stack risk. */
+	static float live_mag[VIBRO_CAPTURE_MAX_SAMPLES];
 
 	for (size_t i = 0; i < n; i++) {
 		const size_t ring_idx = g_vib.ring_len < VIBRO_CAPTURE_MAX_SAMPLES ?
@@ -513,10 +609,9 @@ struct vibro_verdict vibro_capture_verdict(void)
 						      VIBRO_CAPTURE_MAX_SAMPLES;
 
 		live_mag[i] = magnitude_g(&g_vib.ring[ring_idx]);
-		ref_mag[i] = magnitude_g(&g_vib.ref[i]);
 	}
 
-	out.corr = pearson_corr(live_mag, ref_mag, n);
+	out.corr = pearson_corr(live_mag, g_vib.ref_mag, n);
 	out.has_band_ref = g_vib.ref_bands.valid;
 	if (out.has_band_ref) {
 		const struct vibro_band_rms live_bands = vibro_capture_band_rms();
@@ -588,12 +683,22 @@ void vibro_capture_session_tick(uint32_t now_ms)
 	ARG_UNUSED(now_ms);
 }
 
+/* Live STATUS polls can run at IMU rate (~30 Hz). Flash spool append + wrap-erase must not
+ * run every batch — that stacks against the grace-elapse traffic burst and trips TG0WDT. */
+#define VERDICT_FLASH_PERSIST_MIN_MS 30000U
+
 void vibro_capture_on_status_seq(uint32_t seq, bool persist_flash)
 {
 	g_vib.last_verdict_seq = seq;
 	if (persist_flash && seq != g_vib.last_persist_seq) {
-		g_vib.last_persist_seq = seq;
-		persist_verdict(seq);
+		const uint32_t now = k_uptime_get_32();
+
+		if (g_vib.last_persist_ms == 0U ||
+		    (now - g_vib.last_persist_ms) >= VERDICT_FLASH_PERSIST_MIN_MS) {
+			g_vib.last_persist_ms = now;
+			g_vib.last_persist_seq = seq;
+			persist_verdict(seq);
+		}
 	}
 	if (seq > g_vib.last_ack_seq) {
 		g_vib.pending_count = vibro_verdict_store_pending_count();

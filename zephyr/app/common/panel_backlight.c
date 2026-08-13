@@ -73,6 +73,13 @@ void panel_backlight_reapply(void)
 			(uint32_t)((uint64_t)bl_pwm.period * percent / 100U);
 
 		(void)pwm_set_dt(&bl_pwm, bl_pwm.period, pulse_ns);
+	} else {
+		/* Same LEDC-reset hazard applies when the backlight is supposed to be off:
+		 * a later BT/WiFi radio init can silently restore a nonzero duty cycle on
+		 * the channel, physically relighting the panel even though power_manager
+		 * (and the phone's "scr" status) still believe the screen is off. Re-assert
+		 * zero duty periodically so "off" stays actually off. */
+		(void)pwm_set_pulse_dt(&bl_pwm, 0);
 	}
 }
 

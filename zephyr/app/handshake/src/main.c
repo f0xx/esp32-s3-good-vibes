@@ -173,7 +173,7 @@ int main(void)
 	LOG_INF("stage: network manager");
 	network_manager_init();
 
-	LOG_INF("handshake v102 — WiFi disabled (diagnostic: test BT+WiFi coexist as crash source)");
+	LOG_INF("handshake v121 — screen-off idle IMU/CPU tiers");
 
 	LOG_INF("stage: clock / NTP scheduler");
 	clock_sync_ntp_init();
@@ -271,7 +271,7 @@ int main(void)
 			last_hb_ms = now;
 		}
 
-		k_msleep(10);
+		k_msleep(power_manager_main_sleep_ms());
 	}
 
 	return 0;

@@ -8,6 +8,8 @@
 #include "ble_crash_gatt.h"
 #include "ble_imu_gatt.h"
 
+#include "stall_watchdog.h"
+
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -88,7 +90,9 @@ void ble_looper_poll(void)
 	}
 
 	ble_imu_gatt_looper_tick();
+	stall_watchdog_feed_main();
 	ble_crash_gatt_looper_tick();
+	stall_watchdog_feed_main();
 }
 
 int ble_looper_post_connected(struct bt_conn *conn, uint8_t err)

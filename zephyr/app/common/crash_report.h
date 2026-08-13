@@ -34,6 +34,8 @@ int crash_report_list_json(char *buf, size_t len);
 int crash_report_info_json(char *buf, size_t len);
 int crash_report_info_json_slot(uint8_t slot, char *buf, size_t len);
 void crash_report_clear_slot(uint8_t slot);
+/** Clears several slots' pending flags in a single flash erase+rewrite cycle. */
+void crash_report_clear_slots(const uint8_t *slots, size_t n);
 void crash_report_clear(void);
 const char *crash_report_reset_reason_str(void);
 uint8_t crash_report_reset_reason_code(void);

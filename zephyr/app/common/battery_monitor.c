@@ -303,7 +303,11 @@ void battery_monitor_tick(void)
 
 	if (now - g_last_log_ms >= 30000U) {
 		g_last_log_ms = now;
-		LOG_INF("battery adc=%umV v=%.2fV pct=%u%% src=%s valid=%u trend=%+.3fV dc=%u bat=%u",
+		/* dc=/bat= here are the DC/BAT *confirmation streak counters* (consecutive samples
+		 * agreeing with that classification, saturating at 255) — NOT percent or millivolts.
+		 * Grouped under streak(...) to avoid being misread as a second battery percentage. */
+		LOG_INF("battery adc=%umV v=%.2fV pct=%u%% src=%s valid=%u trend=%+.3fV "
+			"streak(dc=%u bat=%u)",
 			adc_mv, (double)g_state.voltage_v, g_state.percent,
 			g_state.on_dc ? "DC" : "BAT", g_state.valid, (double)g_state.trend_v,
 			g_dc_streak, g_bat_streak);
