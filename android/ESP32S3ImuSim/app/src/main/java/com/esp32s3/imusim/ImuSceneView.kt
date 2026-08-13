@@ -3,6 +3,8 @@ package com.esp32s3.imusim
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.os.Handler
+import android.os.Looper
 import android.util.AttributeSet
 import android.view.View
 import kotlin.math.sqrt
@@ -52,10 +54,33 @@ class ImuSceneView @JvmOverloads constructor(
     private var fpsHudLine: String? = null
     private var frame: SceneFrame? = null
     private var powerStatus: ImuProtocol.PowerStatus? = null
+    private var clockTzMin: Int? = null
+    private var clockSynced = false
     private var scaleX = 1f
     private var scaleY = 1f
     private var offsetX = 0f
     private var offsetY = 0f
+    private val headerHandler = Handler(Looper.getMainLooper())
+    private val headerTick = object : Runnable {
+        override fun run() {
+            if (frame != null) {
+                invalidate()
+                headerHandler.postDelayed(this, 1000L)
+            }
+        }
+    }
+
+    fun setClockSynced(synced: Boolean) {
+        if (clockSynced == synced) return
+        clockSynced = synced
+        invalidate()
+    }
+
+    fun setClockTzMin(tzMin: Int?) {
+        if (clockTzMin == tzMin) return
+        clockTzMin = tzMin
+        invalidate()
+    }
 
     fun setFpsHud(line: String?) {
         if (fpsHudLine == line) return
@@ -64,8 +89,14 @@ class ImuSceneView @JvmOverloads constructor(
     }
 
     fun setFrame(f: SceneFrame?) {
-        if (frame == f) return
+        // Always invalidate — SceneFrame is a data class with FloatArray fields, so value
+        // equality treats consecutive identical geometry as "unchanged" and skips redraw.
+        // That dropped draw FPS to ~1 (header tick only) while BLE/UI meters stayed ~30.
         frame = f
+        headerHandler.removeCallbacks(headerTick)
+        if (f != null) {
+            headerHandler.post(headerTick)
+        }
         invalidate()
     }
 
@@ -73,6 +104,11 @@ class ImuSceneView @JvmOverloads constructor(
         if (powerStatus == p) return
         powerStatus = p
         invalidate()
+    }
+
+    override fun onDetachedFromWindow() {
+        headerHandler.removeCallbacks(headerTick)
+        super.onDetachedFromWindow()
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -296,9 +332,7 @@ class ImuSceneView @JvmOverloads constructor(
 
         paint.style = Paint.Style.FILL
         paint.textSize = (12f * scaleY).coerceAtLeast(10f)
-        val walkLabel = String.format(java.util.Locale.US, "%.1f m", distanceM)
-        val powerLabel = powerStatus?.caption() ?: "p/s:--"
-        val headerLabel = "$walkLabel $powerLabel"
+        val headerLabel = HeaderRotator.label(distanceM, powerStatus, tzMin = clockTzMin, clockSynced = clockSynced)
         val fm = paint.fontMetrics
         val textX = mapX(hudX + 14f)
         val textY = mapY(hudY + 3f) - fm.ascent

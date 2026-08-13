@@ -40,14 +40,24 @@
     <string name="wifi_refresh">Refresh</string>
     <string name="profile_wizard_intro">Choose a use-case preset and push settings to the ESP over BLE. Vibration schedules cannot be set without a live connection.</string>
     <string name="cloud_url_hint">https://apps.f0xx.org/app/good_vibes</string>
-    <string name="vibro_ref_start">Ref start</string>
-    <string name="vibro_ref_stop">Ref stop</string>
+    <string name="vibro_ref_profiles">Reference profiles</string>
     <string name="vibro_history">Verdict history</string>
     <string name="vibro_fft">FFT analyze</string>
     <string name="vibro_mode">Vibro mode</string>
     <string name="vibro_mix_settings">Capture mix…</string>
     <string name="erase_nvs_menu">Erase NVS (settings)</string>
     <string name="crash_debug_menu">Crash debug (dev)…</string>
+    <string name="crash_debug_title">Crash debug (dev)</string>
+    <string name="crash_debug_help">Pick a fault to inject on the ESP. The device reboots, saves a crash record in the NVS ring, and the background relay uploads it to Good Vibes on the next BLE session.\n\nStay connected or let autopilot relay run — no manual steps after inject.</string>
+    <string name="crash_debug_bist">Run BIST (self-test)</string>
+    <string name="crash_debug_inject_heading">Inject fault</string>
+    <string name="crash_debug_inject_action">Inject &amp; reboot</string>
+    <string name="crash_debug_inject_confirm">%1$s\n\nThe ESP will reboot immediately. The phone relay drains the crash ring and uploads to cloud on the next connect.</string>
+    <string name="crash_debug_inject_sent">Inject sent: %1$s — ESP rebooting; relay will upload crash</string>
+    <string name="crash_debug_bist_sent">BIST sent — check serial or STATUS bist field</string>
+    <string name="crash_debug_status_disconnected">Not connected — tap Connect on the main screen first.</string>
+    <string name="crash_debug_status_ready">Debug firmware ready (dbg=1). Inject buttons enabled.</string>
+    <string name="crash_debug_status_try_anyway">Debug flag not seen yet — inject may still work if crash BLE service is present.</string>
     <string name="vibro_idle">Vibro: — (connect BLE)</string>
     <string name="cloud_settings">Cloud</string>
     <string name="menu_vibro">Vibro…</string>

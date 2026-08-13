@@ -94,7 +94,7 @@ class Crash(Base):
     detail_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
-        Index("ix_crashes_device_seq", "device_id", "seq", unique=True),
+        Index("ix_crashes_device_seq_pc", "device_id", "seq", "pc", unique=True),
     )
 
     @property
@@ -106,6 +106,80 @@ class Crash(Base):
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
         return []
+
+
+class Machine(Base):
+    """profiles.txt #2/#3: a physical machine/turbine/motor/bearing that owns
+    one or more Sensor rows (ESP32 devices), each with its own reference
+    profile group."""
+
+    __tablename__ = "machines"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    machine_key: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(128))
+    kind: Mapped[str] = mapped_column(String(32), default="generic")
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_ms: Mapped[int] = mapped_column(BigInteger)
+
+
+class Sensor(Base):
+    """One ESP32 device acting as a sensor on a Machine. Each sensor is
+    calibrated independently (own reference profile group), per profiles.txt."""
+
+    __tablename__ = "sensors"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    machine_id: Mapped[int] = mapped_column(Integer, index=True)
+    device_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    label: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    mount_note: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_ms: Mapped[int] = mapped_column(BigInteger)
+
+
+class ReferenceProfile(Base):
+    """One of up to 5 "ideal" recordings for a device (profiles.txt #2: "the
+    operator records up to 5 ideal sampling profiles of the length of 30s
+    max"). Storage format is intentionally flexible (raw_json / bands_json)
+    since the doc leaves the exact representation TBD."""
+
+    __tablename__ = "reference_profiles"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[str] = mapped_column(String(64), index=True)
+    slot: Mapped[int] = mapped_column(Integer)
+    name: Mapped[str] = mapped_column(String(64), default="")
+    created_ms: Mapped[int] = mapped_column(BigInteger)
+    updated_ms: Mapped[int] = mapped_column(BigInteger)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    sample_hz: Mapped[float | None] = mapped_column(Float, nullable=True)
+    format: Mapped[str] = mapped_column(String(16), default="band_rms")
+    bands_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    active: Mapped[bool] = mapped_column(default=True)
+
+    __table_args__ = (
+        Index("ix_refprofiles_device_slot", "device_id", "slot", unique=True),
+    )
+
+    @property
+    def bands(self) -> list[float] | None:
+        if not self.bands_json:
+            return None
+        try:
+            data = json.loads(self.bands_json)
+            return [float(x) for x in data] if isinstance(data, list) else None
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+
+    @property
+    def raw(self) -> dict | list | None:
+        if not self.raw_json:
+            return None
+        try:
+            return json.loads(self.raw_json)
+        except (json.JSONDecodeError, TypeError):
+            return None
 
 
 class DeviceConfigRevision(Base):

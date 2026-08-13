@@ -226,6 +226,82 @@ class DeviceConfigOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class MachineCreate(BaseModel):
+    machine_key: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=128)
+    kind: str = Field(default="generic", max_length=32)
+    notes: str | None = None
+
+
+class MachineOut(BaseModel):
+    machine_key: str
+    name: str
+    kind: str
+    notes: str | None
+    created_ms: int
+    sensor_count: int = 0
+
+    model_config = {"from_attributes": True}
+
+
+class SensorCreate(BaseModel):
+    device_id: str = Field(min_length=1, max_length=64)
+    label: str | None = Field(default=None, max_length=64)
+    mount_note: str | None = Field(default=None, max_length=128)
+
+
+class SensorOut(BaseModel):
+    device_id: str
+    machine_key: str
+    label: str | None
+    mount_note: str | None
+    created_ms: int
+
+    model_config = {"from_attributes": True}
+
+
+class ReferenceProfilePut(BaseModel):
+    name: str = Field(default="", max_length=64)
+    duration_ms: int = Field(default=0, ge=0, le=30_000)
+    sample_hz: float | None = Field(default=None, gt=0)
+    format: str = Field(default="band_rms", max_length=16)
+    bands: list[float] | None = Field(default=None, max_length=64)
+    raw: dict | list | None = None
+    active: bool = True
+
+
+class ReferenceProfileOut(BaseModel):
+    device_id: str
+    slot: int = Field(ge=0, le=4)
+    name: str
+    created_ms: int
+    updated_ms: int
+    duration_ms: int
+    sample_hz: float | None
+    format: str
+    bands: list[float] | None = None
+    raw: dict | list | None = None
+    active: bool
+
+    model_config = {"from_attributes": True}
+
+
+class TrendPoint(BaseModel):
+    ts_ms: int
+    value: float
+
+
+class TrendOut(BaseModel):
+    device_id: str
+    metric: str
+    samples: int
+    trend: Literal["increasing", "decreasing", "none", "insufficient"]
+    score: float = Field(ge=-1.0, le=1.0)
+    early_warning: bool
+    latest_value: float | None = None
+    points: list[TrendPoint] = Field(default_factory=list)
+
+
 class DeviceConfigPut(BaseModel):
     revision: int = Field(ge=0)
     source: str = Field(default="be", max_length=16)

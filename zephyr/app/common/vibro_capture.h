@@ -8,6 +8,7 @@
 #include "imu_sample.h"
 #include "vibro_features.h"
 #include "vibro_band_rms.h"
+#include "vibro_ref_store.h"
 
 enum vibro_level {
 	VIBRO_LEVEL_OK = 0,
@@ -38,15 +39,30 @@ struct vibro_metrics {
 
 #define VIBRO_CAPTURE_MAX_SAMPLES 256
 
+/** profiles.txt #2: "up to 5 ideal sampling profiles of the length of 30s max". */
+#define VIBRO_REF_MAX_RECORD_SEC 30.0f
+
 void vibro_capture_init(void);
 void vibro_capture_apply_config(const struct device_config_v1 *cfg);
 void vibro_capture_reset(void);
 void vibro_capture_push(const struct imu_sample *sample);
-bool vibro_capture_start_reference(void);
+/** Begin recording a new reference into `slot` (0..VIBRO_REF_STORE_SLOTS-1).
+ * `name` may be NULL/empty for an auto-generated "slot N" name. Capped at
+ * VIBRO_REF_MAX_RECORD_SEC wall-clock seconds or VIBRO_REF_MAG_MAX samples,
+ * whichever comes first. */
+bool vibro_capture_start_reference(uint8_t slot, const char *name);
+/** Stop recording (or no-op if not recording) and persist the result to flash,
+ * making it the active reference immediately. */
 bool vibro_capture_stop_reference(void);
 bool vibro_capture_reference_ready(void);
-bool vibro_capture_refresh_ref_bands(void);
 size_t vibro_capture_reference_len(void);
+/** Load a previously-recorded slot as the live/active reference. */
+int vibro_capture_select_reference(uint8_t slot);
+/** Erase a slot; clears the live reference too if it was the active one. */
+int vibro_capture_delete_reference(uint8_t slot);
+int8_t vibro_capture_active_reference_slot(void);
+/** Compact per-slot metadata (name/duration/rms/valid/active) as JSON. */
+int vibro_capture_list_references_json(char *buf, size_t len);
 struct vibro_metrics vibro_capture_metrics_live(void);
 struct vibro_edge_features vibro_capture_edge_features(void);
 struct vibro_band_rms vibro_capture_band_rms(void);

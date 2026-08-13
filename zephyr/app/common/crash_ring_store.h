@@ -24,6 +24,8 @@ bool crash_ring_slot_pending(uint8_t slot);
 int crash_ring_list_json(char *buf, size_t len);
 int crash_ring_info_json(uint8_t slot, char *buf, size_t len);
 int crash_ring_clear_slot(uint8_t slot);
+/** Clears several slots' pending flags in a single flash erase+rewrite cycle. */
+int crash_ring_clear_slots(const uint8_t *slots, size_t n);
 void crash_ring_clear_all(void);
 int crash_ring_first_pending_slot(void);
 int crash_ring_next_pending_slot(uint8_t after);

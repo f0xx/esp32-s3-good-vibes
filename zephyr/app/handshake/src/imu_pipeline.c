@@ -27,6 +27,9 @@ static int64_t g_poll_next_ms;
 
 static struct imu_calibration g_cal;
 static struct imu_sample g_latest;
+static struct imu_pipeline_raw_entry g_raw_ring[IMU_PIPELINE_RAW_RING_CAP];
+static uint8_t g_raw_ring_head;
+static uint8_t g_raw_ring_count;
 static struct attitude_estimator g_attitude = { .alpha = 0.15f };
 static struct walk_distance_estimator g_walk;
 static float g_accel_scale = 1.0f;
@@ -340,9 +343,50 @@ bool imu_pipeline_tick(float dt_sec)
 	attitude_update(&g_attitude, &sample, dt_sec);
 	walk_distance_update(&g_walk, &sample, &g_attitude.state, dt_sec, k_uptime_get_32());
 	vibro_capture_push(&sample);
+
+	g_raw_ring[g_raw_ring_head].t_ms = k_uptime_get_32();
+	g_raw_ring[g_raw_ring_head].sample = sample;
+	g_raw_ring_head = (uint8_t)((g_raw_ring_head + 1U) % IMU_PIPELINE_RAW_RING_CAP);
+	if (g_raw_ring_count < IMU_PIPELINE_RAW_RING_CAP) {
+		g_raw_ring_count++;
+	}
+
 	ok = true;
 	k_mutex_unlock(&imu_lock);
 	return ok;
+}
+
+size_t imu_pipeline_drain_raw(struct imu_pipeline_raw_entry *out, size_t max)
+{
+	size_t n;
+
+	if (out == NULL || max == 0U) {
+		return 0U;
+	}
+
+	k_mutex_lock(&imu_lock, K_FOREVER);
+
+	n = (size_t)g_raw_ring_count;
+	if (n > max) {
+		n = max;
+	}
+
+	/* Oldest-first: ring holds g_raw_ring_count entries ending right before head. */
+	const uint8_t start =
+		(uint8_t)((g_raw_ring_head + IMU_PIPELINE_RAW_RING_CAP - g_raw_ring_count) %
+			  IMU_PIPELINE_RAW_RING_CAP);
+	const size_t skip = (size_t)g_raw_ring_count - n;
+
+	for (size_t i = 0; i < n; i++) {
+		const uint8_t idx =
+			(uint8_t)((start + skip + i) % IMU_PIPELINE_RAW_RING_CAP);
+
+		out[i] = g_raw_ring[idx];
+	}
+
+	g_raw_ring_count = 0U;
+	k_mutex_unlock(&imu_lock);
+	return n;
 }
 
 bool imu_pipeline_live(void)

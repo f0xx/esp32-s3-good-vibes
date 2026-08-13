@@ -9,6 +9,11 @@ import java.util.UUID
 object ImuProtocol {
     const val DEVICE_NAME = "ESP32S3 IMU sim"
 
+    /** Match firmware BLE_IMU_CONNECT_GRACE_MS + BLE_IMU_POST_GRACE_MS (+500 ms margin).
+     *  Phone GATT writes (MODE/poll/TIME/crash/offload) before this elapses stack against
+     *  ESP connect handling and have triggered TG0WDT_SYS_RST (task_wdt, 2 s HW fallback). */
+    const val ESP_CONNECT_SETTLE_MS = 14_500L
+
     val SERVICE_UUID: UUID = UUID.fromString("4a6e0001-0000-1000-8000-00805f9b34fb")
     val CHAR_MODE_UUID: UUID = UUID.fromString("4a6e0002-0000-1000-8000-00805f9b34fb")
     val CHAR_STATUS_UUID: UUID = UUID.fromString("4a6e0003-0000-1000-8000-00805f9b34fb")
@@ -18,6 +23,10 @@ object ImuProtocol {
     val CHAR_TIME_UUID: UUID = UUID.fromString("4a6e0007-0000-1000-8000-00805f9b34fb")
     val CHAR_CAPS_UUID: UUID = UUID.fromString("4a6e0008-0000-1000-8000-00805f9b34fb")
     val CHAR_SCREEN_UUID: UUID = UUID.fromString("4a6e0009-0000-1000-8000-00805f9b34fb")
+    /** Manual CPU clock override, 1 byte: 0 = auto, else explicit target MHz. */
+    val CHAR_CPU_MHZ_UUID: UUID = UUID.fromString("4a6e000a-0000-1000-8000-00805f9b34fb")
+    /** Manual IMU sample-rate override, 1 byte: 0 = auto, else explicit Hz (1-120). */
+    val CHAR_IMU_HZ_UUID: UUID = UUID.fromString("4a6e000b-0000-1000-8000-00805f9b34fb")
 
     const val CAP_IMU = 1 shl 0
     const val CAP_TFT = 1 shl 1
@@ -99,6 +108,16 @@ object ImuProtocol {
         val clockDriftMs: Long? = null,
         val clockCorrMs: Long? = null,
         val clockUnixSec: Long? = null,
+        /** Mode/override-derived MHz before the BLE-linked 240 MHz floor. */
+        val cpuMhzDesired: Int? = null,
+        /** 0 = auto (mode-derived); nonzero = manual override currently in effect. */
+        val cpuMhzOverride: Int? = null,
+        /** Actually-applied CPU MHz (settled). */
+        val cpuMhzApplied: Int? = null,
+        /** True while BT/BLE forces the 240 MHz safety floor. */
+        val cpuBleClamped: Boolean = false,
+        val imuHzTarget: Int? = null,
+        val imuHzOverride: Int? = null,
     )
 
     data class PowerStatus(
@@ -182,8 +201,26 @@ object ImuProtocol {
     )
 
     fun parseStatus(json: String): Status {
-        val o = JSONObject(json)
-        return Status(
+        val o = JSONObject(json.trim())
+        return parseStatusObject(o)
+    }
+
+    fun parseStatusLenient(json: String): Status? = try {
+        parseStatus(json)
+    } catch (_: Exception) {
+        null
+    }
+
+    /** Reject torn/truncated ATT long-read or NOTIFY payloads before JSONObject tries. */
+    fun looksLikeCompleteJson(json: String): Boolean {
+        val t = json.trim()
+        if (t.length < 2 || t[0] != '{') return false
+        var i = t.length - 1
+        while (i >= 0 && t[i].isWhitespace()) i--
+        return i > 0 && t[i] == '}'
+    }
+
+    private fun parseStatusObject(o: JSONObject): Status = Status(
             seq = o.optLong("s"),
             mode = o.optInt("m"),
             count = o.optInt("n"),
@@ -230,8 +267,13 @@ object ImuProtocol {
             clockDriftMs = if (o.has("clkd")) o.optLong("clkd") else null,
             clockCorrMs = if (o.has("clkc")) o.optLong("clkc") else null,
             clockUnixSec = if (o.has("clku")) o.optLong("clku") else null,
+            cpuMhzDesired = if (o.has("cpumhz")) o.optInt("cpumhz") else null,
+            cpuMhzOverride = if (o.has("cpuov")) o.optInt("cpuov") else null,
+            cpuMhzApplied = if (o.has("cpuact")) o.optInt("cpuact") else null,
+            cpuBleClamped = o.optInt("cpuclamp", 0) != 0,
+            imuHzTarget = if (o.has("imuhz")) o.optInt("imuhz") else null,
+            imuHzOverride = if (o.has("imuov")) o.optInt("imuov") else null,
         )
-    }
 
     fun crashDebugFromCaps(caps: Int): Boolean = (caps and CAP_CRASH_DEBUG) != 0
 
@@ -284,6 +326,26 @@ object ImuProtocol {
 
     /** Scene row: [t,dm,fx,fy,fz, axes×12, corners×16] → 33 fields. */
     private const val SCENE_ROW_MIN_LEN = 33
+
+    /** Lightweight header for dedup/stats without parsing the full `d` payload. */
+    data class BatchHeader(val seq: Long, val mode: Int, val recordCount: Int)
+
+    /** Parse only batch metadata (seq/mode/record count) — skips row arrays. */
+    fun peekBatchHeader(json: String): BatchHeader? {
+        val trimmed = json.trim()
+        if (trimmed.length < 8 || !trimmed.startsWith("{")) {
+            return null
+        }
+        return try {
+            val o = org.json.JSONObject(trimmed)
+            val mode = o.optInt("m")
+            val seq = o.optLong("s")
+            val recordCount = o.optJSONArray("d")?.length() ?: 0
+            BatchHeader(seq, mode, recordCount)
+        } catch (_: Exception) {
+            null
+        }
+    }
 
     fun parseBatch(json: String): Batch {
         val trimmed = json.trim()

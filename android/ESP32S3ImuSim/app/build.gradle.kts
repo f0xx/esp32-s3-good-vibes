@@ -11,8 +11,8 @@ android {
         applicationId = "com.esp32s3.imusim"
         minSdk = 26
         targetSdk = 34
-        versionCode = 27
-        versionName = "1.8.1-relay-banner"
+        versionCode = 39
+        versionName = "1.15.0-connect-grace"
     }
 
     buildTypes {

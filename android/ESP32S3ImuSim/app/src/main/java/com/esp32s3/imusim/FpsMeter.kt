@@ -12,6 +12,7 @@ class FpsMeter(private val windowMs: Long = 1000L) {
     private var uiApplyFps = 0f
     private var drawFps = 0f
     private var pollMs = ImuProtocol.DEFAULT_POLL_MS
+    private var drawFpsCap = 0
 
     data class Snapshot(
         val bleRxFps: Float,
@@ -19,16 +20,19 @@ class FpsMeter(private val windowMs: Long = 1000L) {
         val drawFps: Float,
         val pollMs: Int,
         val targetFps: Float,
+        val drawFpsCap: Int,
     ) {
         fun caption(): String {
+            val capLabel = if (drawFpsCap <= 0) "auto" else drawFpsCap.toString()
             return String.format(
                 java.util.Locale.US,
-                "fps BLE %.0f UI %.0f draw %.0f (poll %dms, tgt %.0f)",
+                "fps BLE %.0f UI %.0f draw %.0f (poll %dms, tgt %.0f, cap %s)",
                 bleRxFps,
                 uiApplyFps,
                 drawFps,
                 pollMs,
                 targetFps,
+                capLabel,
             )
         }
 
@@ -46,6 +50,11 @@ class FpsMeter(private val windowMs: Long = 1000L) {
     @Synchronized
     fun setPollMs(ms: Int) {
         pollMs = ms
+    }
+
+    @Synchronized
+    fun setDrawFpsCap(cap: Int) {
+        drawFpsCap = cap.coerceIn(0, 25)
     }
 
     @Synchronized
@@ -78,6 +87,7 @@ class FpsMeter(private val windowMs: Long = 1000L) {
             drawFps = drawFps,
             pollMs = pollMs,
             targetFps = 1000f / pollMs.coerceAtLeast(1),
+            drawFpsCap = drawFpsCap,
         )
     }
 

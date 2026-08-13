@@ -39,39 +39,65 @@ object CrashFetcher {
         }
     }
 
+    /**
+     * Firmware embeds full per-slot detail (slot/seq/reason/pc/bt/…) directly in the "slots"
+     * array — see crash_ring_list_json(). Parsing it here avoids a per-slot write+read
+     * round trip for every pending crash, which used to be the main cause of long BLE
+     * disconnect/reconnect cycles ("crash clear failed") whenever 2+ crashes were pending.
+     * Firmware may omit a slot here if it didn't fit the 512B ATT cap — those are simply
+     * missing from this round's result and get picked up on the relay's next round.
+     */
+    fun parseListDetailed(json: String): List<CrashInfo> {
+        return try {
+            val o = JSONObject(json)
+            val arr = o.optJSONArray("slots") ?: return emptyList()
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val row = arr.optJSONObject(i) ?: continue
+                    parseInfoObject(row)?.let { add(it) }
+                }
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
     fun parseInfo(json: String): CrashInfo? {
         return try {
             if (isListJson(json)) {
                 return null
             }
-            val o = JSONObject(json)
-            if (o.optInt("pending", 0) == 0 && !o.has("pc")) {
-                return null
-            }
-            val bt = mutableListOf<Long>()
-            o.optJSONArray("bt")?.let { arr ->
-                for (i in 0 until arr.length()) {
-                    bt.add(arr.optLong(i))
-                }
-            }
-            CrashInfo(
-                pending = o.optInt("pending", 0) != 0,
-                slot = o.optInt("slot", -1),
-                seq = o.optLong("seq"),
-                size = o.optInt("size"),
-                pc = o.optLong("pc"),
-                exccause = o.optInt("exccause"),
-                excvaddr = o.optLong("excvaddr"),
-                reason = o.optString("reason", "unknown"),
-                fw = o.optString("fw", ""),
-                reset = o.optInt("reset"),
-                uptimeMs = o.optLong("uptime"),
-                backtrace = bt,
-                detail = o.optJSONObject("detail"),
-            )
+            parseInfoObject(JSONObject(json))
         } catch (_: Exception) {
             null
         }
+    }
+
+    private fun parseInfoObject(o: JSONObject): CrashInfo? {
+        if (o.optInt("pending", 0) == 0 && !o.has("pc")) {
+            return null
+        }
+        val bt = mutableListOf<Long>()
+        o.optJSONArray("bt")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                bt.add(arr.optLong(i))
+            }
+        }
+        return CrashInfo(
+            pending = true,
+            slot = o.optInt("slot", -1),
+            seq = o.optLong("seq"),
+            size = o.optInt("size"),
+            pc = o.optLong("pc"),
+            exccause = o.optInt("exccause"),
+            excvaddr = o.optLong("excvaddr"),
+            reason = o.optString("reason", "unknown"),
+            fw = o.optString("fw", ""),
+            reset = o.optInt("reset"),
+            uptimeMs = o.optLong("uptime"),
+            backtrace = bt,
+            detail = o.optJSONObject("detail"),
+        )
     }
 
     fun toOffloadJson(info: CrashInfo): String {

@@ -18,7 +18,17 @@
 #define BAT_MEASUREMENT_OFFSET        0.992857f
 #define BAT_FULL_V                    4.20f
 #define BAT_EMPTY_V                   3.00f
-#define BAT_DC_MARGIN_V               4.18f
+/* There is no VBUS/charger-status sense pin on this board — DC vs battery is inferred purely
+ * from cell voltage + trend (see battery_monitor.c classify_power_source()). A LiPo that
+ * finished charging on USB commonly plateaus/trickles at ~4.15-4.19V depending on charger
+ * termination voltage and this board's ADC calibration slop (BAT_MEASUREMENT_OFFSET), which
+ * sat just *below* the old 4.18V margin — so a fully-charged-on-USB device could get stuck
+ * reporting src=BAT forever (flat trend never triggers the rise-based DC detection, and the
+ * margin check that would otherwise catch it never fired). Lowered to comfortably cover that
+ * plateau while staying well above any real discharge-under-load resting voltage; an actual
+ * unplug is still caught quickly via the trend-fall path (BAT_TREND_FALL_V), independent of
+ * this margin. */
+#define BAT_DC_MARGIN_V               4.10f
 #define BAT_TREND_WINDOW              16
 #define BAT_TREND_COMPARE             5
 #define BAT_TREND_RISE_V              0.012f
@@ -32,13 +42,20 @@
 
 #define IMU_SAMPLE_HZ_DEFAULT         100
 #define IMU_SAMPLE_HZ_MIN             10
+/** Screen-off / no-render awake tier — enough for BLE telemetry, not scene fidelity. */
+#define IMU_SAMPLE_HZ_IDLE            25
 #define RENDER_HZ_DEFAULT             30
 
 /*
  * Demo/staging operating mode — cycled by BOOT tap (device_config local flag).
- * CPU steps are the only three PLL frequencies the ESP32-S3 clock driver
- * accepts (80/160/240 MHz); 120/40 MHz requested in the spec aren't valid PLL
- * dividers, so each tier below picks the closest supported step.
+ * CPU steps are 80/160/240 MHz — all three are just divider taps off the same
+ * always-on 480 MHz BBPLL, which is what makes live switching between them
+ * safe while BT/BLE is active (see apply_cpu_mhz_fast() in power_manager.c).
+ * 120 MHz isn't a valid PLL divider. Frequencies below 80 MHz (e.g. 40 MHz)
+ * are technically supported by the SoC via the XTAL clock source instead of
+ * the PLL, but that path disables the BBPLL outright and leaves the CPU too
+ * slow to reliably service BLE's real-time interrupts — not offered while a
+ * BT/BLE link may be active, so not exposed here.
  */
 #define OPMODE_CPU_MHZ_DEMO_DC        240U
 #define OPMODE_CPU_MHZ_DEMO_BAT       160U

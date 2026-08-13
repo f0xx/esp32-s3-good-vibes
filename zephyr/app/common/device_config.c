@@ -323,6 +323,34 @@ void device_config_set_staging_mode(bool staging)
 	(void)device_config_save(&cfg);
 }
 
+uint8_t device_config_cpu_mhz_override(void)
+{
+	return device_config_runtime()->reserved[9];
+}
+
+void device_config_set_cpu_mhz_override(uint8_t mhz)
+{
+	struct device_config_v1 cfg = *device_config_runtime();
+
+	cfg.reserved[9] = mhz;
+	bump_local_revision(&cfg);
+	(void)device_config_save(&cfg);
+}
+
+uint8_t device_config_imu_hz_override(void)
+{
+	return device_config_runtime()->reserved[10];
+}
+
+void device_config_set_imu_hz_override(uint8_t hz)
+{
+	struct device_config_v1 cfg = *device_config_runtime();
+
+	cfg.reserved[10] = hz;
+	bump_local_revision(&cfg);
+	(void)device_config_save(&cfg);
+}
+
 enum device_config_apply_result device_config_apply_remote(const struct device_config_v1 *incoming)
 {
 	if (incoming == NULL || !validate(incoming)) {
@@ -345,6 +373,8 @@ enum device_config_apply_result device_config_apply_remote(const struct device_c
 	merged.reserved[6] = cur->reserved[6];
 	merged.reserved[7] = cur->reserved[7];
 	merged.reserved[8] = cur->reserved[8];
+	merged.reserved[9] = cur->reserved[9];
+	merged.reserved[10] = cur->reserved[10];
 
 	if (!device_config_save(&merged)) {
 		return DEVICE_CONFIG_APPLY_INVALID;

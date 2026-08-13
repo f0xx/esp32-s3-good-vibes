@@ -9,6 +9,7 @@
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/util.h>
 
 #include "crash_report.h"
 #include "crash_debug.h"
@@ -31,7 +32,11 @@ static struct bt_uuid_128 crash_info_uuid = BT_UUID_INIT_128(BT_UUID_CRASH_INFO_
 static struct bt_uuid_128 crash_ctrl_uuid = BT_UUID_INIT_128(BT_UUID_CRASH_CTRL_VAL);
 static struct bt_uuid_128 crash_data_uuid = BT_UUID_INIT_128(BT_UUID_CRASH_DATA_VAL);
 
-static char g_info_json[480];
+/* BLE ATT attribute values are hard-capped at 512B by the Bluetooth spec (BT_ATT_MAX_ATTRIBUTE_LEN)
+ * regardless of buffer size here, so this must stay <= that. crash_ring_list_json() keeps each
+ * bulk-mode record compact (~190-210B) so 2 pending crashes usually fit in one read; any
+ * remainder is picked up on the relay's next round instead of overflowing. */
+static char g_info_json[500];
 static uint8_t g_data_buf[512];
 static size_t g_data_len;
 static off_t g_data_off;
@@ -90,6 +95,44 @@ static bool parse_slot_cmd(const char *json, int *slot_out)
 	return *slot_out >= 0 && *slot_out < (int)CRASH_RING_SLOTS;
 }
 
+/* Parses {"op":"clear","slots":[0,2,3]} — lets the phone clear every slot it just confirmed
+ * uploaded to the cloud in one BLE write instead of one write per slot. Returns the number of
+ * slots parsed (0 if the key is absent so the caller falls back to single-slot/clear-all). */
+static int parse_slots_array(const char *json, uint8_t *slots_out, int max_slots)
+{
+	const char *key = strstr(json, "\"slots\"");
+	int count = 0;
+
+	if (key == NULL) {
+		return 0;
+	}
+	key = strchr(key, '[');
+	if (key == NULL) {
+		return 0;
+	}
+	key++;
+
+	while (*key != '\0' && *key != ']' && count < max_slots) {
+		while (*key == ' ' || *key == ',') {
+			key++;
+		}
+		if (*key == ']' || *key == '\0') {
+			break;
+		}
+		char *end = NULL;
+		long v = strtol(key, &end, 10);
+
+		if (end == key) {
+			break;
+		}
+		if (v >= 0 && v < (long)CRASH_RING_SLOTS) {
+			slots_out[count++] = (uint8_t)v;
+		}
+		key = end;
+	}
+	return count;
+}
+
 static ssize_t read_info(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
 			 uint16_t len, uint16_t offset)
 {
@@ -130,9 +173,20 @@ static void process_ctrl_json(void)
 	char *json = g_ctrl_json;
 
 	if (strstr(json, "\"op\":\"clear\"") != NULL) {
+		uint8_t slots[CRASH_RING_SLOTS];
+		int n = parse_slots_array(json, slots, (int)ARRAY_SIZE(slots));
 		int slot = -1;
 
-		if (parse_slot_cmd(json, &slot)) {
+		if (n > 0) {
+			/* Single erase+rewrite for all N slots — see crash_report_clear_slots()'s
+			 * doc comment for why looping crash_report_clear_slot() per slot here used
+			 * to chain N full flash-sector erases inside one BLE write callback, which
+			 * was long enough to starve the main-loop stall watchdog and reboot the
+			 * device mid-clear (surfaced to the phone as "crash clear failed" +
+			 * a dropped link). */
+			crash_report_clear_slots(slots, (size_t)n);
+			LOG_INF("crash slots cleared via BLE (n=%d)", n);
+		} else if (parse_slot_cmd(json, &slot)) {
 			crash_report_clear_slot((uint8_t)slot);
 			LOG_INF("crash slot %d cleared via BLE", slot);
 		} else {
@@ -245,7 +299,23 @@ bool ble_crash_gatt_pending(void)
 
 void ble_crash_gatt_looper_tick(void)
 {
-	if (ble_imu_in_connect_grace()) {
+	if (!atomic_get(&g_defer_ctrl)) {
+		return;
+	}
+
+	/* Dev inject/BIST must run immediately — connect grace (12s) blocked user-triggered
+	 * faults and made the mobile "Crash debug" menu appear dead. "clear" is also urgent:
+	 * running it exactly at the grace-elapse tick (the same tick that kicks off batch-prep
+	 * once notifications are enabled, see ble_imu_gatt.c's g_grace_prep_pending) seemed to
+	 * correlate with the intermittent flash-erase/BLE TG0WDT_SYS_RST reset (see
+	 * persist_ring()'s doc comment) — running the clear's flash write earlier, decoupled
+	 * from that boundary, avoids stacking it against whatever else fires there. Read dump
+	 * still defers until grace ends. */
+	const bool urgent = strstr(g_ctrl_json, "\"op\":\"inject\"") != NULL ||
+			    strstr(g_ctrl_json, "\"op\":\"bist\"") != NULL ||
+			    strstr(g_ctrl_json, "\"op\":\"clear\"") != NULL;
+
+	if (!urgent && ble_imu_in_connect_grace()) {
 		return;
 	}
 

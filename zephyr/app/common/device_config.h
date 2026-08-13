@@ -85,6 +85,13 @@ struct device_config_v1 {
 			       * [0]=mix_every [1]=mix_ratio [2]=dyn_short [3]=dyn_nested
 			       * [4..7]=local_revision u32 LE (bit31 = ESP-local namespace)
 			       * [8]=local_flags (bit0 = TFT user-off persists across reboot)
+			       * [9]=cpu_mhz_override (0=auto/mode-derived, else explicit MHz —
+			       *     see power_manager.c apply_rates())
+			       * [10]=imu_hz_override (0=auto/mode-derived, else explicit Hz)
+			       * Both are ESP-local like [8] (excluded from cloud/remote merge —
+			       * see device_config_apply_remote()) since they're a phone-side
+			       * manual override of *this device's* live behavior, not profile
+			       * data meant to sync.
 			       */
 };
 #pragma pack(pop)
@@ -122,3 +129,9 @@ bool device_config_user_screen_off(void);
 /** Demo (false) / staging (true) operating mode — persists across reboots, local only. */
 bool device_config_staging_mode(void);
 void device_config_set_staging_mode(bool staging);
+/** Manual CPU clock override (0 = auto/mode-derived), local only, persists across reboots. */
+uint8_t device_config_cpu_mhz_override(void);
+void device_config_set_cpu_mhz_override(uint8_t mhz);
+/** Manual IMU sample-rate override (0 = auto/mode-derived), local only, persists across reboots. */
+uint8_t device_config_imu_hz_override(void);
+void device_config_set_imu_hz_override(uint8_t hz);

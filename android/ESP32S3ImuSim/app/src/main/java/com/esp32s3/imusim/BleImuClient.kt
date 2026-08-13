@@ -3,12 +3,12 @@ package com.esp32s3.imusim
 import android.annotation.SuppressLint
 import android.bluetooth.*
 import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import java.nio.charset.StandardCharsets
 import java.util.UUID
 
@@ -20,7 +20,7 @@ class BleImuClient(
         fun onStatus(text: String)
         fun onPollStats(seq: Long, recordCount: Int, pollMs: Int) {}
         fun onDeviceStatus(status: ImuProtocol.Status) {}
-        fun onBatch(batch: ImuProtocol.Batch)
+        fun onBatch(batch: ImuProtocol.Batch) {}
         fun onBatchJson(json: String) {}
         fun onPowerStatus(power: ImuProtocol.PowerStatus)
         fun onConnected(connected: Boolean)
@@ -39,14 +39,19 @@ class BleImuClient(
     private var pollMs = ImuProtocol.DEFAULT_POLL_MS
     private var watchdogRunnable: Runnable? = null
     private var statusPollRunnable: Runnable? = null
-    private val statusPollIntervalMs = 2000L
+    private val statusPollIntervalMs = 5000L
+    private val notifyFallbackMs = 2500L
+    private var lastNotifyBatchAtMs = 0L
     private var pollGeneration = 0
     private var targetMode = ImuProtocol.MODE_COMPUTED
     private var lastSeq = -1L
+    private var statusParseRetries = 0
     private var scanning = false
     private var bleSessionUp = false
     private var connectTimeoutRunnable: Runnable? = null
-    private var gattConnectTimeoutRunnable: Runnable? = null
+    private var gattLinkTimeoutRunnable: Runnable? = null
+    private var gattPostConnectTimeoutRunnable: Runnable? = null
+    private var connectFailureReported = false
     private var deviceCaps = 0
     private var netServiceAvailable = false
     var crashServiceAvailable = false
@@ -59,7 +64,29 @@ class BleImuClient(
     private var pendingNetScanRead: ((String?) -> Unit)? = null
     private var pendingNetProfilesRead: ((String?) -> Unit)? = null
     private var pendingCrashJsonRead: ((String?) -> Unit)? = null
+    private var pendingVibroRefListRead: ((String?) -> Unit)? = null
     private var minimalRelayConnect = false
+    private var fullSessionActive = false
+    private var directConnectFallbackRunnable: Runnable? = null
+    private var connectBusy = false
+    private var connectSeq = 0
+    private var sessionSetupPending = false
+    private var timeSyncAttempts = 0
+    private var timeSyncOkBannerShown = false
+    private val sessionSetupRunnable = Runnable {
+        val g = gatt ?: return@Runnable
+        if (!bleSessionUp || !sessionSetupPending) return@Runnable
+        beginGattSessionSetup(g)
+    }
+    private val timeSyncRetryRunnable = Runnable { retryTimeSyncIfNeeded() }
+
+    fun isSessionUp(): Boolean = bleSessionUp
+
+    fun isFullSessionUp(): Boolean = bleSessionUp && fullSessionActive
+
+    fun isConnectBusy(): Boolean = connectBusy
+
+    fun connectedDeviceAddress(): String? = gatt?.device?.address
 
     private sealed class GattRequest {
         abstract val tag: String
@@ -84,13 +111,18 @@ class BleImuClient(
 
     private companion object {
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-        const val CONNECT_SCAN_TIMEOUT_MS = 25_000L
+        const val CONNECT_SCAN_TIMEOUT_MS = 20_000L
+        const val GATT_LINK_TIMEOUT_MS = 15_000L
+        const val GATT_POST_CONNECT_TIMEOUT_MS = 24_000L
+        const val GATT_FULL_SETUP_TIMEOUT_MS = 40_000L
         const val GATT_CONNECT_TIMEOUT_MS = 12_000L
         /** Force-clear a stuck GATT op (no read/write callback) — avoids hanging the queue forever. */
         const val GATT_OP_TIMEOUT_MS = 8_000L
         /** Wait for ESP connect grace before ATT service discovery (minimal relay). */
         /** Must exceed firmware BLE_CONNECT_GRACE_MS (12000) + link settle. */
         const val MINIMAL_DISCOVER_DELAY_MS = 14_000L
+        const val PRE_SCAN_SETTLE_MS = 200L
+        const val DIRECT_CONNECT_FALLBACK_MS = 8_000L
     }
 
     fun deviceCaps(): Int = deviceCaps
@@ -105,30 +137,96 @@ class BleImuClient(
     }
 
     @SuppressLint("MissingPermission")
-    fun connect() {
+    fun connect(lastKnownAddress: String? = null) {
+        mainHandler.post { startConnect(lastKnownAddress) }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startConnect(lastKnownAddress: String?) {
+        connectSeq++
+        connectBusy = true
+        connectFailureReported = false
         if (adapter == null || !adapter.isEnabled) {
+            connectBusy = false
             postBanner(StatusBannerLevel.ERROR, "Bluetooth off")
+            listener.onConnectFailed("Bluetooth off")
             return
         }
         stopPoll()
-        disconnect()
-        postStatus("Scanning for ${ImuProtocol.DEVICE_NAME}...")
-        val filters = listOf(
-            ScanFilter.Builder().setServiceUuid(android.os.ParcelUuid(ImuProtocol.SERVICE_UUID)).build(),
-            ScanFilter.Builder().setDeviceName(ImuProtocol.DEVICE_NAME).build(),
-        )
+        disconnectInternal(notifyListener = false)
+        val addr = lastKnownAddress?.takeIf { it.isNotBlank() }
+        if (addr != null) {
+            tryDirectConnect(addr)
+        } else {
+            postStatus("Scanning for ${ImuProtocol.DEVICE_NAME}...")
+            mainHandler.postDelayed({ startBleScan() }, PRE_SCAN_SETTLE_MS)
+        }
+    }
+
+    /** Upgrade an existing minimal relay GATT session to full IMU notify/poll without reconnect. */
+    @SuppressLint("MissingPermission")
+    fun upgradeToFullSession(): Boolean {
+        val g = gatt ?: return false
+        if (!bleSessionUp || !minimalRelayConnect) {
+            return false
+        }
+        minimalRelayConnect = false
+        g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+        if (g.getService(ImuProtocol.SERVICE_UUID) != null) {
+            finishFullSessionSetup(g)
+            return true
+        }
+        g.requestMtu(517)
+        return true
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun tryDirectConnect(address: String) {
+        postStatus("Direct connect $address…")
+        try {
+            val device = adapter?.getRemoteDevice(address) ?: run {
+                postStatus("Scanning for ${ImuProtocol.DEVICE_NAME}...")
+                mainHandler.postDelayed({ startBleScan() }, PRE_SCAN_SETTLE_MS)
+                return
+            }
+            gatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+            scheduleGattLinkTimeout()
+            directConnectFallbackRunnable?.let { mainHandler.removeCallbacks(it) }
+            directConnectFallbackRunnable = Runnable {
+                if (!bleSessionUp && gatt != null && !scanning) {
+                    postStatus("Direct connect slow — scanning…")
+                    disconnect()
+                    postStatus("Scanning for ${ImuProtocol.DEVICE_NAME}...")
+                    mainHandler.postDelayed({ startBleScan() }, PRE_SCAN_SETTLE_MS)
+                }
+            }
+            mainHandler.postDelayed(directConnectFallbackRunnable!!, DIRECT_CONNECT_FALLBACK_MS)
+        } catch (_: IllegalArgumentException) {
+            postStatus("Scanning for ${ImuProtocol.DEVICE_NAME}...")
+            mainHandler.postDelayed({ startBleScan() }, PRE_SCAN_SETTLE_MS)
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startBleScan() {
+        if (adapter == null || !adapter.isEnabled) {
+            listener.onConnectFailed("Bluetooth off")
+            return
+        }
+        // Unfiltered scan — ESP puts the IMU UUID in the adv packet and the name in scan
+        // response only; hardware filters on some phones miss it for many seconds.
         val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_BALANCED)
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
         scanning = true
-        adapter.bluetoothLeScanner.startScan(filters, settings, scanCallback)
+        adapter?.bluetoothLeScanner?.startScan(null, settings, scanCallback)
         connectTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
         connectTimeoutRunnable = Runnable {
             if (scanning) {
-                adapter.bluetoothLeScanner.stopScan(scanCallback)
+                adapter?.bluetoothLeScanner?.stopScan(scanCallback)
                 scanning = false
                 postBanner(StatusBannerLevel.WARN, "Device not found")
-                listener.onConnectFailed("device not found (${CONNECT_SCAN_TIMEOUT_MS / 1000}s scan)")
+                reportConnectFailed("device not found (${CONNECT_SCAN_TIMEOUT_MS / 1000}s scan)")
             }
         }
         mainHandler.postDelayed(connectTimeoutRunnable!!, CONNECT_SCAN_TIMEOUT_MS)
@@ -136,12 +234,22 @@ class BleImuClient(
 
     @SuppressLint("MissingPermission")
     fun disconnect() {
+        mainHandler.post { disconnectInternal(notifyListener = true) }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun disconnectInternal(notifyListener: Boolean) {
+        connectBusy = false
+        sessionSetupPending = false
+        stopTimeSyncRetries()
+        mainHandler.removeCallbacks(sessionSetupRunnable)
         stopPoll()
         clearGattQueue()
         connectTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
         connectTimeoutRunnable = null
-        gattConnectTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
-        gattConnectTimeoutRunnable = null
+        clearGattConnectTimeouts()
+        directConnectFallbackRunnable?.let { mainHandler.removeCallbacks(it) }
+        directConnectFallbackRunnable = null
         if (scanning) {
             adapter?.bluetoothLeScanner?.stopScan(scanCallback)
             scanning = false
@@ -150,13 +258,14 @@ class BleImuClient(
         gatt?.close()
         gatt = null
         bleSessionUp = false
+        fullSessionActive = false
         netServiceAvailable = false
         cccdQueue.clear()
         cccdGatt = null
         pendingNetScanRead = null
         pendingNetProfilesRead = null
         pendingCrashJsonRead = null
-        if (wasUp) {
+        if (notifyListener && wasUp) {
             listener.onConnected(false)
         }
     }
@@ -167,8 +276,9 @@ class BleImuClient(
         lastSeq = -1L
         val ch = gatt?.getService(ImuProtocol.SERVICE_UUID)?.getCharacteristic(ImuProtocol.CHAR_MODE_UUID)
         if (ch != null) {
-            ch.value = byteArrayOf(mode.toByte())
-            gatt?.writeCharacteristic(ch)
+            // Queued (see setEspScreenOn's doc comment) — a direct write here can race the
+            // periodic DATA/STATUS polls that share the same BluetoothGatt.
+            enqueueGatt(GattRequest.WriteChar(char = ch, payload = byteArrayOf(mode.toByte())), highPriority = true)
         }
         mainHandler.postDelayed({ pollDataOnly() }, 80)
     }
@@ -180,24 +290,102 @@ class BleImuClient(
         mainHandler.post { pollDataOnly() }
     }
 
+    /** Routed through gattQueue (not a direct gatt.writeCharacteristic call) — a direct write here
+     *  used to race the periodic STATUS/DATA polls (pollStatusOnly/pollDataOnly run every ~poll
+     *  interval while connected), which are always in flight via the same queue. Two concurrent
+     *  GATT ops on one BluetoothGatt silently drop or strand one of them (see syncTimeFromPhone's
+     *  doc comment for the same class of bug) — this is what made "turn ESP display on/off" look
+     *  flaky/no-op from the phone side even though the BLE write occasionally landed fine. */
     @SuppressLint("MissingPermission")
-    fun setEspScreenOn(on: Boolean) {
+    fun setEspScreenOn(on: Boolean, onDone: ((Boolean) -> Unit)? = null) {
         val ch = gatt?.getService(ImuProtocol.SERVICE_UUID)
-            ?.getCharacteristic(ImuProtocol.CHAR_SCREEN_UUID) ?: return
-        ch.value = byteArrayOf(if (on) 1 else 0)
-        gatt?.writeCharacteristic(ch)
-        mainHandler.postDelayed({ pollStatusOnly() }, 120)
+            ?.getCharacteristic(ImuProtocol.CHAR_SCREEN_UUID) ?: run {
+            onDone?.invoke(false)
+            return
+        }
+        enqueueGatt(
+            GattRequest.WriteChar(
+                char = ch,
+                payload = byteArrayOf(if (on) 1 else 0),
+                onComplete = { ok ->
+                    if (ok) {
+                        mainHandler.postDelayed({ pollStatusOnly() }, 120)
+                    } else {
+                        postBanner(StatusBannerLevel.ERROR, "Screen ${if (on) "on" else "off"} write failed")
+                    }
+                    onDone?.invoke(ok)
+                },
+            ),
+            highPriority = true,
+        )
+    }
+
+    /** mhz = 0 restores auto (mode-derived). Queued — see setEspScreenOn's doc comment. */
+    @SuppressLint("MissingPermission")
+    fun setCpuMhzOverride(mhz: Int, onDone: ((Boolean) -> Unit)? = null) {
+        val ch = gatt?.getService(ImuProtocol.SERVICE_UUID)
+            ?.getCharacteristic(ImuProtocol.CHAR_CPU_MHZ_UUID) ?: run {
+            onDone?.invoke(false)
+            return
+        }
+        enqueueGatt(
+            GattRequest.WriteChar(
+                char = ch,
+                payload = byteArrayOf(mhz.coerceIn(0, 255).toByte()),
+                onComplete = { ok ->
+                    if (ok) {
+                        mainHandler.postDelayed({ pollStatusOnly() }, 120)
+                    } else {
+                        postBanner(StatusBannerLevel.ERROR, "CPU speed override write failed")
+                    }
+                    onDone?.invoke(ok)
+                },
+            ),
+            highPriority = true,
+        )
+    }
+
+    /** hz = 0 restores auto (mode-derived); nonzero clamped firmware-side to [1,120].
+     *  Queued — see setEspScreenOn's doc comment. */
+    @SuppressLint("MissingPermission")
+    fun setImuHzOverride(hz: Int, onDone: ((Boolean) -> Unit)? = null) {
+        val ch = gatt?.getService(ImuProtocol.SERVICE_UUID)
+            ?.getCharacteristic(ImuProtocol.CHAR_IMU_HZ_UUID) ?: run {
+            onDone?.invoke(false)
+            return
+        }
+        enqueueGatt(
+            GattRequest.WriteChar(
+                char = ch,
+                payload = byteArrayOf(hz.coerceIn(0, 255).toByte()),
+                onComplete = { ok ->
+                    if (ok) {
+                        mainHandler.postDelayed({ pollStatusOnly() }, 120)
+                    } else {
+                        postBanner(StatusBannerLevel.ERROR, "IMU sample rate override write failed")
+                    }
+                    onDone?.invoke(ok)
+                },
+            ),
+            highPriority = true,
+        )
     }
 
     @SuppressLint("MissingPermission")
     fun setPollIntervalMs(ms: Int) {
-        pollMs = ms.coerceIn(33, 2000)
+        val newMs = ms.coerceIn(33, 2000)
+        val changed = newMs != pollMs
+        pollMs = newMs
         val ch = gatt?.getService(ImuProtocol.SERVICE_UUID)?.getCharacteristic(ImuProtocol.CHAR_POLL_MS_UUID)
-        if (ch != null) {
-            ch.value = ImuProtocol.pollMsToBytes(pollMs)
-            gatt?.writeCharacteristic(ch)
+        if (ch != null && changed) {
+            // Queued (see setEspScreenOn's doc comment) — a direct write here can race the
+            // periodic DATA/STATUS polls that share the same BluetoothGatt.
+            enqueueGatt(
+                GattRequest.WriteChar(char = ch, payload = ImuProtocol.pollMsToBytes(pollMs)),
+                highPriority = true,
+            )
         }
-        if (gatt != null) {
+        if (gatt != null && changed) {
             stopPoll()
             startPoll()
         }
@@ -206,66 +394,198 @@ class BleImuClient(
     private val scanCallback = object : ScanCallback() {
         @SuppressLint("MissingPermission")
         override fun onScanResult(callbackType: Int, result: ScanResult) {
-            val hasService = result.scanRecord?.serviceUuids?.contains(
-                android.os.ParcelUuid(ImuProtocol.SERVICE_UUID),
-            ) == true
-            val name = result.device.name
-            if (name != ImuProtocol.DEVICE_NAME && !hasService) {
+            if (!matchesTargetDevice(result)) {
                 return
             }
             adapter?.bluetoothLeScanner?.stopScan(this)
             scanning = false
             connectTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
             connectTimeoutRunnable = null
-            postStatus("Connecting to ${name ?: "ESP32"}...")
+            val name = result.device.name ?: result.scanRecord?.deviceName ?: "ESP32"
+            postStatus("Connecting to $name...")
             gatt = result.device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
-            scheduleGattConnectTimeout()
+            scheduleGattLinkTimeout()
+        }
+
+        override fun onScanFailed(errorCode: Int) {
+            if (!scanning) {
+                return
+            }
+            adapter?.bluetoothLeScanner?.stopScan(this)
+            scanning = false
+            connectTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+            connectTimeoutRunnable = null
+            postBanner(StatusBannerLevel.WARN, "BLE scan failed ($errorCode)")
+            reportConnectFailed("scan failed (code=$errorCode)")
         }
     }
 
-    private fun scheduleGattConnectTimeout() {
-        gattConnectTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
-        val timeoutMs = if (minimalRelayConnect) {
-            MINIMAL_DISCOVER_DELAY_MS + 20_000L
-        } else {
-            GATT_CONNECT_TIMEOUT_MS
+    private fun matchesTargetDevice(result: ScanResult): Boolean {
+        val hasService = result.scanRecord?.serviceUuids?.contains(
+            android.os.ParcelUuid(ImuProtocol.SERVICE_UUID),
+        ) == true
+        val name = result.device.name ?: result.scanRecord?.deviceName
+        return name == ImuProtocol.DEVICE_NAME || hasService
+    }
+
+    private fun clearGattConnectTimeouts() {
+        gattLinkTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        gattLinkTimeoutRunnable = null
+        gattPostConnectTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        gattPostConnectTimeoutRunnable = null
+    }
+
+    private fun reportConnectFailed(reason: String) {
+        if (connectFailureReported) {
+            return
         }
-        gattConnectTimeoutRunnable = Runnable {
+        connectFailureReported = true
+        connectBusy = false
+        listener.onConnectFailed(reason)
+    }
+
+    private fun scheduleGattLinkTimeout() {
+        gattLinkTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        gattLinkTimeoutRunnable = Runnable {
             if (!bleSessionUp && gatt != null) {
-                postBanner(StatusBannerLevel.WARN, "GATT connect timeout")
-                listener.onConnectFailed("GATT connect timeout (${timeoutMs / 1000}s)")
+                postBanner(StatusBannerLevel.WARN, "GATT link timeout")
+                reportConnectFailed("GATT link timeout (${GATT_LINK_TIMEOUT_MS / 1000}s)")
                 disconnect()
             }
         }
-        mainHandler.postDelayed(gattConnectTimeoutRunnable!!, timeoutMs)
+        mainHandler.postDelayed(gattLinkTimeoutRunnable!!, GATT_LINK_TIMEOUT_MS)
+    }
+
+    private fun scheduleGattPostConnectTimeout() {
+        gattPostConnectTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        val timeoutMs = if (minimalRelayConnect) {
+            GATT_POST_CONNECT_TIMEOUT_MS
+        } else {
+            GATT_FULL_SETUP_TIMEOUT_MS
+        }
+        gattPostConnectTimeoutRunnable = Runnable {
+            if (!bleSessionUp && gatt != null) {
+                postBanner(StatusBannerLevel.WARN, "GATT setup timeout")
+                reportConnectFailed("GATT setup timeout (${timeoutMs / 1000}s)")
+                disconnect()
+            }
+        }
+        mainHandler.postDelayed(gattPostConnectTimeoutRunnable!!, timeoutMs)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun finishFullSessionSetup(gatt: BluetoothGatt) {
+        if (fullSessionActive) {
+            return
+        }
+        fullSessionActive = true
+        sessionSetupPending = true
+        enableNotify(gatt)
+        enableNetNotify(gatt)
+        /* CCCD writes run outside gattQueue — defer MODE/TIME/poll/crash until ESP connect
+         * grace ends (ble_imu_gatt.c BLE_CONNECT_GRACE_MS + POST_GRACE). */
+        mainHandler.removeCallbacks(sessionSetupRunnable)
+        mainHandler.postDelayed(sessionSetupRunnable, ImuProtocol.ESP_CONNECT_SETTLE_MS)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun beginGattSessionSetup(gatt: BluetoothGatt) {
+        if (!sessionSetupPending) {
+            return
+        }
+        sessionSetupPending = false
+        mainHandler.removeCallbacks(sessionSetupRunnable)
+        setMode(targetMode)
+        setPollIntervalMs(pollMs)
+        syncTimeFromPhone(gatt)
+        scheduleTimeSyncRetries()
+        readDeviceCaps(gatt)
+        startPoll()
+        postStatus("Polling every ${pollMs}ms")
+    }
+
+    fun requestTimeSyncRetry() {
+        mainHandler.post {
+            val g = gatt ?: return@post
+            if (!bleSessionUp) return@post
+            syncTimeFromPhone(g)
+        }
+    }
+
+    private fun scheduleTimeSyncRetries() {
+        timeSyncAttempts = 0
+        mainHandler.removeCallbacks(timeSyncRetryRunnable)
+        mainHandler.postDelayed(timeSyncRetryRunnable, 5000)
+    }
+
+    /** Public: called once the firmware confirms the clock is already synced (STATUS "clks":1),
+     *  so the blind post-connect retry chain (up to 8 attempts over 40s, restarted on *every*
+     *  reconnect regardless of whether a correction is even needed) doesn't keep firing pointless
+     *  TIME writes for a session that's already time-synced. */
+    fun stopTimeSyncRetries() {
+        mainHandler.removeCallbacks(timeSyncRetryRunnable)
+        timeSyncAttempts = 0
+        timeSyncOkBannerShown = false
+    }
+
+    private fun retryTimeSyncIfNeeded() {
+        val g = gatt ?: return
+        if (!bleSessionUp || timeSyncAttempts >= 8) {
+            return
+        }
+        // IMU notify batches flowing — clock already applied on connect; don't queue more
+        // high-priority TIME writes ahead of DATA/STATUS traffic.
+        if (notifyBatchRecent()) {
+            stopTimeSyncRetries()
+            return
+        }
+        timeSyncAttempts++
+        syncTimeFromPhone(g)
+        mainHandler.postDelayed(timeSyncRetryRunnable, 5000)
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                directConnectFallbackRunnable?.let { mainHandler.removeCallbacks(it) }
+                directConnectFallbackRunnable = null
                 connectTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
                 connectTimeoutRunnable = null
-                gattConnectTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
-                gattConnectTimeoutRunnable = null
+                gattLinkTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+                gattLinkTimeoutRunnable = null
+                scheduleGattPostConnectTimeout()
                 postStatus("Connected — waiting for ESP grace")
                 postBanner(StatusBannerLevel.OK, "Connected")
+                /*
+                 * Android's default (BALANCED) connection interval is ~30-50ms, which caps IMU
+                 * notify throughput regardless of how fast the firmware prepares batches
+                 * (ble_imu_gatt.c's ~33ms poll tick). CONNECTION_PRIORITY_HIGH asks the stack to
+                 * renegotiate down to ~7.5-15ms, multiplying real notification throughput —
+                 * skipped for the minimal background relay session (crash/status polling only,
+                 * no streaming) to avoid needlessly draining phone battery for a link that isn't
+                 * shipping high-rate data anyway.
+                 */
+                if (!minimalRelayConnect) {
+                    gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+                }
                 if (minimalRelayConnect) {
                     mainHandler.postDelayed({ gatt.discoverServices() }, MINIMAL_DISCOVER_DELAY_MS)
                 } else {
                     gatt.requestMtu(517)
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                connectBusy = false
                 connectTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
                 connectTimeoutRunnable = null
-                gattConnectTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
-                gattConnectTimeoutRunnable = null
+                clearGattConnectTimeouts()
                 val wasUp = bleSessionUp
                 stopPoll()
                 clearGattQueue()
                 bleSessionUp = false
-                if (status != BluetoothGatt.GATT_SUCCESS && !wasUp) {
-                    listener.onConnectFailed("GATT disconnect (status=$status)")
+                fullSessionActive = false
+                if (status != BluetoothGatt.GATT_SUCCESS && !wasUp && !connectFailureReported) {
+                    reportConnectFailed("GATT disconnect (status=$status)")
                 }
                 if (wasUp) {
                     listener.onConnected(false)
@@ -275,17 +595,14 @@ class BleImuClient(
         }
 
         @SuppressLint("MissingPermission")
-        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
-            gatt.discoverServices()
-        }
-
-        @SuppressLint("MissingPermission")
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 postBanner(StatusBannerLevel.ERROR, "Service discovery failed")
-                listener.onConnectFailed("service discovery failed (status=$status)")
+                reportConnectFailed("service discovery failed (status=$status)")
+                disconnect()
                 return
             }
+            clearGattConnectTimeouts()
             configServiceAvailable = gatt.getService(ConfigProtocol.SERVICE_UUID) != null
             crashServiceAvailable = gatt.getService(CrashProtocol.SERVICE_UUID) != null
             if (!configServiceAvailable) {
@@ -296,25 +613,40 @@ class BleImuClient(
             }
             if (minimalRelayConnect) {
                 bleSessionUp = true
-                syncTimeFromPhone(gatt)
+                connectBusy = false
+                mainHandler.postDelayed({
+                    if (!bleSessionUp) return@postDelayed
+                    syncTimeFromPhone(gatt)
+                    scheduleTimeSyncRetries()
+                }, ImuProtocol.ESP_CONNECT_SETTLE_MS)
                 mainHandler.postDelayed({
                     if (bleSessionUp) {
                         listener.onConnected(true)
                         postStatus("Relay connect (minimal GATT)")
                     }
-                }, 1500)
+                }, ImuProtocol.ESP_CONNECT_SETTLE_MS)
             } else {
-                enableNotify(gatt)
-                enableNetNotify(gatt)
-                setMode(targetMode)
-                setPollIntervalMs(pollMs)
-                syncTimeFromPhone(gatt)
-                readDeviceCaps(gatt)
+                finishFullSessionSetup(gatt)
                 bleSessionUp = true
+                connectBusy = false
                 listener.onConnected(true)
-                postStatus("Polling every ${pollMs}ms")
-                startPoll()
             }
+        }
+
+        @SuppressLint("MissingPermission")
+        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            if (gatt.getService(ImuProtocol.SERVICE_UUID) != null && !minimalRelayConnect) {
+                if (!fullSessionActive) {
+                    finishFullSessionSetup(gatt)
+                    if (!bleSessionUp) {
+                        bleSessionUp = true
+                        connectBusy = false
+                        listener.onConnected(true)
+                    }
+                }
+                return
+            }
+            gatt.discoverServices()
         }
 
         @SuppressLint("MissingPermission")
@@ -323,7 +655,24 @@ class BleImuClient(
             characteristic: BluetoothGattCharacteristic,
         ) {
             when (characteristic.uuid) {
-                ImuProtocol.CHAR_NOTIFY_UUID -> mainHandler.post { pollDataOnly() }
+                ImuProtocol.CHAR_NOTIFY_UUID -> {
+                    // Firmware v110+ ships the full batch JSON directly in the notification
+                    // payload once MTU is large enough (see ble_imu_gatt.c's g_defer_notify_send
+                    // handling) — a bare 4-byte seq means it fell back to the old "poke" (MTU too
+                    // small, or an empty batch), so only then do we pay for a follow-up Read.
+                    val value = characteristic.value
+                    if (value != null && value.size > 4 && value[0] == '{'.code.toByte()) {
+                        val json = String(value, StandardCharsets.UTF_8)
+                        if (ImuProtocol.looksLikeCompleteJson(json)) {
+                            lastNotifyBatchAtMs = SystemClock.elapsedRealtime()
+                            mainHandler.post { handleDataJson(json) }
+                        } else {
+                            mainHandler.post { pollDataOnly() }
+                        }
+                    } else {
+                        mainHandler.post { pollDataOnly() }
+                    }
+                }
                 NetProtocol.CHAR_SCAN_UUID -> {
                     val json = characteristic.readUtf8()
                     mainHandler.post { listener.onNetScan(json) }
@@ -349,9 +698,10 @@ class BleImuClient(
                 val ok = status == BluetoothGatt.GATT_SUCCESS
                 when (characteristic.uuid) {
                     ImuProtocol.CHAR_TIME_UUID -> {
-                        if (ok) {
+                        if (ok && !timeSyncOkBannerShown) {
+                            timeSyncOkBannerShown = true
                             postBanner(StatusBannerLevel.OK, "TIME sync OK")
-                        } else {
+                        } else if (!ok) {
                             postBanner(StatusBannerLevel.WARN, "TIME sync failed ($status)")
                         }
                     }
@@ -381,16 +731,35 @@ class BleImuClient(
                         pendingCrashJsonRead?.invoke(null)
                         pendingCrashJsonRead = null
                     }
+                    if (characteristic.uuid == ConfigProtocol.CHAR_REFLIST_UUID) {
+                        pendingVibroRefListRead?.invoke(null)
+                        pendingVibroRefListRead = null
+                    }
                     postBanner(StatusBannerLevel.ERROR, "GATT read failed ($status)")
                     return@post
                 }
                 when (characteristic.uuid) {
+                    ImuProtocol.CHAR_CAPS_UUID -> {
+                        deviceCaps = ImuProtocol.parseCaps(characteristic.value ?: ByteArray(0))
+                        if (deviceCaps != 0) {
+                            postStatus(ImuProtocol.capsCaption(deviceCaps))
+                            listener.onCaps(deviceCaps)
+                        }
+                        if (crashServiceAvailable && ImuProtocol.crashDebugFromCaps(deviceCaps)) {
+                            postBanner(StatusBannerLevel.OK, "Crash debug BLE ready (caps DBG)")
+                        }
+                    }
                     ImuProtocol.CHAR_STATUS_UUID -> handleStatusRead(gatt, characteristic)
                     ImuProtocol.CHAR_DATA_UUID -> handleDataRead(characteristic)
                     NetProtocol.CHAR_SCAN_UUID -> deliverNetRead(characteristic) { listener.onNetScan(it) }
                     NetProtocol.CHAR_PROFILES_UUID -> deliverNetRead(characteristic) { listener.onNetProfiles(it) }
                     NetProtocol.CHAR_STATUS_UUID -> deliverNetRead(characteristic) { listener.onNetStatus(it) }
                     CrashProtocol.CHAR_INFO_UUID -> deliverCrashRead(characteristic)
+                    ConfigProtocol.CHAR_REFLIST_UUID -> {
+                        val json = characteristic.readUtf8()
+                        pendingVibroRefListRead?.invoke(json)
+                        pendingVibroRefListRead = null
+                    }
                 }
             }
         }
@@ -403,6 +772,9 @@ class BleImuClient(
         ) {
             if (descriptor.uuid == CCCD_UUID && status == BluetoothGatt.GATT_SUCCESS) {
                 writeNextCccd()
+                if (cccdQueue.isEmpty() && sessionSetupPending) {
+                    beginGattSessionSetup(gatt)
+                }
             }
         }
     }
@@ -431,7 +803,18 @@ class BleImuClient(
             when {
                 json == null -> onDone(emptyList())
                 CrashFetcher.isListJson(json) -> {
-                    fetchCrashSlotDetails(CrashFetcher.parseListSlots(json), 0, mutableListOf(), onDone)
+                    // Firmware v109+ embeds full per-slot detail in the list JSON itself — no
+                    // per-slot write+read round trip needed. Older firmware only sends
+                    // slot/seq/reason/pc/uptime here (no "pc" field alone would still parse via
+                    // parseInfoObject, but backtrace/detail would be missing) — that's an
+                    // acceptable degradation, not a correctness issue, and self-heals on reflash.
+                    val detailed = CrashFetcher.parseListDetailed(json)
+                    val slots = CrashFetcher.parseListSlots(json)
+                    if (detailed.size >= slots.size && detailed.isNotEmpty()) {
+                        onDone(detailed)
+                    } else {
+                        fetchCrashSlotDetails(slots, 0, mutableListOf(), onDone)
+                    }
                 }
                 else -> {
                     val info = CrashFetcher.parseInfo(json)?.takeIf { it.pending }
@@ -515,6 +898,41 @@ class BleImuClient(
                         onDone?.invoke()
                     } else {
                         postBanner(StatusBannerLevel.ERROR, "Crash clear failed (slot $slot)")
+                    }
+                },
+            ),
+            highPriority = true,
+        )
+    }
+
+    /** Clears several slots in one BLE write instead of one write per slot — cuts the round-trip
+     *  count (and thus failure/retry surface) when multiple crashes were pending at once. */
+    @SuppressLint("MissingPermission")
+    fun clearDeviceCrashSlots(slots: List<Int>, onDone: (() -> Unit)? = null) {
+        if (slots.isEmpty()) {
+            onDone?.invoke()
+            return
+        }
+        val g = gatt ?: run {
+            onDone?.invoke()
+            return
+        }
+        val ctrl = g.getService(CrashProtocol.SERVICE_UUID)
+            ?.getCharacteristic(CrashProtocol.CHAR_CTRL_UUID)
+        if (ctrl == null) {
+            onDone?.invoke()
+            return
+        }
+        val slotsJson = slots.joinToString(",")
+        enqueueGatt(
+            GattRequest.WriteChar(
+                char = ctrl,
+                payload = "{\"op\":\"clear\",\"slots\":[$slotsJson]}".toByteArray(StandardCharsets.UTF_8),
+                onComplete = { ok ->
+                    if (ok) {
+                        onDone?.invoke()
+                    } else {
+                        postBanner(StatusBannerLevel.ERROR, "Crash clear failed (slots $slotsJson)")
                     }
                 },
             ),
@@ -647,34 +1065,48 @@ class BleImuClient(
     @SuppressLint("MissingPermission")
     private fun handleStatusRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
         val json = characteristic.readUtf8()
-        try {
-            val st = ImuProtocol.parseStatus(json)
-            listener.onDeviceStatus(st)
-            listener.onPowerStatus(ImuProtocol.powerFromStatus(st))
-        } catch (e: Exception) {
-            postBanner(StatusBannerLevel.ERROR, "Status parse error: ${e.message}")
+        if (!ImuProtocol.looksLikeCompleteJson(json)) {
+            if (statusParseRetries < 2 && !gattBusy) {
+                statusParseRetries++
+                mainHandler.postDelayed({ pollStatusOnly() }, 80)
+            }
+            return
         }
+        statusParseRetries = 0
+        val st = ImuProtocol.parseStatusLenient(json)
+            ?: run {
+                android.util.Log.w("BleImuClient", "Status parse skip (${json.length} B)")
+                return
+            }
+        listener.onDeviceStatus(st)
+        listener.onPowerStatus(ImuProtocol.powerFromStatus(st))
     }
 
     private fun handleDataRead(characteristic: BluetoothGattCharacteristic) {
-        val json = characteristic.readUtf8()
-        if (json.length >= 4) {
-            try {
-                val batch = ImuProtocol.parseBatch(json)
-                if (batch.seq != lastSeq) {
-                    lastSeq = batch.seq
-                    val count = when (batch.mode) {
-                        ImuProtocol.MODE_RAW -> batch.raw.size
-                        ImuProtocol.MODE_SCENE -> batch.scene.size
-                        else -> batch.computed.size
-                    }
-                    listener.onPollStats(batch.seq, count, pollMs)
-                    listener.onBatchJson(json)
-                    listener.onBatch(batch)
-                }
-            } catch (e: Exception) {
-                postBanner(StatusBannerLevel.WARN, "Batch parse error (${json.length} B)")
+        handleDataJson(characteristic.readUtf8())
+    }
+
+    /** Shared by the GATT-Read path (handleDataRead) and the notify-embedded-payload path
+     *  (onCharacteristicChanged) now that firmware v110+ can ship the batch JSON directly in
+     *  the notification instead of requiring a follow-up Read for every update. */
+    private fun handleDataJson(json: String) {
+        if (json.length < 4) {
+            return
+        }
+        if (!ImuProtocol.looksLikeCompleteJson(json)) {
+            pollDataOnly()
+            return
+        }
+        try {
+            val header = ImuProtocol.peekBatchHeader(json) ?: return
+            lastNotifyBatchAtMs = SystemClock.elapsedRealtime()
+            if (header.seq != lastSeq) {
+                lastSeq = header.seq
+                listener.onPollStats(header.seq, header.recordCount, pollMs)
+                listener.onBatchJson(json)
             }
+        } catch (e: Exception) {
+            postBanner(StatusBannerLevel.WARN, "Batch parse error (${json.length} B)")
         }
     }
 
@@ -801,17 +1233,7 @@ class BleImuClient(
     private fun readDeviceCaps(gatt: BluetoothGatt) {
         val capsChar = gatt.getService(ImuProtocol.SERVICE_UUID)
             ?.getCharacteristic(ImuProtocol.CHAR_CAPS_UUID) ?: return
-        gatt.readCharacteristic(capsChar)
-        mainHandler.postDelayed({
-            deviceCaps = ImuProtocol.parseCaps(capsChar.value ?: ByteArray(0))
-            if (deviceCaps != 0) {
-                postStatus(ImuProtocol.capsCaption(deviceCaps))
-                listener.onCaps(deviceCaps)
-            }
-            if (crashServiceAvailable && ImuProtocol.crashDebugFromCaps(deviceCaps)) {
-                postBanner(StatusBannerLevel.OK, "Crash debug BLE ready (caps DBG)")
-            }
-        }, 200)
+        queueRead(capsChar, highPriority = true)
     }
 
     @SuppressLint("MissingPermission")
@@ -828,7 +1250,6 @@ class BleImuClient(
             GattRequest.WriteChar(char = ch, payload = payload),
             highPriority = true,
         )
-        listener.onStatus("TIME handshake ${System.currentTimeMillis()} tz=${tzMin}min")
     }
 
     @SuppressLint("MissingPermission")
@@ -994,6 +1415,21 @@ class BleImuClient(
     }
 
     @SuppressLint("MissingPermission")
+    fun readVibroRefList(onDone: (String?) -> Unit) {
+        val g = gatt ?: run {
+            onDone(null)
+            return
+        }
+        val ch = g.getService(ConfigProtocol.SERVICE_UUID)?.getCharacteristic(ConfigProtocol.CHAR_REFLIST_UUID)
+        if (ch == null) {
+            onDone(null)
+            return
+        }
+        pendingVibroRefListRead = onDone
+        queueRead(ch, highPriority = true)
+    }
+
+    @SuppressLint("MissingPermission")
     private fun enableNotify(gatt: BluetoothGatt) {
         val notify = gatt.getService(ImuProtocol.SERVICE_UUID)?.getCharacteristic(ImuProtocol.CHAR_NOTIFY_UUID)
         if (notify != null) {
@@ -1013,10 +1449,16 @@ class BleImuClient(
 
     @SuppressLint("MissingPermission")
     private fun pollStatusOnly() {
+        if (gattBusy) return
         val g = gatt ?: return
         val statusChar = g.getService(ImuProtocol.SERVICE_UUID)
             ?.getCharacteristic(ImuProtocol.CHAR_STATUS_UUID) ?: return
         queueRead(statusChar)
+    }
+
+    private fun notifyBatchRecent(): Boolean {
+        return lastNotifyBatchAtMs > 0L &&
+            SystemClock.elapsedRealtime() - lastNotifyBatchAtMs < notifyFallbackMs
     }
 
     /** Notify + watchdog backup; STATUS on its own timer for vibro/temp. */
@@ -1029,6 +1471,7 @@ class BleImuClient(
 
     private fun stopPoll() {
         pollGeneration++
+        lastNotifyBatchAtMs = 0L
         watchdogRunnable?.let { mainHandler.removeCallbacks(it) }
         watchdogRunnable = null
         statusPollRunnable?.let { mainHandler.removeCallbacks(it) }
@@ -1041,10 +1484,13 @@ class BleImuClient(
         watchdogRunnable?.let { mainHandler.removeCallbacks(it) }
         watchdogRunnable = Runnable {
             if (gen != pollGeneration) return@Runnable
-            if (!gattBusy) pollDataOnly()
+            if (!gattBusy && !notifyBatchRecent()) {
+                pollDataOnly()
+            }
             scheduleWatchdog()
         }
-        mainHandler.postDelayed(watchdogRunnable!!, pollMs.toLong().coerceAtLeast(33L))
+        val watchdogMs = if (notifyBatchRecent()) 1000L else pollMs.toLong().coerceAtLeast(33L)
+        mainHandler.postDelayed(watchdogRunnable!!, watchdogMs)
     }
 
     private fun scheduleStatusPoll() {
@@ -1052,7 +1498,9 @@ class BleImuClient(
         statusPollRunnable?.let { mainHandler.removeCallbacks(it) }
         statusPollRunnable = Runnable {
             if (gen != pollGeneration) return@Runnable
-            pollStatusOnly()
+            if (!gattBusy) {
+                pollStatusOnly()
+            }
             scheduleStatusPoll()
         }
         mainHandler.postDelayed(statusPollRunnable!!, statusPollIntervalMs)
@@ -1131,22 +1579,34 @@ class BleImuClient(
     }
 
     @SuppressLint("MissingPermission")
-    fun ackOffloadSeq(seq: Long) {
-        val g = gatt ?: return
+    fun ackOffloadSeq(seq: Long, onDone: ((Boolean) -> Unit)? = null) {
+        val g = gatt ?: run {
+            onDone?.invoke(false)
+            return
+        }
         val cmd = g.getService(ConfigProtocol.SERVICE_UUID)?.getCharacteristic(ConfigProtocol.CHAR_CMD_UUID)
-            ?: return
+            ?: run {
+                onDone?.invoke(false)
+                return
+            }
         val payload = ByteArray(5)
         payload[0] = ConfigProtocol.CMD_OFFLOAD_ACK.toByte()
         payload[1] = (seq and 0xFF).toByte()
         payload[2] = ((seq shr 8) and 0xFF).toByte()
         payload[3] = ((seq shr 16) and 0xFF).toByte()
         payload[4] = ((seq shr 24) and 0xFF).toByte()
-        cmd.value = payload
-        g.writeCharacteristic(cmd)
+        enqueueGatt(
+            GattRequest.WriteChar(
+                char = cmd,
+                payload = payload,
+                onComplete = onDone,
+            ),
+            highPriority = false,
+        )
     }
 
     @SuppressLint("MissingPermission")
-    fun sendConfigCmd(cmdByte: Byte, onDone: ((Boolean) -> Unit)? = null) {
+    fun sendConfigCmd(payload: ByteArray, onDone: ((Boolean) -> Unit)? = null) {
         val g = gatt ?: run {
             onDone?.invoke(false)
             return
@@ -1159,18 +1619,32 @@ class BleImuClient(
         enqueueGatt(
             GattRequest.WriteChar(
                 char = cmd,
-                payload = byteArrayOf(cmdByte),
+                payload = payload,
                 onComplete = onDone,
             ),
             highPriority = true,
         )
     }
 
-    fun vibroRefStart(onDone: ((Boolean) -> Unit)? = null) =
-        sendConfigCmd(ConfigProtocol.CMD_VIBRO_REF_START.toByte(), onDone)
+    fun sendConfigCmd(cmdByte: Byte, onDone: ((Boolean) -> Unit)? = null) =
+        sendConfigCmd(byteArrayOf(cmdByte), onDone)
+
+    /** `slot` 0..VIBRO_REF_SLOT_COUNT-1; `name` optional (truncated to VIBRO_REF_NAME_MAX_LEN). */
+    fun vibroRefStart(slot: Int = 0, name: String = "", onDone: ((Boolean) -> Unit)? = null) {
+        val nameBytes = name.toByteArray(StandardCharsets.UTF_8)
+            .let { if (it.size > ConfigProtocol.VIBRO_REF_NAME_MAX_LEN) it.copyOf(ConfigProtocol.VIBRO_REF_NAME_MAX_LEN) else it }
+        val payload = byteArrayOf(ConfigProtocol.CMD_VIBRO_REF_START.toByte(), slot.toByte()) + nameBytes
+        sendConfigCmd(payload, onDone)
+    }
 
     fun vibroRefStop(onDone: ((Boolean) -> Unit)? = null) =
         sendConfigCmd(ConfigProtocol.CMD_VIBRO_REF_STOP.toByte(), onDone)
+
+    fun vibroRefSelect(slot: Int, onDone: ((Boolean) -> Unit)? = null) =
+        sendConfigCmd(byteArrayOf(ConfigProtocol.CMD_VIBRO_REF_SELECT.toByte(), slot.toByte()), onDone)
+
+    fun vibroRefDelete(slot: Int, onDone: ((Boolean) -> Unit)? = null) =
+        sendConfigCmd(byteArrayOf(ConfigProtocol.CMD_VIBRO_REF_DELETE.toByte(), slot.toByte()), onDone)
 
     private fun BluetoothGattCharacteristic.readUtf8(): String {
         val bytes = value ?: return ""

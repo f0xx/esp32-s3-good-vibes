@@ -16,6 +16,7 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Long-lived BLE session — survives activity rotation and app backgrounding.
@@ -36,8 +37,10 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
         private val CRASH_RELAY_DELAYS_MS = longArrayOf(3000L, 8000L, 18000L)
         private const val CONNECT_RETRY_PAUSE_MS = 900_000L
         private const val CONNECT_RETRY_PAUSE_MAX_MS = 1_800_000L
-        private const val BT_WARMUP_MS = 30_000L
-        private const val RELAY_PAUSE_MS = 30_000L
+        private const val BT_WARMUP_MS = 8_000L
+        private const val RELAY_PAUSE_MS = 15_000L
+        private const val UI_RELAY_PAUSE_MS = 4_000L
+        private const val MANUAL_CONNECT_RETRY_MS = 8_000L
         private const val CONNECT_FAILURE_COOLDOWN_THRESHOLD = 2
         private const val CONNECT_FAILURE_COOLDOWN_MS = 3_600_000L
         private const val CRASH_RELAY_RETRY_MS = 3_000L
@@ -50,6 +53,7 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
     }
 
     private val callbacks = RemoteCallbackList<IImuBleCallback>()
+    private val callbacksBroadcastActive = AtomicBoolean(false)
     private val mainHandler = Handler(Looper.getMainLooper())
     private val ioExecutor = Executors.newSingleThreadExecutor()
 
@@ -69,25 +73,42 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
     private var lastEspScreenOn: Boolean? = null
     private var pendingTelemetry: String? = null
 
+    /** True only while extra (verdict/config) sync work runs during an established relay session. */
     private var bridgeSyncActive = false
-    private var bridgeInitiatedConnect = false
-    private var bridgeAwaitingCrashRelay = false
+    /** Requested by scheduler/manual trigger; serviced on the *next* CONNECTED state of the
+     *  single always-on relay FSM — bridge sync never opens its own BLE connection. */
+    private var pendingBridgeWork = false
     private var connectRelayActive = false
     private var bleRelayActive = false
     private var connectAttemptSeq = 0
     private var connectFailureStreak = 0
     private var userConnectedSession = false
+    /** True while a foreground Activity is bound and visible. Drives whether the always-on
+     *  relay FSM connects in minimal (no-notify) mode or full mode, and whether an existing
+     *  minimal background session gets upgraded so the UI (e.g. the cube+axis scene) has data. */
+    private var uiVisible = false
+    /** True if userConnectedSession was flipped on by onUiVisibleChanged()'s auto-upgrade rather
+     *  than an explicit manual Connect tap — reverted (without forcing a disconnect) once the UI
+     *  goes back to the background so future reconnects resume power-saving minimal-relay mode. */
+    private var autoPromotedFullSession = false
     private var autopilotActive = false
     private var relayFsmState = RelayFsmState.STARTING
     private var relayFsmCaption = "Starting…"
     private var relayFsmStarted = false
+    private var btWarmupDone = false
+    private var reconnectDueAtMs = 0L
+    private var bleConnectGeneration = 0
+    private var captionEpoch = 0
+    private var lastTimeSyncRetryMs = 0L
     private var autoRefInProgress = false
     private var savedPollMsForBridge = 0
+    private var clockCheckedThisSession = false
     private val crashRelayRunnable = Runnable { relayPendingCrash() }
     private val bridgeFinishRunnable = Runnable { completeBridgeSyncCycle() }
     private val connectRetryRunnable = Runnable { attemptAutoConnect() }
     private val fsmWarmupRunnable = Runnable { onFsmWarmupComplete() }
     private val fsmPauseRunnable = Runnable { onFsmPauseComplete() }
+    private val reconnectWatchdogRunnable = Runnable { onReconnectWatchdog() }
     private val internalBridgeRunnable = Runnable {
         if (!autopilotActive || bridgeSyncActive) {
             return@Runnable
@@ -105,7 +126,12 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
         override fun registerCallback(callback: IImuBleCallback?) {
             if (callback != null) {
                 callbacks.register(callback)
-                mainHandler.post { pushSessionRestoreToCallback(callback) }
+                mainHandler.post {
+                    if (!bleRelayActive && !connected) {
+                        startBleRelayMode()
+                    }
+                    pushSessionRestoreToCallback(callback)
+                }
             }
         }
 
@@ -115,8 +141,6 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
             }
         }
 
-        override fun getSnapshot(): Bundle = buildSnapshot()
-
         override fun requestState() {
             mainHandler.post {
                 broadcastRelayState()
@@ -124,18 +148,23 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
             }
         }
 
+        override fun setUiVisible(active: Boolean) {
+            mainHandler.post { onUiVisibleChanged(active) }
+        }
+
         override fun connect() {
             userConnectedSession = true
-            cancelFsmTimers()
-            bleClient.setMinimalRelayConnect(false)
-            enterRelayState(RelayFsmState.SCAN_CONNECT, "Manual connect — scanning…")
-            mainHandler.post { bleClient.connect() }
+            autoPromotedFullSession = false
+            requestBleConnect(
+                fullSession = true,
+                reason = "Manual connect — scanning…",
+            )
         }
 
         override fun disconnect() {
             userConnectedSession = false
+            autoPromotedFullSession = false
             bridgeSyncActive = false
-            bridgeAwaitingCrashRelay = false
             cancelFsmTimers()
             mainHandler.post {
                 bleClient.disconnect()
@@ -210,14 +239,14 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
             mainHandler.post { bleClient.sendNetCommand(json) }
         }
 
-        override fun vibroRefStart() {
+        override fun vibroRefStart(slot: Int, name: String?) {
             mainHandler.post {
                 rawSampling.onRefRecording(true)
-                bleClient.vibroRefStart { ok ->
+                bleClient.vibroRefStart(slot, name ?: "") { ok ->
                     broadcastBanner(
                         if (ok) StatusBannerLevel.OK else StatusBannerLevel.ERROR,
                         if (ok) {
-                            "Ref recording — shake the device ~10 s"
+                            "Recording slot $slot — shake the device (up to 30s)"
                         } else {
                             "Ref start failed (BLE busy?)"
                         },
@@ -234,6 +263,61 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
                         if (ok) StatusBannerLevel.OK else StatusBannerLevel.ERROR,
                         if (ok) "Reference saved" else "Ref stop failed",
                     )
+                    if (ok) {
+                        bleClient.readVibroRefList { json ->
+                            if (json != null) {
+                                foreachCallback { it.onVibroRefList(json) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        override fun vibroRefSelect(slot: Int) {
+            mainHandler.post {
+                bleClient.vibroRefSelect(slot) { ok ->
+                    broadcastBanner(
+                        if (ok) StatusBannerLevel.OK else StatusBannerLevel.ERROR,
+                        if (ok) "Reference slot $slot active" else "Select failed",
+                    )
+                    if (ok) {
+                        bleClient.readVibroRefList { json ->
+                            if (json != null) {
+                                foreachCallback { it.onVibroRefList(json) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        override fun vibroRefDelete(slot: Int) {
+            mainHandler.post {
+                bleClient.vibroRefDelete(slot) { ok ->
+                    broadcastBanner(
+                        if (ok) StatusBannerLevel.OK else StatusBannerLevel.ERROR,
+                        if (ok) "Reference slot $slot deleted" else "Delete failed",
+                    )
+                    if (ok) {
+                        bleClient.readVibroRefList { json ->
+                            if (json != null) {
+                                foreachCallback { it.onVibroRefList(json) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        override fun requestVibroRefList() {
+            mainHandler.post {
+                bleClient.readVibroRefList { json ->
+                    if (json != null) {
+                        foreachCallback { it.onVibroRefList(json) }
+                    } else {
+                        broadcastBanner(StatusBannerLevel.ERROR, "Ref list read failed")
+                    }
                 }
             }
         }
@@ -253,15 +337,24 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
             }
         }
 
+        override fun setCpuMhzOverride(mhz: Int) {
+            mainHandler.post { bleClient.setCpuMhzOverride(mhz) }
+        }
+
+        override fun setImuHzOverride(hz: Int) {
+            mainHandler.post { bleClient.setImuHzOverride(hz) }
+        }
+
         override fun injectCrash(kind: String?) {
             mainHandler.post {
-                bleClient.injectCrash(kind ?: "panic") { ok ->
+                val k = kind ?: "panic"
+                bleClient.injectCrash(k) { ok ->
                     broadcastBanner(
                         if (ok) StatusBannerLevel.WARN else StatusBannerLevel.ERROR,
                         if (ok) {
-                            "Crash inject: ${kind ?: "panic"} — device will reboot"
+                            "Crash inject ($k) queued — ESP rebooting; relay uploads on next connect"
                         } else {
-                            "Crash inject failed — crash BLE service missing or write rejected"
+                            "Crash inject failed — connect BLE and use debug firmware (CRASH_DEBUG=1)"
                         },
                     )
                 }
@@ -433,8 +526,20 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
 
     override fun onStatus(text: String) {
         session.lastStatus = text
+        if (connected && userConnectedSession && isLiveSessionNoise(text)) {
+            return
+        }
         broadcastStatus(text, important = false)
-        updateNotification(force = true)
+    }
+
+    /** Routine BLE telemetry that must not overwrite the status line during live IMU viewing. */
+    private fun isLiveSessionNoise(text: String): Boolean {
+        val lower = text.lowercase()
+        return lower.startsWith("time handshake") ||
+            lower.startsWith("polling every") ||
+            lower.contains("esp clock corrected") ||
+            lower.startsWith("clock sync ok") ||
+            lower.contains("clock drift")
     }
 
     override fun onBanner(level: StatusBannerLevel, text: String) {
@@ -448,8 +553,30 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
         throttleTelemetry("seq=$seq n=$recordCount poll=${pollMs}ms")
     }
 
+    private var lastClockSyncedUi: Boolean? = null
+    private var lastReportedClockCorrMs = -1L
+    private var lastVibroCaption: String? = null
+
     override fun onDeviceStatus(status: ImuProtocol.Status) {
         lastDeviceStatus = status
+        val synced = status.clockSynced == true
+        if (lastClockSyncedUi != synced) {
+            lastClockSyncedUi = synced
+            val tz = status.clockTzMin ?: 0
+            foreachCallback { it.onClockState(synced, tz) }
+        }
+        if (connected && status.clockSynced != true) {
+            val now = SystemClock.uptimeMillis()
+            if (now - lastTimeSyncRetryMs > 12_000L) {
+                lastTimeSyncRetryMs = now
+                mainHandler.post { bleClient.requestTimeSyncRetry() }
+            }
+        } else if (synced) {
+            // Already synced (common case — the RTC survives BLE disconnects) — cancel the
+            // blind post-connect retry chain instead of letting it burn through all 8 attempts
+            // over 40s of pointless TIME writes on every single reconnect.
+            bleClient.stopTimeSyncRetries()
+        }
         status.screenOn?.let { on ->
             if (lastEspScreenOn != on) {
                 lastEspScreenOn = on
@@ -465,7 +592,7 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
                 verdictStore.record(status)
                 offloadExporter.exportVerdict(status)
                 CloudUploadScheduler.enqueueNow(applicationContext)
-                mainHandler.post { flushOffloadAcks() }
+                mainHandler.post { scheduleFlushOffloadAcks(0) }
             }
         } else if (
             (status.offloadPending ?: 0) > 0 &&
@@ -475,7 +602,7 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
             ioExecutor.execute {
                 offloadExporter.exportVerdict(status)
                 CloudUploadScheduler.enqueueNow(applicationContext)
-                mainHandler.post { flushOffloadAcks() }
+                mainHandler.post { scheduleFlushOffloadAcks(0) }
             }
         } else if ((status.offloadPending ?: 0) > 0) {
             status.pendingSessionSeq?.takeIf { it > 0L }?.let { ps ->
@@ -484,7 +611,7 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
                         verdictStore.recordOfflineSession(status, ps)
                         offloadExporter.exportVerdict(status.copy(seq = ps))
                     }
-                    mainHandler.post { flushOffloadAcks() }
+                    mainHandler.post { scheduleFlushOffloadAcks(0) }
                 }
             }
         }
@@ -504,7 +631,13 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
         if (extras.isNotEmpty()) {
             throttleTelemetry(extras.joinToString(" "))
         }
-        broadcastVibroCaption(formatVibroCaption(status))
+        broadcastVibroCaptionIfChanged(formatVibroCaption(status))
+    }
+
+    private fun broadcastVibroCaptionIfChanged(caption: String) {
+        if (caption == lastVibroCaption) return
+        lastVibroCaption = caption
+        broadcastVibroCaption(caption)
     }
 
     private fun formatVibroCaption(status: ImuProtocol.Status): String {
@@ -544,11 +677,16 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
         this.connected = connected
         if (connected) {
             connectFailureStreak = 0
+            captionEpoch++
+            mainHandler.removeCallbacks(reconnectWatchdogRunnable)
             cancelFsmTimers()
+            cancelPendingStatusUpdates()
+            clockCheckedThisSession = false
+            lastReportedClockCorrMs = -1L
+            lastVibroCaption = null
+            bleClient.connectedDeviceAddress()?.let { session.lastBleAddress = it }
             if (userConnectedSession) {
                 enterRelayState(RelayFsmState.CONNECTED, "Connected — live IMU")
-            } else if (bridgeSyncActive) {
-                enterRelayState(RelayFsmState.CONNECTED, "Bridge sync — connected")
             } else if (bleRelayActive) {
                 // Caption set once here; the branch below (TIME sync -> crash drain) reuses it
                 // instead of overwriting it a second time with the same "connected" transition.
@@ -567,49 +705,53 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
             val priorStatus = lastDeviceStatus ?: session.lastStatus?.let {
                 runCatching { ImuProtocol.parseStatus(it) }.getOrNull()
             }
-            val relayOnly = bleRelayActive && !userConnectedSession && !bridgeSyncActive
+            val relayOnly = bleRelayActive && !userConnectedSession
             if (!relayOnly) {
-                WakeRelay.onConnect(bleClient, priorStatus)
-                if (priorStatus == null || !WakeRelay.isDeepSleepProfile(priorStatus)) {
-                    bleClient.setPollIntervalMs(session.pollMs)
-                }
-                bleClient.setMode(session.renderMode)
+                mainHandler.postDelayed({
+                    if (!this@ImuBleForegroundService.connected) return@postDelayed
+                    WakeRelay.onConnect(bleClient, priorStatus)
+                }, ImuProtocol.ESP_CONNECT_SETTLE_MS)
             }
-            mainHandler.postDelayed({ flushOffloadAcks() }, 500)
-            if (bridgeSyncActive) {
-                savedPollMsForBridge = session.pollMs
-                bleClient.setPollIntervalMs(2000)
-                bridgeAwaitingCrashRelay = true
-                relayCrashesUntilConfirmed {
-                    bridgeAwaitingCrashRelay = false
-                    if (this@ImuBleForegroundService.connected && bridgeSyncActive) {
-                        syncConfigThenBridgeSetup(skipCrashSchedule = true)
+            scheduleFlushOffloadAcks(ImuProtocol.ESP_CONNECT_SETTLE_MS)
+            if (bleRelayActive && !userConnectedSession) {
+                // Single connect authority: after ESP grace — crash drain then bridge/cloud.
+                Log.i(TAG, "Relay connected — crash drain after ${ImuProtocol.ESP_CONNECT_SETTLE_MS}ms settle")
+                mainHandler.postDelayed({
+                    if (!this@ImuBleForegroundService.connected) return@postDelayed
+                    relayCrashesUntilConfirmed {
+                        if (pendingBridgeWork && this@ImuBleForegroundService.connected) {
+                            beginBridgeWorkThenFinish()
+                        } else {
+                            finishBleRelaySession("crash relay done")
+                        }
                     }
-                }
-            } else if (bleRelayActive && !userConnectedSession && !bridgeSyncActive) {
-                Log.i(TAG, "BLE relay — priority: 1) TIME sync 2) crash drain 3) cloud")
-                relayCrashesUntilConfirmed {
-                    finishBleRelaySession("crash relay done")
-                }
+                }, ImuProtocol.ESP_CONNECT_SETTLE_MS)
             } else {
-                relayPendingCrash()
-                scheduleCrashRelayRetries()
-            }
-            if (priorStatus != null && WakeRelay.isDeepSleepProfile(priorStatus)) {
-                mainHandler.postDelayed({ flushOffloadAcks() }, 1500)
+                scheduleCrashRelayAfterSettle()
             }
         } else {
             stopForegroundIfIdle()
             mainHandler.removeCallbacks(flushTelemetryRunnable)
             mainHandler.removeCallbacks(crashRelayRunnable)
             mainHandler.removeCallbacks(bridgeFinishRunnable)
+            flushOffloadAcksRunnable?.let { mainHandler.removeCallbacks(it) }
+            flushOffloadAcksRunnable = null
+            offloadAckInFlight = false
+            lastLocallyAckedSeq = 0L
             pendingTelemetry = null
             if (wasConnected) {
-                bridgeAwaitingCrashRelay = false
+                // An unexpected mid-session drop during bridge work (e.g. supervision timeout)
+                // never reaches finishBridgeSyncCycle() — clear it here too. pendingBridgeWork is
+                // intentionally kept so the still-pending sync is retried on the next connect.
+                if (bridgeSyncActive) {
+                    Log.w(TAG, "Bridge work dropped mid-session — will retry on next connect")
+                    bridgeSyncActive = false
+                    mainHandler.removeCallbacks(bridgeFinishRunnable)
+                }
                 if (userConnectedSession) {
-                    enterRelayState(RelayFsmState.PAUSE, "Disconnected")
+                    scheduleReconnectPause("Link lost — retry in ${MANUAL_CONNECT_RETRY_MS / 1000}s")
                 } else if (relayFsmActive()) {
-                    scheduleFsmPauseThenConnect("Link lost — retry in ${RELAY_PAUSE_MS / 1000}s")
+                    scheduleReconnectPause("Link lost — retry in ${RELAY_PAUSE_MS / 1000}s")
                 }
             }
         }
@@ -621,13 +763,12 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
     override fun onConnectFailed(reason: String) {
         connectFailureStreak++
         if (userConnectedSession) {
-            enterRelayState(RelayFsmState.PAUSE, "Connect failed: $reason")
+            scheduleReconnectPause("Connect failed — retry in ${MANUAL_CONNECT_RETRY_MS / 1000}s ($reason)")
             broadcastBanner(StatusBannerLevel.WARN, reason)
-            broadcastRelayState()
             return
         }
         if (relayFsmActive()) {
-            scheduleFsmPauseThenConnect("Connect failed — retry in ${RELAY_PAUSE_MS / 1000}s ($reason)")
+            scheduleReconnectPause("Connect failed — retry in ${RELAY_PAUSE_MS / 1000}s ($reason)")
         } else {
             broadcastBanner(StatusBannerLevel.WARN, reason)
         }
@@ -675,44 +816,161 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
         broadcastNetStatus(json)
     }
 
+    private var offloadAckInFlight = false
+    private var flushOffloadAcksRunnable: Runnable? = null
+
+    /** Locally-known "high water mark" of the seq we've successfully ACKed. STATUS is only
+     *  polled every 5s, so `lastDeviceStatus.offloadAckSeq` lags well behind an ACK we just sent —
+     *  without this, the self-reschedule below kept re-computing the *same* seqToAck against the
+     *  stale status and firing duplicate ACKs every ~800ms until the next STATUS poll finally
+     *  caught up (the "offload ACK seq=N — ring rotated" spam seen on serial, one seq repeated
+     *  4-10x). Reset on disconnect since a firmware reboot restarts seq numbering from scratch. */
+    private var lastLocallyAckedSeq = 0L
+
+    /**
+     * Single-flight scheduler for [flushOffloadAcks]. Every trigger site (new verdict, connect,
+     * bridge sync, self-reschedule after a successful ACK, …) used to call
+     * `mainHandler.postDelayed({ flushOffloadAcks() }, …)` with a fresh anonymous Runnable each
+     * time. None of those closures could be cancelled, so overlapping triggers (e.g. a new verdict
+     * arriving mid-chain) could pile up independent timers. Routing every call through one named
+     * Runnable field guarantees at most one flush attempt is ever scheduled at a time.
+     */
+    private fun scheduleFlushOffloadAcks(delayMs: Long) {
+        flushOffloadAcksRunnable?.let { mainHandler.removeCallbacks(it) }
+        val r = Runnable {
+            flushOffloadAcksRunnable = null
+            flushOffloadAcks()
+        }
+        flushOffloadAcksRunnable = r
+        mainHandler.postDelayed(r, delayMs)
+    }
+
+    /** One queued GATT write per pending offload — stale SQLite seqs must not flood CMD. */
     private fun flushOffloadAcks() {
-        if (!connected) return
-        ioExecutor.execute {
-            for (seq in verdictStore.pendingAckSeqs()) {
-                bleClient.ackOffloadSeq(seq)
-                verdictStore.markAcked(seq)
-            }
-            lastDeviceStatus?.pendingSessionSeq?.takeIf { it > 0L }?.let { ps ->
-                if ((lastDeviceStatus?.offloadPending ?: 0) > 0) {
-                    bleClient.ackOffloadSeq(ps)
-                    verdictStore.markAcked(ps)
+        if (!connected || offloadAckInFlight) return
+        val status = lastDeviceStatus ?: return
+        if ((status.offloadPending ?: 0) <= 0) return
+
+        val lastAck = maxOf(status.offloadAckSeq ?: 0L, lastLocallyAckedSeq)
+        val seqToAck = status.pendingSessionSeq?.takeIf { it > lastAck }
+            ?: lastStoredVerdictSeq.takeIf { it > lastAck }
+            ?: return
+
+        offloadAckInFlight = true
+        bleClient.ackOffloadSeq(seqToAck) { ok ->
+            mainHandler.post {
+                offloadAckInFlight = false
+                if (ok) {
+                    lastLocallyAckedSeq = seqToAck
+                    ioExecutor.execute { verdictStore.markAcked(seqToAck) }
+                    // Only chase another round if we already know (locally) there's a seq beyond
+                    // the one we just ACKed — otherwise wait for the next real trigger (new
+                    // verdict / STATUS poll) instead of blindly re-polling every 800ms.
+                    val moreKnownLocally = (lastDeviceStatus?.pendingSessionSeq ?: 0L) > seqToAck ||
+                        lastStoredVerdictSeq > seqToAck
+                    if (moreKnownLocally) {
+                        scheduleFlushOffloadAcks(800)
+                    }
                 }
             }
         }
     }
 
-    /** Step 3b: read pending crashes from NVS ring, upload, clear per slot. Retries at 3/8/18 s. */
-    private fun scheduleCrashRelayRetries() {
+    /** Step 3b: read pending crashes from NVS ring, upload, clear per slot. Retries after settle. */
+    private fun scheduleCrashRelayAfterSettle() {
         mainHandler.removeCallbacks(crashRelayRunnable)
+        mainHandler.postDelayed(crashRelayRunnable, ImuProtocol.ESP_CONNECT_SETTLE_MS)
         for (delayMs in CRASH_RELAY_DELAYS_MS) {
-            mainHandler.postDelayed(crashRelayRunnable, delayMs)
+            mainHandler.postDelayed(
+                crashRelayRunnable,
+                ImuProtocol.ESP_CONNECT_SETTLE_MS + delayMs,
+            )
         }
+    }
+
+    private fun scheduleCrashRelayRetries() {
+        scheduleCrashRelayAfterSettle()
     }
 
     private fun relayFsmActive(): Boolean = bleRelayActive || connectRelayActive
 
     private fun shouldAutoConnectRetry(): Boolean {
-        if (userConnectedSession || connected || bridgeSyncActive) {
+        if (connected) {
             return false
         }
-        return relayFsmActive()
+        return userConnectedSession || relayFsmActive()
     }
 
-    private fun connectRetryPauseMs(): Long = RELAY_PAUSE_MS
+    /**
+     * Single entry for every BLE connect attempt (manual, relay FSM, link-loss retry).
+     * Supersedes any in-flight connect so background + manual taps cannot interleave.
+     */
+    private fun requestBleConnect(fullSession: Boolean, reason: String) {
+        if (connected && fullSession && bleClient.isFullSessionUp()) {
+            Log.i(TAG, "Connect skipped — full session already up ($reason)")
+            enterRelayState(RelayFsmState.CONNECTED, "Connected — live IMU")
+            return
+        }
+        if (connected && fullSession && bleClient.upgradeToFullSession()) {
+            Log.i(TAG, "Connect upgraded minimal session in place ($reason)")
+            enterRelayState(RelayFsmState.CONNECTED, "Connected — live IMU")
+            return
+        }
+        bleConnectGeneration++
+        val generation = bleConnectGeneration
+        cancelFsmTimers()
+        cancelPendingStatusUpdates()
+        bleClient.setMinimalRelayConnect(!fullSession)
+        enterRelayState(RelayFsmState.SCAN_CONNECT, reason)
+        mainHandler.post {
+            if (generation != bleConnectGeneration) {
+                Log.i(TAG, "Connect superseded: $reason")
+                return@post
+            }
+            if (connected && fullSession && bleClient.isFullSessionUp()) {
+                return@post
+            }
+            if (bleClient.isConnectBusy()) {
+                Log.i(TAG, "Connect deferred — GATT busy ($reason)")
+                mainHandler.postDelayed({
+                    if (generation != bleConnectGeneration || connected) {
+                        return@postDelayed
+                    }
+                    if (!bleClient.isConnectBusy()) {
+                        bleClient.connect(session.lastBleAddress)
+                    } else {
+                        requestBleConnect(fullSession, reason)
+                    }
+                }, 2000)
+                return@post
+            }
+            bleClient.connect(session.lastBleAddress)
+        }
+    }
+
+    private fun connectRetryPauseMs(): Long = when {
+        userConnectedSession -> MANUAL_CONNECT_RETRY_MS
+        uiVisible -> UI_RELAY_PAUSE_MS
+        else -> RELAY_PAUSE_MS
+    }
 
     private fun finishBleRelaySession(reason: String) {
-        if (connected && bleRelayActive && !userConnectedSession && !bridgeSyncActive) {
+        if (connected && bleRelayActive && !userConnectedSession && !uiVisible) {
             bleClient.disconnect()
+        }
+        if (userConnectedSession || uiVisible) {
+            if (connected) {
+                enterRelayState(RelayFsmState.CONNECTED, "Connected — live IMU")
+            } else {
+                scheduleReconnectPause(
+                    if (uiVisible) {
+                        "Reconnecting…"
+                    } else {
+                        "Link lost — retry in ${MANUAL_CONNECT_RETRY_MS / 1000}s"
+                    },
+                )
+            }
+            return
         }
         if (relayFsmActive() && !userConnectedSession) {
             enterRelayState(RelayFsmState.CLOUD_SYNC, "Cloud sync…")
@@ -741,9 +999,12 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
             TAG,
             "clock status synced=$synced src=$src tz=${status.clockTzMin} drift=${drift}ms corr=${corr}ms",
         )
-        if (corr > 0L) {
+        if (corr > 0L && corr != lastReportedClockCorrMs) {
+            lastReportedClockCorrMs = corr
             val msg = "ESP clock corrected ${corr}ms (src=$src drift=${drift}ms)"
-            broadcastStatus(msg, important = true)
+            if (!userConnectedSession) {
+                broadcastStatus(msg, important = true)
+            }
             if (CloudSettings(applicationContext).enabled) {
                 ioExecutor.execute {
                     cloudUploader.uploadClockEvent(
@@ -754,6 +1015,28 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
                         unixSec = status.clockUnixSec ?: 0L,
                     )
                 }
+            }
+        }
+        // Explicit once-per-connect user-visible verdict: priority #1 per FSM spec.
+        // "NOK" tolerance is +-5min; firmware auto-applies at 4min so a correction always
+        // implies the pre-correction drift was inside the NOK zone.
+        if (!clockCheckedThisSession) {
+            clockCheckedThisSession = true
+            val driftAbsMin = Math.abs(drift) / 60_000.0
+            when {
+                corr > 0L -> broadcastBanner(
+                    StatusBannerLevel.WARN,
+                    String.format(java.util.Locale.US, "Clock drift was %.1fmin — corrected (src=$src)", driftAbsMin),
+                )
+                !synced -> broadcastBanner(StatusBannerLevel.WARN, "Clock not synced yet")
+                driftAbsMin > 5.0 -> broadcastBanner(
+                    StatusBannerLevel.WARN,
+                    String.format(java.util.Locale.US, "Clock drift %.1fmin (NOK, src=$src)", driftAbsMin),
+                )
+                else -> broadcastBanner(
+                    StatusBannerLevel.OK,
+                    String.format(java.util.Locale.US, "Clock sync OK (drift %.1fmin, src=$src)", driftAbsMin),
+                )
             }
         }
     }
@@ -772,15 +1055,87 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
     }
 
     private fun attemptAutoConnect() {
-        if (!shouldAutoConnectRetry() || connected) {
+        if (connected) {
+            return
+        }
+        if (bleClient.isConnectBusy()) {
+            Log.i(TAG, "Auto connect skipped — connect in flight; retry in 2s")
+            mainHandler.postDelayed({ attemptAutoConnect() }, 2000L)
+            return
+        }
+        if (!shouldAutoConnectRetry()) {
             return
         }
         connectAttemptSeq++
-        val msg = "Auto connect #$connectAttemptSeq (scan 25s)…"
+        val msg = "Auto connect #$connectAttemptSeq (scan 20s)…"
         Log.i(TAG, msg)
-        enterRelayState(RelayFsmState.SCAN_CONNECT, msg)
-        bleClient.setMinimalRelayConnect(true)
-        bleClient.connect()
+        requestBleConnect(
+            fullSession = uiVisible || userConnectedSession,
+            reason = msg,
+        )
+    }
+
+    /**
+     * The always-on relay FSM connects in minimal (no-notify) mode in the background to save
+     * power/BLE traffic for crash & status sync only. If the Activity becomes visible while that
+     * minimal session is already up, notifications were never enabled, so the scene view (and any
+     * live batch data) stays blank. Upgrade in place by reconnecting with full setup — mirrors
+     * what the manual Connect button already does.
+     */
+    private fun onUiVisibleChanged(active: Boolean) {
+        uiVisible = active
+        if (active) {
+            if (connected && !userConnectedSession) {
+                Log.i(TAG, "UI foregrounded during minimal relay session — upgrading to full BLE session")
+                userConnectedSession = true
+                autoPromotedFullSession = true
+                cancelFsmTimers()
+                cancelPendingStatusUpdates()
+                bleClient.setMinimalRelayConnect(false)
+                if (bleClient.upgradeToFullSession()) {
+                    enterRelayState(RelayFsmState.CONNECTED, "Connected — live IMU")
+                } else {
+                    requestBleConnect(
+                        fullSession = true,
+                        reason = "Foreground — upgrading link…",
+                    )
+                }
+            } else if (!connected) {
+                ensureRelayConnectForUi()
+            }
+        } else if (autoPromotedFullSession) {
+            autoPromotedFullSession = false
+            userConnectedSession = false
+        }
+    }
+
+    /** UI is visible but BLE is down — (re)start the relay FSM instead of sitting on "Disconnected". */
+    private fun ensureRelayConnectForUi() {
+        if (connected) {
+            return
+        }
+        if (!relayFsmActive()) {
+            startBleRelayMode()
+            return
+        }
+        cancelFsmTimers()
+        when (relayFsmState) {
+            RelayFsmState.PAUSE, RelayFsmState.STARTING, RelayFsmState.BT_WARMUP -> {
+                requestBleConnect(
+                    fullSession = true,
+                    reason = "UI foreground — connecting…",
+                )
+            }
+            RelayFsmState.SCAN_CONNECT -> {
+                if (!bleClient.isConnectBusy()) {
+                    requestBleConnect(
+                        fullSession = true,
+                        reason = "UI foreground — retrying scan…",
+                    )
+                }
+            }
+            else -> wakeRelayFsmNow()
+        }
     }
 
     /** On connect: fetch crashes immediately and retry upload until backend accepts (or none left). */
@@ -809,7 +1164,11 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
                         onDone()
                         return@post
                     }
-                    if (upload.ok) {
+                    if (upload.ok && (upload.accepted > 0 || upload.duplicates > 0)) {
+                        // Dedup key is (device_id, seq, pc) — a "duplicate" here means this exact
+                        // crash is already safely recorded in the cloud (e.g. a prior upload
+                        // succeeded but the link dropped before the slot-clear write landed).
+                        // Safe to clear either way; only the banner differs.
                         clearDeviceCrashSlots(crashes)
                         val first = crashes.first()
                         if (upload.accepted > 0) {
@@ -820,11 +1179,17 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
                             )
                         } else {
                             broadcastStatus(
-                                "Crash already in cloud — ESP slot cleared (${first.reason})",
+                                "Crash already in cloud (seq ${first.seq}) — ESP slot cleared",
                                 important = true,
                             )
                         }
                         mainHandler.postDelayed({ relayCrashesUntilConfirmed(round + 1, onDone) }, 500)
+                    } else if (upload.ok) {
+                        broadcastBanner(
+                            StatusBannerLevel.WARN,
+                            "Crash upload returned 0 accepted — ESP slot kept",
+                        )
+                        onDone()
                     } else if (!CloudSettings(applicationContext).enabled) {
                         broadcastBanner(
                             StatusBannerLevel.WARN,
@@ -850,10 +1215,9 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
     }
 
     private fun clearDeviceCrashSlots(crashes: List<CrashFetcher.CrashInfo>) {
-        for (info in crashes) {
-            if (info.slot >= 0) {
-                bleClient.clearDeviceCrashSlot(info.slot)
-            }
+        val slots = crashes.mapNotNull { it.slot.takeIf { s -> s >= 0 } }
+        if (slots.isNotEmpty()) {
+            bleClient.clearDeviceCrashSlots(slots)
         }
         if (crashes.any { it.slot < 0 }) {
             bleClient.clearDeviceCrash()
@@ -871,7 +1235,7 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
                 val upload = cloudUploader.uploadPendingCrashes(crashes.size.coerceAtLeast(1))
                 mainHandler.post {
                     if (!connected) return@post
-                    if (upload.ok) {
+                    if (upload.ok && (upload.accepted > 0 || upload.duplicates > 0)) {
                         clearDeviceCrashSlots(crashes)
                         val first = crashes.first()
                         if (upload.accepted > 0) {
@@ -882,7 +1246,7 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
                             )
                         } else {
                             broadcastStatus(
-                                "Crash already in cloud — ESP slot cleared (${first.reason})",
+                                "Crash already in cloud (seq ${first.seq}) — ESP slot cleared",
                                 important = true,
                             )
                         }
@@ -941,6 +1305,10 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
         relayFsmStarted = true
         cancelFsmTimers()
         enterRelayState(RelayFsmState.STARTING, "Background service started")
+        if (btWarmupDone) {
+            mainHandler.post { beginScanConnect("FSM resumed") }
+            return
+        }
         mainHandler.postDelayed({
             enterRelayState(
                 RelayFsmState.BT_WARMUP,
@@ -951,6 +1319,7 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
     }
 
     private fun onFsmWarmupComplete() {
+        btWarmupDone = true
         if (!relayFsmActive() || userConnectedSession || connected) {
             return
         }
@@ -958,35 +1327,102 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
     }
 
     private fun onFsmPauseComplete() {
-        if (!relayFsmActive() || userConnectedSession || connected || bridgeSyncActive) {
+        Log.i(
+            TAG,
+            "FSM pause ended (connected=$connected bridge=$bridgeSyncActive " +
+                "user=$userConnectedSession relay=${relayFsmActive()})",
+        )
+        if (connected) {
+            return
+        }
+        if (userConnectedSession) {
+            requestBleConnect(
+                fullSession = true,
+                reason = "Retrying manual connect…",
+            )
+            return
+        }
+        if (!relayFsmActive()) {
+            Log.w(TAG, "FSM pause ended but relay inactive — no reconnect")
             return
         }
         beginScanConnect("pause ended")
     }
 
+    private fun onReconnectWatchdog() {
+        if (connected) {
+            return
+        }
+        if (!relayFsmActive() && !userConnectedSession) {
+            return
+        }
+        val now = SystemClock.uptimeMillis()
+        if (relayFsmState == RelayFsmState.SCAN_CONNECT && now < reconnectDueAtMs + 45_000L) {
+            // Scan + GATT still in progress — check again later.
+            armReconnectWatchdog(10_000L)
+            return
+        }
+        if (now < reconnectDueAtMs) {
+            armReconnectWatchdog()
+            return
+        }
+        Log.w(TAG, "Reconnect watchdog: overdue in ${relayFsmState.name} — forcing retry")
+        onFsmPauseComplete()
+    }
+
+    private fun armReconnectWatchdog(fixedDelayMs: Long? = null) {
+        mainHandler.removeCallbacks(reconnectWatchdogRunnable)
+        if (connected || (!relayFsmActive() && !userConnectedSession)) {
+            return
+        }
+        val delay = fixedDelayMs ?: run {
+            val untilDue = reconnectDueAtMs - SystemClock.uptimeMillis() + 3_000L
+            untilDue.coerceIn(5_000L, 45_000L)
+        }
+        mainHandler.postDelayed(reconnectWatchdogRunnable, delay)
+    }
+
     private fun beginScanConnect(reason: String) {
-        if (!relayFsmActive() || userConnectedSession || connected || bridgeSyncActive) {
+        if (!relayFsmActive() || userConnectedSession || connected) {
             return
         }
         enterRelayState(RelayFsmState.SCAN_CONNECT, "Scan + connect… ($reason)")
         attemptAutoConnect()
     }
 
-    private fun scheduleFsmPauseThenConnect(caption: String) {
-        if (!relayFsmActive() || userConnectedSession) {
+    private fun scheduleReconnectPause(caption: String) {
+        if (!relayFsmActive() && !userConnectedSession) {
             return
         }
         enterRelayState(RelayFsmState.PAUSE, caption)
+        val pauseMs = when {
+            userConnectedSession -> MANUAL_CONNECT_RETRY_MS
+            uiVisible -> UI_RELAY_PAUSE_MS
+            else -> RELAY_PAUSE_MS
+        }
+        reconnectDueAtMs = SystemClock.uptimeMillis() + pauseMs
         cancelFsmTimers()
-        mainHandler.postDelayed(fsmPauseRunnable, RELAY_PAUSE_MS)
+        mainHandler.postDelayed(fsmPauseRunnable, pauseMs)
+        armReconnectWatchdog()
         broadcastRelayState()
         updateNotification(force = true)
+        Log.i(TAG, "Reconnect scheduled in ${pauseMs / 1000}s: $caption")
+    }
+
+    private fun scheduleFsmPauseThenConnect(caption: String) {
+        scheduleReconnectPause(caption)
+    }
+
+    private fun cancelPendingStatusUpdates() {
+        pendingTelemetry = null
+        mainHandler.removeCallbacks(flushTelemetryRunnable)
     }
 
     private fun cancelFsmTimers() {
         mainHandler.removeCallbacks(connectRetryRunnable)
         mainHandler.removeCallbacks(fsmWarmupRunnable)
         mainHandler.removeCallbacks(fsmPauseRunnable)
+        // reconnectWatchdogRunnable intentionally kept — safety net if pause callback is lost
     }
 
     private fun relayBannerLevel(state: RelayFsmState): StatusBannerLevel = when (state) {
@@ -999,9 +1435,19 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
     private fun enterRelayState(state: RelayFsmState, caption: String) {
         relayFsmState = state
         relayFsmCaption = caption
-        session.lastStatus = caption
         Log.i(TAG, "FSM ${state.name}: $caption")
         broadcastRelayState()
+        if (connected) {
+            if (state == RelayFsmState.CONNECTED || state == RelayFsmState.CLOUD_SYNC) {
+                session.lastStatus = caption
+                broadcastStatus(caption, important = true)
+                if (caption.isNotBlank() && state == RelayFsmState.CONNECTED) {
+                    broadcastBanner(relayBannerLevel(state), caption)
+                }
+            }
+            return
+        }
+        session.lastStatus = caption
         broadcastStatus(caption, important = true)
         if (caption.isNotBlank()) {
             broadcastBanner(relayBannerLevel(state), caption)
@@ -1032,11 +1478,11 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
 
     private fun stopAutopilotMode() {
         autopilotActive = false
+        pendingBridgeWork = false
         mainHandler.removeCallbacks(internalBridgeRunnable)
         mainHandler.removeCallbacks(connectRetryRunnable)
         if (bridgeSyncActive && !userConnectedSession) {
             bridgeSyncActive = false
-            bridgeAwaitingCrashRelay = false
             mainHandler.removeCallbacks(bridgeFinishRunnable)
         }
         updateNotification(force = true)
@@ -1065,30 +1511,72 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
         }
     }
 
+    /**
+     * Bridge sync (verdict/config sync) never opens its own BLE connection — it only sets a
+     * request flag serviced by the single always-on relay FSM once it reaches CONNECTED (after
+     * crash drain). This removes the old two-connect-authorities race that could leave
+     * bridgeSyncActive stuck and silently freeze reconnects.
+     */
     private fun startBridgeSyncCycle() {
-        if (bridgeSyncActive) {
+        if (bridgeSyncActive || pendingBridgeWork) {
             return
         }
-        bridgeSyncActive = true
-        bridgeInitiatedConnect = !connected
-        startForeground(NOTIFICATION_ID, buildNotification())
-        broadcastBanner(StatusBannerLevel.WARN, "Bridge sync: connecting to ESP…")
+        pendingBridgeWork = true
+        Log.i(TAG, "Bridge sync requested — will run on next relay connect")
+        if (connected && !userConnectedSession) {
+            beginBridgeWorkThenFinish()
+        } else if (!connected && !userConnectedSession) {
+            wakeRelayFsmNow()
+        }
+        // else: user is manually connected — pendingBridgeWork stays set and is picked up once
+        // they disconnect and the relay FSM resumes.
+    }
+
+    /** Nudge the relay FSM to (re)connect now instead of waiting out its pause timer. */
+    private fun wakeRelayFsmNow() {
         if (connected) {
-            savedPollMsForBridge = session.pollMs
-            bleClient.setPollIntervalMs(2000)
-            bridgeAwaitingCrashRelay = true
-            relayCrashesUntilConfirmed {
-                bridgeAwaitingCrashRelay = false
-                if (this.connected && bridgeSyncActive) {
-                    syncConfigThenBridgeSetup(skipCrashSchedule = true)
-                }
+            return
+        }
+        if (userConnectedSession && !uiVisible) {
+            return
+        }
+        if (!relayFsmActive()) {
+            startBleRelayMode()
+            return
+        }
+        if (relayFsmState == RelayFsmState.PAUSE) {
+            cancelFsmTimers()
+            if (uiVisible || userConnectedSession) {
+                requestBleConnect(
+                    fullSession = true,
+                    reason = "Wake — connecting…",
+                )
+            } else {
+                mainHandler.post(fsmPauseRunnable)
             }
-        } else {
-            bleClient.connect()
+            return
+        }
+        if (relayFsmState == RelayFsmState.STARTING || relayFsmState == RelayFsmState.BT_WARMUP) {
+            if (uiVisible) {
+                cancelFsmTimers()
+                requestBleConnect(fullSession = true, reason = "Wake — connecting…")
+            }
         }
     }
 
-    private fun syncConfigThenBridgeSetup(skipCrashSchedule: Boolean = false) {
+    private fun beginBridgeWorkThenFinish() {
+        if (bridgeSyncActive || !connected) {
+            return
+        }
+        bridgeSyncActive = true
+        pendingBridgeWork = false
+        startForeground(NOTIFICATION_ID, buildNotification())
+        savedPollMsForBridge = session.pollMs
+        bleClient.setPollIntervalMs(2000)
+        syncConfigThenBridgeSetup()
+    }
+
+    private fun syncConfigThenBridgeSetup() {
         ioExecutor.execute {
             bleClient.syncConfigFromDevice { blob ->
                 if (blob != null) {
@@ -1099,11 +1587,7 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
                     if (!connected || !bridgeSyncActive) {
                         return@post
                     }
-                    mainHandler.postDelayed({ flushOffloadAcks() }, 500)
-                    if (!skipCrashSchedule) {
-                        relayPendingCrash()
-                        scheduleCrashRelayRetries()
-                    }
+                    scheduleFlushOffloadAcks(500)
                     maybeAutoRefForBridge()
                     scheduleBridgeFinish()
                 }
@@ -1131,55 +1615,21 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
         mainHandler.postDelayed(bridgeFinishRunnable, dwellMs)
     }
 
+    /** Bridge work done — hand off to the single relay pause/reconnect/cloud-sync path. */
     private fun completeBridgeSyncCycle() {
         if (!bridgeSyncActive) {
             return
         }
-        if (bridgeAwaitingCrashRelay) {
-            mainHandler.postDelayed(bridgeFinishRunnable, 2000L)
-            return
-        }
-        mainHandler.post { flushOffloadAcks() }
-        ioExecutor.execute {
-            val upload = cloudUploader.uploadAll()
-            mainHandler.post {
-                when {
-                    upload.totalAccepted > 0 ->
-                        broadcastBanner(StatusBannerLevel.OK, "Bridge: uploaded ${upload.summary}")
-                    !CloudSettings(applicationContext).enabled ->
-                        broadcastBanner(StatusBannerLevel.WARN, "Bridge done — cloud off")
-                    else ->
-                        broadcastBanner(StatusBannerLevel.OK, "Bridge sync done")
-                }
-                finishBridgeSyncCycle()
-            }
-        }
-    }
-
-    private fun finishBridgeSyncCycle() {
-        if (!bridgeSyncActive) {
-            return
-        }
         bridgeSyncActive = false
-        bridgeAwaitingCrashRelay = false
         mainHandler.removeCallbacks(bridgeFinishRunnable)
-        mainHandler.removeCallbacks(connectRetryRunnable)
         if (savedPollMsForBridge > 0 && !userConnectedSession) {
             bleClient.setPollIntervalMs(savedPollMsForBridge)
             savedPollMsForBridge = 0
         }
-        if (bridgeInitiatedConnect && connected && !userConnectedSession) {
-            bleClient.disconnect()
-            broadcastStatus("Bridge sync — disconnected to save ESP battery", important = true)
-        }
         if (autopilotActive) {
             scheduleInternalBridgeNext()
-            updateNotification(force = true)
-        } else if (relayFsmActive() && !userConnectedSession) {
-            scheduleFsmPauseThenConnect("Bridge done — pause ${RELAY_PAUSE_MS / 1000}s")
-        } else {
-            stopForegroundIfIdle()
         }
+        finishBleRelaySession("bridge sync done")
     }
 
     private fun buildSnapshot(): Bundle =
@@ -1214,6 +1664,10 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
                 snap.getBoolean(ImuSessionStore.KEY_SHOW_DISCONNECT),
             )
             callback.onSessionRestore(snap)
+            callback.onClockState(
+                lastDeviceStatus?.clockSynced == true,
+                lastDeviceStatus?.clockTzMin ?: 0,
+            )
         } catch (_: Exception) {
         }
     }
@@ -1232,6 +1686,10 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
     }
 
     private fun flushPendingTelemetry() {
+        if (connected) {
+            pendingTelemetry = null
+            return
+        }
         val text = pendingTelemetry ?: return
         pendingTelemetry = null
         lastTelemetryUiMs = SystemClock.uptimeMillis()
@@ -1240,16 +1698,42 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
 
     private fun broadcastConnection(connected: Boolean) {
         foreachCallback { it.onConnectionChanged(connected) }
+        if (connected) {
+            foreachCallback { it.onCaptionEpoch(captionEpoch) }
+        }
+    }
+
+    private fun isFsmNoiseCaption(text: String): Boolean {
+        val lower = text.lowercase()
+        return lower.contains("link lost") ||
+            lower.contains("retry") ||
+            lower.contains("auto connect") ||
+            lower.contains("pause") ||
+            lower.contains("scanning") ||
+            lower.contains("scan + connect") ||
+            lower.contains("connect blocked") ||
+            lower.contains("relay done") ||
+            lower.contains("cloud ok") ||
+            lower.contains("warmup") ||
+            lower.contains("direct connect") ||
+            lower.contains("waiting for esp grace") ||
+            lower.contains("disconnected")
     }
 
     private fun broadcastStatus(text: String, important: Boolean) {
-        if (important) {
+        if (connected && isFsmNoiseCaption(text)) {
+            return
+        }
+        if (important && (!connected || !isFsmNoiseCaption(text))) {
             session.lastStatus = text
         }
         foreachCallback { it.onStatus(text) }
     }
 
     private fun broadcastBanner(level: StatusBannerLevel, message: String) {
+        if (connected && isFsmNoiseCaption(message)) {
+            return
+        }
         mainHandler.post {
             val code = when (level) {
                 StatusBannerLevel.OK -> 0
@@ -1302,17 +1786,33 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
         foreachCallback { it.onEspScreenState(on) }
     }
 
-    private inline fun foreachCallback(block: (IImuBleCallback) -> Unit) {
-        val n = callbacks.beginBroadcast()
+    /**
+     * RemoteCallbackList.beginBroadcast()/finishBroadcast() do not support reentrancy: a nested
+     * call on the same thread (e.g. a local in-process callback synchronously triggering another
+     * broadcast before the outer one finishes) or a racing call from another thread both throw
+     * "beginBroadcast() called while already in a broadcast" and crash the process. Guard with an
+     * atomic flag and defer any nested/racing call back onto mainHandler's queue — it will retry
+     * once the in-flight broadcast has called finishBroadcast().
+     */
+    private fun foreachCallback(block: (IImuBleCallback) -> Unit) {
+        if (!callbacksBroadcastActive.compareAndSet(false, true)) {
+            mainHandler.post { foreachCallback(block) }
+            return
+        }
         try {
-            for (i in 0 until n) {
-                try {
-                    block(callbacks.getBroadcastItem(i))
-                } catch (_: Exception) {
+            val n = callbacks.beginBroadcast()
+            try {
+                for (i in 0 until n) {
+                    try {
+                        block(callbacks.getBroadcastItem(i))
+                    } catch (_: Exception) {
+                    }
                 }
+            } finally {
+                callbacks.finishBroadcast()
             }
         } finally {
-            callbacks.finishBroadcast()
+            callbacksBroadcastActive.set(false)
         }
     }
 
@@ -1352,7 +1852,7 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
             bridgeSyncActive -> "Bridge sync…"
             bleRelayActive -> {
                 val cloud = if (CloudSettings(this).enabled) "cloud on" else "cloud off"
-                "BLE relay #$connectAttemptSeq (10s/30s · $cloud)"
+                "BLE relay #$connectAttemptSeq (20s scan · ${RELAY_PAUSE_MS / 1000}s pause · $cloud)"
             }
             autopilotActive -> getString(R.string.notification_autopilot)
             else -> getString(R.string.notification_idle)

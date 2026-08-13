@@ -62,6 +62,13 @@
             android:parentActivityName=".MainActivity"
             android:screenOrientation="fullSensor" />
 
+        <activity
+            android:name=".CrashDebugActivity"
+            android:exported="false"
+            android:label="@string/crash_debug_title"
+            android:parentActivityName=".MainActivity"
+            android:screenOrientation="fullSensor" />
+
         <service
             android:name=".ImuBleForegroundService"
             android:exported="false"

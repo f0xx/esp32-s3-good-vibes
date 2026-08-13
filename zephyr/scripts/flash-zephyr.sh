@@ -99,12 +99,12 @@ if [[ -x "$BT_LONG_WQ_APPLY" && "${APPLY_BT_LONG_WQ_PATCH:-1}" == "1" ]]; then
 		exit 1
 	fi
 	BT_LONG_WQ_APPLIED=1
-	if ! grep -q 'default 2048 if BT_GATT_CACHING' \
+	if ! grep -q 'default 3072 if BT_GATT_CACHING' \
 		"$HOME/zephyrproject/zephyr/subsys/bluetooth/host/Kconfig"; then
-		echo "ERROR: BT_LONG_WQ_STACK_SIZE still defaults to 1300" >&2
+		echo "ERROR: BT_LONG_WQ_STACK_SIZE still defaults to 1300/2048" >&2
 		exit 1
 	fi
-	echo "Verified: BT_LONG_WQ_STACK_SIZE bumped to 2048 (zephyr #92224)"
+	echo "Verified: BT_LONG_WQ_STACK_SIZE bumped to 3072 (zephyr #92224)"
 fi
 
 source "$HOME/zephyrproject/.venv/bin/activate"

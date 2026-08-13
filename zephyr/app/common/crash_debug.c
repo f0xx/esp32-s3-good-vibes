@@ -19,6 +19,30 @@ static void stack_overflow_fn(void)
 	stack_overflow_fn();
 }
 
+static void trigger_badptr_read(void)
+{
+	volatile int *p = (volatile int *)0xDEADBEEF;
+
+	(void)*p;
+}
+
+static void trigger_unaligned(void)
+{
+	volatile uint8_t buf[8] __attribute__((aligned(4))) = { 0 };
+	volatile uint32_t *p = (volatile uint32_t *)(buf + 1);
+
+	(void)*p;
+}
+
+static void trigger_ill(void)
+{
+#if defined(__XTENSA__)
+	__asm__ volatile("ill");
+#else
+	__builtin_trap();
+#endif
+}
+
 bool crash_debug_available(void)
 {
 	return true;
@@ -42,12 +66,24 @@ void crash_debug_inject(const char *kind)
 		*p = 42;
 		return;
 	}
+	if (strcmp(kind, "badptr") == 0) {
+		trigger_badptr_read();
+		return;
+	}
 	if (strcmp(kind, "div0") == 0) {
 		volatile int x = 42;
 		volatile int y = 0;
 		volatile int z = x / y;
 
 		ARG_UNUSED(z);
+		return;
+	}
+	if (strcmp(kind, "unalign") == 0) {
+		trigger_unaligned();
+		return;
+	}
+	if (strcmp(kind, "ill") == 0) {
+		trigger_ill();
 		return;
 	}
 	if (strcmp(kind, "stack") == 0) {

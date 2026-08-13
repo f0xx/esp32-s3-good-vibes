@@ -18,6 +18,8 @@
 #define BLE_IMU_POLL_MS_MAX     2000
 
 #define BLE_IMU_ATT_PAYLOAD_MAX 512
+/** STATUS is read-only (long-read); separate from NOTIFY batch cap. */
+#define BLE_IMU_STATUS_JSON_MAX 768
 
 #define BLE_IMU_HEADER_RESERVE    96
 #define BLE_IMU_COMMIT_BYTES      (BLE_IMU_ATT_PAYLOAD_MAX - BLE_IMU_HEADER_RESERVE)
@@ -41,6 +43,17 @@
 	BT_UUID_128_ENCODE(0x4a6e0008, 0x0000, 0x1000, 0x8000, 0x00805f9b34fb)
 #define BT_UUID_IMU_SCREEN_VAL \
 	BT_UUID_128_ENCODE(0x4a6e0009, 0x0000, 0x1000, 0x8000, 0x00805f9b34fb)
+/** Manual CPU clock override, 1 byte: 0 = auto (mode-derived), else explicit target MHz
+ *  (rounded to the nearest supported tier — see power_manager.c clamp_cpu_mhz()). */
+#define BT_UUID_IMU_CPU_MHZ_VAL \
+	BT_UUID_128_ENCODE(0x4a6e000a, 0x0000, 0x1000, 0x8000, 0x00805f9b34fb)
+/** Manual IMU sample-rate override, 1 byte: 0 = auto (mode-derived), else explicit Hz
+ *  (clamped to [BLE_IMU_HZ_OVERRIDE_MIN, BLE_IMU_HZ_OVERRIDE_MAX]). */
+#define BT_UUID_IMU_IMU_HZ_VAL \
+	BT_UUID_128_ENCODE(0x4a6e000b, 0x0000, 0x1000, 0x8000, 0x00805f9b34fb)
+
+#define BLE_IMU_HZ_OVERRIDE_MIN 1
+#define BLE_IMU_HZ_OVERRIDE_MAX 120
 
 enum ble_imu_mode {
 	BLE_IMU_MODE_RAW = 0,

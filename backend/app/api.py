@@ -10,8 +10,9 @@ from sqlalchemy.orm import Session
 
 from app.auth import require_api_key
 from app.db import Base, engine, get_db
-from app.models import Crash, Device, DeviceConfigRevision, Spectrum, Verdict
+from app.models import Crash, Device, DeviceConfigRevision, Machine, ReferenceProfile, Sensor, Spectrum, Verdict
 from app.edge_score import score_edge_features
+from app.trend_score import score_trend
 from app.symbolicate import enrich_crash_detail
 from app.device_config_codec import blob_to_json, cloud_revision, json_to_blob
 from app.schemas import (
@@ -26,8 +27,16 @@ from app.schemas import (
     HealthOut,
     IngestEnvelope,
     IngestResult,
+    MachineCreate,
+    MachineOut,
+    ReferenceProfileOut,
+    ReferenceProfilePut,
+    SensorCreate,
+    SensorOut,
     SpectrumIngestEnvelope,
     SpectrumOut,
+    TrendOut,
+    TrendPoint,
     VerdictOut,
 )
 
@@ -76,6 +85,20 @@ def ensure_db() -> None:
                     )
         except Exception:
             pass
+        try:
+            with engine.begin() as conn:
+                # seq alone collides when ESP crash ring resets; include pc in dedup key.
+                conn.execute(text("DROP INDEX IF EXISTS ix_crashes_device_seq"))
+                conn.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS ix_crashes_device_seq_pc "
+                        "ON crashes (device_id, seq, pc)"
+                    )
+                )
+        except Exception as exc:
+            import logging
+
+            logging.getLogger(__name__).warning("crash dedup index migration: %s", exc)
 
 
 @router.get("/health", response_model=HealthOut)
@@ -302,10 +325,12 @@ def ingest_crashes(
     for rec in body.records:
         if rec.type != "crash":
             continue
+        pc_val = rec.pc if rec.pc is not None else 0
         exists = db.scalar(
             select(Crash.id).where(
                 Crash.device_id == body.device_id,
                 Crash.seq == rec.seq,
+                func.coalesce(Crash.pc, 0) == pc_val,
             )
         )
         if exists is not None:
@@ -709,3 +734,263 @@ def ingest_config(
     device.last_phone_id = body.phone_id
     db.commit()
     return IngestResult(accepted=accepted, duplicates=duplicates, device_id=body.device_id)
+
+
+# --- Machines / Sensors / Reference profiles (profiles.txt #2/#3) ---------
+
+
+def _machine_out(row: Machine, sensor_count: int) -> MachineOut:
+    return MachineOut(
+        machine_key=row.machine_key,
+        name=row.name,
+        kind=row.kind,
+        notes=row.notes,
+        created_ms=row.created_ms,
+        sensor_count=sensor_count,
+    )
+
+
+@router.post("/machines", response_model=MachineOut, status_code=201)
+def create_machine(
+    body: MachineCreate,
+    _: None = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> MachineOut:
+    existing = db.scalar(select(Machine).where(Machine.machine_key == body.machine_key))
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="machine_key already exists")
+    row = Machine(
+        machine_key=body.machine_key,
+        name=body.name,
+        kind=body.kind,
+        notes=body.notes,
+        created_ms=int(time.time() * 1000),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return _machine_out(row, 0)
+
+
+@router.get("/machines", response_model=list[MachineOut])
+def list_machines(
+    _: None = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> list[MachineOut]:
+    rows = db.scalars(select(Machine).order_by(Machine.created_ms.desc())).all()
+    out: list[MachineOut] = []
+    for row in rows:
+        count = db.scalar(
+            select(func.count()).select_from(Sensor).where(Sensor.machine_id == row.id)
+        ) or 0
+        out.append(_machine_out(row, int(count)))
+    return out
+
+
+def _get_machine_or_404(db: Session, machine_key: str) -> Machine:
+    row = db.scalar(select(Machine).where(Machine.machine_key == machine_key))
+    if row is None:
+        raise HTTPException(status_code=404, detail="machine not found")
+    return row
+
+
+@router.get("/machines/{machine_key}", response_model=MachineOut)
+def get_machine(
+    machine_key: str,
+    _: None = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> MachineOut:
+    row = _get_machine_or_404(db, machine_key)
+    count = db.scalar(
+        select(func.count()).select_from(Sensor).where(Sensor.machine_id == row.id)
+    ) or 0
+    return _machine_out(row, int(count))
+
+
+def _sensor_out(row: Sensor, machine_key: str) -> SensorOut:
+    return SensorOut(
+        device_id=row.device_id,
+        machine_key=machine_key,
+        label=row.label,
+        mount_note=row.mount_note,
+        created_ms=row.created_ms,
+    )
+
+
+@router.post("/machines/{machine_key}/sensors", response_model=SensorOut, status_code=201)
+def add_sensor(
+    machine_key: str,
+    body: SensorCreate,
+    _: None = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> SensorOut:
+    machine = _get_machine_or_404(db, machine_key)
+    existing = db.scalar(select(Sensor).where(Sensor.device_id == body.device_id))
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="device_id already assigned to a sensor")
+    row = Sensor(
+        machine_id=machine.id,
+        device_id=body.device_id,
+        label=body.label,
+        mount_note=body.mount_note,
+        created_ms=int(time.time() * 1000),
+    )
+    db.add(row)
+    device = db.get(Device, body.device_id)
+    if device is None:
+        db.add(Device(device_id=body.device_id))
+    db.commit()
+    db.refresh(row)
+    return _sensor_out(row, machine_key)
+
+
+@router.get("/machines/{machine_key}/sensors", response_model=list[SensorOut])
+def list_sensors(
+    machine_key: str,
+    _: None = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> list[SensorOut]:
+    machine = _get_machine_or_404(db, machine_key)
+    rows = db.scalars(
+        select(Sensor).where(Sensor.machine_id == machine.id).order_by(Sensor.created_ms)
+    ).all()
+    return [_sensor_out(r, machine_key) for r in rows]
+
+
+def _ref_profile_out(row: ReferenceProfile) -> ReferenceProfileOut:
+    return ReferenceProfileOut(
+        device_id=row.device_id,
+        slot=row.slot,
+        name=row.name,
+        created_ms=row.created_ms,
+        updated_ms=row.updated_ms,
+        duration_ms=row.duration_ms,
+        sample_hz=row.sample_hz,
+        format=row.format,
+        bands=row.bands,
+        raw=row.raw,
+        active=row.active,
+    )
+
+
+@router.put(
+    "/devices/{device_id}/reference_profiles/{slot}",
+    response_model=ReferenceProfileOut,
+)
+def put_reference_profile(
+    device_id: str,
+    slot: int,
+    body: ReferenceProfilePut,
+    _: None = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> ReferenceProfileOut:
+    if slot < 0 or slot > 4:
+        raise HTTPException(status_code=400, detail="slot must be 0..4 (max 5 profiles)")
+    now_ms = int(time.time() * 1000)
+    row = db.scalar(
+        select(ReferenceProfile).where(
+            ReferenceProfile.device_id == device_id,
+            ReferenceProfile.slot == slot,
+        )
+    )
+    if row is None:
+        row = ReferenceProfile(device_id=device_id, slot=slot, created_ms=now_ms)
+        db.add(row)
+    row.name = body.name
+    row.updated_ms = now_ms
+    row.duration_ms = body.duration_ms
+    row.sample_hz = body.sample_hz
+    row.format = body.format
+    row.bands_json = json.dumps(body.bands) if body.bands is not None else None
+    row.raw_json = json.dumps(body.raw) if body.raw is not None else None
+    row.active = body.active
+
+    device = db.get(Device, device_id)
+    if device is None:
+        db.add(Device(device_id=device_id))
+
+    db.commit()
+    db.refresh(row)
+    return _ref_profile_out(row)
+
+
+@router.get(
+    "/devices/{device_id}/reference_profiles",
+    response_model=list[ReferenceProfileOut],
+)
+def list_reference_profiles(
+    device_id: str,
+    _: None = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> list[ReferenceProfileOut]:
+    rows = db.scalars(
+        select(ReferenceProfile)
+        .where(ReferenceProfile.device_id == device_id)
+        .order_by(ReferenceProfile.slot)
+    ).all()
+    return [_ref_profile_out(r) for r in rows]
+
+
+@router.delete("/devices/{device_id}/reference_profiles/{slot}", status_code=204)
+def delete_reference_profile(
+    device_id: str,
+    slot: int,
+    _: None = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> None:
+    row = db.scalar(
+        select(ReferenceProfile).where(
+            ReferenceProfile.device_id == device_id,
+            ReferenceProfile.slot == slot,
+        )
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="reference profile not found")
+    db.delete(row)
+    db.commit()
+
+
+# --- Trend / monotonic early-warning (profiles.txt #2) ---------------------
+
+
+@router.get("/devices/{device_id}/trend", response_model=TrendOut)
+def device_trend(
+    device_id: str,
+    metric: str = Query(default="edge_score", pattern="^(edge_score|rms_delta|band_delta_max)$"),
+    samples: int = Query(default=30, ge=5, le=200),
+    _: None = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> TrendOut:
+    rows = db.scalars(
+        select(Verdict)
+        .where(Verdict.device_id == device_id)
+        .order_by(Verdict.ts_ms.desc())
+        .limit(samples)
+    ).all()
+    rows = list(reversed(rows))  # oldest -> newest for trend direction
+
+    points: list[TrendPoint] = []
+    for row in rows:
+        if metric == "rms_delta":
+            val = row.rms_delta
+        elif metric == "band_delta_max":
+            val = _edge_from_raw(row.raw_json).get("band_delta_max")
+        else:
+            val = _edge_from_raw(row.raw_json).get("edge_score")
+        if val is not None:
+            points.append(TrendPoint(ts_ms=row.ts_ms, value=float(val)))
+
+    values = [p.value for p in points]
+    latest_high = bool(rows) and rows[-1].level >= 1
+    result = score_trend(values, latest_high=latest_high)
+
+    return TrendOut(
+        device_id=device_id,
+        metric=metric,
+        samples=len(values),
+        trend=result.trend,
+        score=result.score,
+        early_warning=result.early_warning,
+        latest_value=values[-1] if values else None,
+        points=points,
+    )

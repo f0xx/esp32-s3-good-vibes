@@ -1,6 +1,6 @@
 #!/bin/bash
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-S=${S:-"192.168.33.173:43069"}
+S=${S:-"192.168.33.173:33887"}
 export ANDROID_HOME="/home/foxx/Android/Sdk"
 export JAVA_HOME="/usr/lib/jvm/openjdk-bin-21"
 export PATH="$JAVA_HOME/bin:$ANDROID_HOME/platform-tools:$PATH"

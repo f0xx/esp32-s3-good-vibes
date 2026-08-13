@@ -68,8 +68,10 @@ struct vibro_band_rms vibro_band_rms_compute_series(size_t count, float sample_h
 						    vibro_mag_at_fn mag_at, void *ctx)
 {
 	struct vibro_band_rms out = { 0 };
-	float re[VIBRO_BAND_FFT_SIZE];
-	float im[VIBRO_BAND_FFT_SIZE];
+	/* Off the stack: this runs nested several calls deep inside the vibro
+	 * verdict/reference path on threads with limited stack budget. */
+	static float re[VIBRO_BAND_FFT_SIZE];
+	static float im[VIBRO_BAND_FFT_SIZE];
 	size_t n = VIBRO_BAND_FFT_SIZE;
 	size_t use = count;
 

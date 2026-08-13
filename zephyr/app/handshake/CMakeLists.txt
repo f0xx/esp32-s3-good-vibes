@@ -50,6 +50,7 @@ target_sources(app PRIVATE
   ${COMMON_DIR}/vibro_band_rms.c
   ${COMMON_DIR}/vibro_features.c
   ${COMMON_DIR}/vibro_verdict_store.c
+  ${COMMON_DIR}/vibro_ref_store.c
   ${COMMON_DIR}/vibro_schedule.c
   ${COMMON_DIR}/walk_distance.c
 )

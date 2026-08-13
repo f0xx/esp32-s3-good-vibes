@@ -7,7 +7,6 @@ This repository bundles everything needed to build, flash, and operate the full 
 | Component | Path | Role |
 |-----------|------|------|
 | **Zephyr firmware** (primary) | [`zephyr/`](zephyr/) | On-device app: IMU pipeline, live scene, BLE GATT, WiFi, power management |
-| **Arduino firmware** (reference) | [`esp32_s3_imu_basics/`](esp32_s3_imu_basics/) | Original production sketch; battery/UI calibration reference |
 | **Android app** | [`android/ESP32S3ImuSim/`](android/ESP32S3ImuSim/) | BLE client, live scene, vibration verdicts, cloud upload |
 | **Backend** | [`backend/`](backend/) | FastAPI ingest + TimescaleDB + Grafana dashboards |
 
@@ -34,6 +33,17 @@ System overview: **[docs/architecture.md](docs/architecture.md)**
 | RGB edge | WS2812 on GPIO38 | Bit-bang `ws2812_gpio38.c` |
 
 Full pin map and Kconfig: **[docs/zephyr-hardware.md](docs/zephyr-hardware.md)**
+
+---
+
+## Soldering the accumulator (taken from electronic cigarette)
+
+Accu rated as 3.7V / 420mAh LiPo
+
+![Battery soldering pins](backend/assets/simg0000.jpg)
+
+Accu +3.7v (red) <-> BAT pin (ETA6098)
+Accu Gnd (black) <-> G pin (common ground)
 
 ---
 
