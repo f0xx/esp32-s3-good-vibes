@@ -1,0 +1,12 @@
+Development ECDSA P-256 MCUboot signing key for desk, docker west, and phone OTA.
+
+  zephyr/mcuboot/root-ec-p256.pem
+
+ECDSA (not RSA-2048): ESP32-S3 MCUboot IRAM cannot fit mbedTLS RSA verify
+plus the board DTS. One key for common development. Rotate only after
+compromise or a rare re-factory: `imgtool keygen -t ecdsa-p256 -k root-ec-p256.pem`,
+rebuild MCUboot + app, USB-flash mcuboot.bin @ 0x0 and the signed confirmed
+slot image @ 0x10000 (flash-zephyr.sh handshake).
+
+Do not use MCUboot's upstream `root-ec-p256.pem` — that private key is public.
+USB recovery always remains the fallback if an OTA slot is marked bad.

@@ -34,6 +34,9 @@ uint8_t power_manager_cpu_mhz_override(void);
 /** Manual override of the mode-derived IMU sample rate (0 = auto). Persists via device_config. */
 void power_manager_set_imu_hz_override(uint8_t hz);
 uint8_t power_manager_imu_hz_override(void);
+/** True while battery-bench mode holds CPU/IMU/screen/config frozen. */
+bool power_manager_bench_locked(void);
+void power_manager_set_bench_lock(bool lock);
 /** Queue panel blanking/backlight change (applied on render thread). */
 void power_manager_request_panel_hw(bool on);
 /** Panel blanking/backlight (render thread only). */

@@ -11,7 +11,40 @@
 
 static float gyro_deadband(float dps)
 {
-	return fabsf(dps) < 1.0f ? 0.0f : dps;
+	return fabsf(dps) < 0.35f ? 0.0f : dps;
+}
+
+static float wrap_pi(float rad)
+{
+	while (rad > (float)M_PI) {
+		rad -= 2.0f * (float)M_PI;
+	}
+	while (rad < -(float)M_PI) {
+		rad += 2.0f * (float)M_PI;
+	}
+	return rad;
+}
+
+void attitude_rotation_zyx(struct mat3 *out, float roll, float pitch, float yaw)
+{
+	const float cr = cosf(roll);
+	const float sr = sinf(roll);
+	const float cp = cosf(pitch);
+	const float sp = sinf(pitch);
+	const float cy = cosf(yaw);
+	const float sy = sinf(yaw);
+
+	if (out == NULL) {
+		return;
+	}
+
+	*out = (struct mat3){
+		.m = {
+			{ cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr },
+			{ sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr },
+			{ -sp, cp * sr, cp * cr },
+		},
+	};
 }
 
 void attitude_reset(struct attitude_estimator *est)
@@ -50,12 +83,17 @@ void attitude_update(struct attitude_estimator *est, const struct imu_sample *sa
 				  est->alpha * roll_acc;
 		est->state.pitch = (1.0f - est->alpha) * (est->state.pitch + gy * DEG2RAD * dt_sec) +
 				   est->alpha * pitch_acc;
-		est->state.yaw += gz * DEG2RAD * dt_sec;
 	}
+	/* No magnetometer — yaw is gyro-only. The old "stationary" branch skipped this, so a
+	 * slow desk turn (deadbanded gyro, accel still ~1 g) froze the cube while the HUD/tick
+	 * kept moving. Always integrate, even when still. */
+	est->state.yaw = wrap_pi(est->state.yaw + gz * DEG2RAD * dt_sec);
 
-	const struct mat3 rx = mat3_rot_x(est->state.roll);
-	const struct mat3 ry = mat3_rot_y(est->state.pitch);
-	const struct mat3 rz = mat3_rot_z(est->state.yaw);
+	attitude_rotation_zyx(&est->state.rotation, est->state.roll, est->state.pitch,
+			      est->state.yaw);
 
-	est->state.rotation = mat3_mul(rz, mat3_mul(ry, rx));
+	if (!isfinite(est->state.roll) || !isfinite(est->state.pitch) ||
+	    !isfinite(est->state.yaw) || !isfinite(est->state.rotation.m[0][0])) {
+		attitude_reset(est);
+	}
 }

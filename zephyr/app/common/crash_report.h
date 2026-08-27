@@ -9,6 +9,7 @@
 
 struct crash_report_info {
 	bool valid;
+	bool soft;
 	uint32_t seq;
 	uint32_t dump_size;
 	uint32_t pc;
@@ -16,11 +17,18 @@ struct crash_report_info {
 	uint32_t excvaddr;
 	uint32_t uptime_ms;
 	uint8_t reset_reason;
+	uint8_t boot_part;
+	uint8_t target_part;
 	const char *reason;
 	char fw_version[32];
+	char ota_outcome[16];
 	uint32_t backtrace[CRASH_REPORT_BACKTRACE_MAX];
 	uint8_t backtrace_count;
 };
+
+/** Append a non-fatal soft reboot event (uses crash ring + phone relay, not panic path). */
+void crash_report_append_soft(const char *soft_reason, uint8_t reset_reason, uint8_t boot_part,
+			      uint8_t target_part, const char *ota_outcome);
 
 void crash_report_init(void);
 /** Append boot crash to flash ring — call after IMU/BIST, before BLE. */

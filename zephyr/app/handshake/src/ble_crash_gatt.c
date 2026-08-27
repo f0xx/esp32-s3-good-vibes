@@ -15,6 +15,7 @@
 #include "crash_debug.h"
 #include "bist.h"
 #include "crash_ring_store.h"
+#include "mt200_bridge.h"
 
 LOG_MODULE_REGISTER(ble_crash, LOG_LEVEL_INF);
 
@@ -273,6 +274,11 @@ static void process_ctrl_json(void)
 		refresh_info_json();
 		return;
 	}
+
+	if (strstr(json, "\"op\":\"mt200_scan\"") != NULL) {
+		mt200_bridge_start();
+		return;
+	}
 #endif
 }
 
@@ -297,20 +303,37 @@ bool ble_crash_gatt_pending(void)
 	return crash_report_pending();
 }
 
+/* Real hardware testing showed live-BLE flash_area_erase() (persist_ring(), used for crash-ring
+ * "clear") correlates with a silent TG0WDT_SYS_RST at every offset from connect tried — not
+ * just near the connection-setup/grace-elapse boundaries a fixed post-connect margin was meant
+ * to dodge. So "clear" no longer touches flash from here at all: crash_report_clear_slot(s)()
+ * now only flip a RAM-only bit (crash_ring_clear_slot(s)()), which is instant and safe to run
+ * immediately regardless of connection state. The actual flash write is deferred to
+ * maybe_flush_ram_clears() below, which only runs once fully disconnected. */
+/* Was 500ms — bumped to match app_flash_erase_safe()'s FLASH_ERASE_DISCONNECT_SETTLE_MS
+ * (see ble_imu_gatt.c): that value proved too short under real testing (crashes fired right at
+ * the old threshold for vibro_ref_store commits), and this path shares the exact same hazard. */
+#define CRASH_FLUSH_DISCONNECT_SETTLE_MS 4000U
+
+static void maybe_flush_ram_clears(void)
+{
+	if (!ble_imu_link_active() &&
+	    ble_imu_disconnected_settled(CRASH_FLUSH_DISCONNECT_SETTLE_MS)) {
+		crash_ring_flush_ram_clears();
+	}
+}
+
 void ble_crash_gatt_looper_tick(void)
 {
+	maybe_flush_ram_clears();
+
 	if (!atomic_get(&g_defer_ctrl)) {
 		return;
 	}
 
-	/* Dev inject/BIST must run immediately — connect grace (12s) blocked user-triggered
-	 * faults and made the mobile "Crash debug" menu appear dead. "clear" is also urgent:
-	 * running it exactly at the grace-elapse tick (the same tick that kicks off batch-prep
-	 * once notifications are enabled, see ble_imu_gatt.c's g_grace_prep_pending) seemed to
-	 * correlate with the intermittent flash-erase/BLE TG0WDT_SYS_RST reset (see
-	 * persist_ring()'s doc comment) — running the clear's flash write earlier, decoupled
-	 * from that boundary, avoids stacking it against whatever else fires there. Read dump
-	 * still defers until grace ends. */
+	/* "clear"/inject/BIST are all safe to run immediately now: clear is RAM-only (see
+	 * above), inject only schedules a fault for the next main-loop pass, and BIST is
+	 * read-only. Everything else still waits out the connect grace window. */
 	const bool urgent = strstr(g_ctrl_json, "\"op\":\"inject\"") != NULL ||
 			    strstr(g_ctrl_json, "\"op\":\"bist\"") != NULL ||
 			    strstr(g_ctrl_json, "\"op\":\"clear\"") != NULL;

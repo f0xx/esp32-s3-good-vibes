@@ -7,6 +7,7 @@
 #define BIST_FLAG_HEAP       (1U << 1)
 #define BIST_FLAG_CFG        (1U << 2)
 #define BIST_FLAG_CRASH_RING (1U << 3)
+#define BIST_FLAG_MEM        (1U << 4)
 
 struct bist_result {
 	uint32_t flags_ok;

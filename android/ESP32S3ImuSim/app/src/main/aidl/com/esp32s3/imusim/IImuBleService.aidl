@@ -35,6 +35,9 @@ oneway interface IImuBleService {
     void vibroRefStop();
     void vibroRefSelect(int slot);
     void vibroRefDelete(int slot);
+    void vibroRefClearAll();
+    /** End ref wizard — device acrylic LED off (operational). */
+    void vibroArm();
     /** Async: result arrives via onVibroRefList. */
     void requestVibroRefList();
     void analyzeSpectrum();
@@ -47,8 +50,21 @@ oneway interface IImuBleService {
     /** 0 = auto; nonzero clamped firmware-side to [1,120] Hz. Persists across reboots. */
     void setImuHzOverride(int hz);
 
+    /** Start/stop ESP battery-bench mode (config locked on device while active). */
+    void startBatteryBench(String label);
+    void stopBatteryBench();
+
     /** Debug firmware only (CONFIG_APP_CRASH_DEBUG) — triggers fault after ~250ms. */
     void injectCrash(String kind);
     void runDeviceBist();
     void eraseDeviceNvs();
+
+    /** Bubble-level-style flat-floor mounting calibration. Device must sit still on a
+     *  true-level reference for durationMs (0 = firmware default 3000ms). Result/progress
+     *  arrives via onFloorCalStatus. */
+    void floorCalibStart(int durationMs);
+    /** Discard the stored flat-floor correction (back to identity). */
+    void floorCalibClear();
+    /** Async: result arrives via onFloorCalStatus. */
+    void requestFloorCalStatus();
 }

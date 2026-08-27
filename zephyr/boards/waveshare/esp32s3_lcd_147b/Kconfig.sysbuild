@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+
+choice BOOTLOADER
+	default BOOTLOADER_MCUBOOT
+endchoice
+
+# Espressif boards default to unsigned images. We sign with the repo key so
+# BLE OTA cannot install a random blob. See zephyr/mcuboot/KEYS.
+choice BOOT_SIGNATURE_TYPE
+	default BOOT_SIGNATURE_TYPE_ECDSA_P256
+endchoice

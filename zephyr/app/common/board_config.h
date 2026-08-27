@@ -18,6 +18,10 @@
 #define BAT_MEASUREMENT_OFFSET        0.992857f
 #define BAT_FULL_V                    4.20f
 #define BAT_EMPTY_V                   3.00f
+/** Auto-stop an active battery bench below this cell voltage (margin above brownout). */
+#define BATTERY_BENCH_STOP_V          3.10f
+/** Do not resume a persisted bench until cell voltage recovers above this. */
+#define BATTERY_BENCH_RESUME_MIN_V    3.15f
 /* There is no VBUS/charger-status sense pin on this board — DC vs battery is inferred purely
  * from cell voltage + trend (see battery_monitor.c classify_power_source()). A LiPo that
  * finished charging on USB commonly plateaus/trickles at ~4.15-4.19V depending on charger

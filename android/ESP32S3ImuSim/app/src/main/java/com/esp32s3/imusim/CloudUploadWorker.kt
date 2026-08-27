@@ -30,7 +30,11 @@ class CloudUploadWorker(appContext: Context, params: WorkerParameters) :
     private fun reportBatch(batch: CloudUploader.BatchResult) {
         when {
             batch.totalAccepted > 0 ->
-                AppEventHub.showBanner(StatusBannerLevel.OK, "OK! Uploaded ${batch.summary}")
+                AppEventHub.showBanner(StatusBannerLevel.OK, "Uploaded ${batch.summary}")
+            batch.verdicts.ok && batch.spectra.ok && batch.crashes.ok &&
+                batch.batteryBench.ok && batch.telemetry.ok -> {
+                AppEventHub.showBanner(StatusBannerLevel.OK, "Cloud synced — ${batch.summary}")
+            }
             batch.verdicts.message == "cloud disabled" -> return
             batch.verdicts.message.contains("nothing pending", ignoreCase = true) &&
                 batch.spectra.message.contains("no spectra", ignoreCase = true) &&

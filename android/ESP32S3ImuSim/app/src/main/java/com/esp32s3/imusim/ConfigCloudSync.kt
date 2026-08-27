@@ -44,6 +44,48 @@ object ConfigCloudSync {
         return postJson(settings, "${settings.baseUrl.trim().trimEnd('/')}/v1/ingest/config", body.toString())
     }
 
+    sealed class ReconcileResult {
+        /** Cloud was strictly newer than the device's just-reported revision — `blob` is
+         *  ready to push straight to pushConfigToDevice(). */
+        data class PushToDevice(val blob: ByteArray, val cloudRevision: Long) : ReconcileResult()
+        /** Device was equal-or-ahead — its current config was uploaded to the cloud. */
+        data class UploadedToCloud(val deviceRevision: Long) : ReconcileResult()
+    }
+
+    /**
+     * Handshake reconciliation, run every time the phone reads the ESP's live config (manual
+     * "sync" and the periodic background bridge cycle — see ImuBleForegroundService).
+     *
+     * On-device config has priority: the ESP's own device_config_apply_remote() already
+     * rejects any incoming push whose revision is older than what's currently running (see
+     * device_config.c), so a stale cloud copy can never clobber a fresher on-device config.
+     * This mirrors that same rule proactively on the phone side — only builds a cloud -> device
+     * push when the cloud is *strictly newer* than what the device just reported; otherwise
+     * (equal, or device ahead — e.g. reconfigured locally, or pushed from another phone
+     * session) uploads the device's current config so the cloud copy catches up.
+     *
+     * `baseBlob` should be the raw blob just read from the device (same one `doc` was decoded
+     * from) — it's the base that cloud profile/vibro/mix fields get merged on top of, so
+     * anything the cloud JSON doesn't cover (or fields outside the profile/vibro/mix trio,
+     * e.g. the ESP-local overlay bytes) is preserved unchanged.
+     */
+    fun reconcile(context: Context, doc: DeviceConfigJson.Doc, baseBlob: ByteArray): ReconcileResult {
+        val (cloudRevision, cloudConfig) = fetchLatest(context)
+        if (cloudRevision > doc.revision && cloudConfig != null) {
+            val cloudDoc = doc.copy(
+                revision = cloudRevision,
+                profile = cloudConfig.optJSONObject("profile") ?: doc.profile,
+                vibro = cloudConfig.optJSONObject("vibro") ?: doc.vibro,
+                mix = cloudConfig.optJSONObject("mix") ?: doc.mix,
+                source = "cloud",
+            )
+            val blob = DeviceConfigJson.mergeIntoBlob(baseBlob, cloudDoc, cloudRevision)
+            return ReconcileResult.PushToDevice(blob, cloudRevision)
+        }
+        upload(context, doc)
+        return ReconcileResult.UploadedToCloud(doc.revision)
+    }
+
     fun fetchLatest(context: Context): Pair<Long, JSONObject?> {
         val settings = CloudSettings(context)
         if (!settings.enabled) return 0L to null

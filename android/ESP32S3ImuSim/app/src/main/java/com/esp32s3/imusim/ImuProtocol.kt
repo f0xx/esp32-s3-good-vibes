@@ -9,10 +9,8 @@ import java.util.UUID
 object ImuProtocol {
     const val DEVICE_NAME = "ESP32S3 IMU sim"
 
-    /** Match firmware BLE_IMU_CONNECT_GRACE_MS + BLE_IMU_POST_GRACE_MS (+500 ms margin).
-     *  Phone GATT writes (MODE/poll/TIME/crash/offload) before this elapses stack against
-     *  ESP connect handling and have triggered TG0WDT_SYS_RST (task_wdt, 2 s HW fallback). */
-    const val ESP_CONNECT_SETTLE_MS = 14_500L
+    /** Match firmware BLE_IMU_CONNECT_GRACE_MS + BLE_IMU_POST_GRACE_MS (+500 ms margin). */
+    const val ESP_CONNECT_SETTLE_MS = 3_000L
 
     val SERVICE_UUID: UUID = UUID.fromString("4a6e0001-0000-1000-8000-00805f9b34fb")
     val CHAR_MODE_UUID: UUID = UUID.fromString("4a6e0002-0000-1000-8000-00805f9b34fb")
@@ -27,6 +25,11 @@ object ImuProtocol {
     val CHAR_CPU_MHZ_UUID: UUID = UUID.fromString("4a6e000a-0000-1000-8000-00805f9b34fb")
     /** Manual IMU sample-rate override, 1 byte: 0 = auto, else explicit Hz (1-120). */
     val CHAR_IMU_HZ_UUID: UUID = UUID.fromString("4a6e000b-0000-1000-8000-00805f9b34fb")
+    /** Battery bench: write 0=STOP 1=START; read 9 bytes active+session_id+seq. */
+    val CHAR_BENCH_UUID: UUID = UUID.fromString("4a6e000c-0000-1000-8000-00805f9b34fb")
+
+    const val BENCH_CMD_STOP = 0
+    const val BENCH_CMD_START = 1
 
     const val CAP_IMU = 1 shl 0
     const val CAP_TFT = 1 shl 1
@@ -36,6 +39,11 @@ object ImuProtocol {
     const val CAP_WIFI = 1 shl 5
     const val CAP_OTA = 1 shl 6
     const val CAP_CRASH_DEBUG = 1 shl 7
+    const val CAP_MT200 = 1 shl 8
+    const val CAP_RSSI = 1 shl 9
+
+    /** HCI/Android 127 = N/A. Missing RSSI is reported as worst legal dBm. */
+    const val RSSI_UNAVAIL = -127
 
     const val MODE_RAW = 0
     const val MODE_COMPUTED = 1
@@ -50,6 +58,10 @@ object ImuProtocol {
     const val VERDICT_WARN = 1
     const val VERDICT_ALERT = 2
 
+    const val COMPACT_MAGIC: Byte = 0xC1.toByte()
+    const val COMPACT_HDR = 14
+    const val COMPACT_RAW_REC = 14
+    const val COMPACT_ATT_REC = 26
     const val DEFAULT_POLL_MS = 33
     /** Matches esp32 RENDER_HZ (30 fps). */
     const val LIVE_POLL_MS = 33
@@ -118,6 +130,22 @@ object ImuProtocol {
         val cpuBleClamped: Boolean = false,
         val imuHzTarget: Int? = null,
         val imuHzOverride: Int? = null,
+        val benchActive: Boolean = false,
+        val benchSessionId: Long? = null,
+        val benchSampleSeq: Long? = null,
+        val benchUptimeMs: Long? = null,
+        val renderHzTarget: Int? = null,
+        val apbMhz: Int? = null,
+        val spoolFreeB: Int? = null,
+        val spoolCapB: Int? = null,
+        val spoolPending: Int? = null,
+        val dramFreeKb: Int? = null,
+        /** ESP-measured MT200↔ESP RSSI (dBm). Absent on old firmware. */
+        val wrssiDbm: Int? = null,
+        /** Live firmware name from STATUS `fw` (not the dummy "zephyr"). */
+        val fwVersion: String? = null,
+        /** Monotonic OTA compare from STATUS `fwc`. */
+        val fwVersionCode: Int? = null,
     )
 
     data class PowerStatus(
@@ -220,6 +248,70 @@ object ImuProtocol {
         return i > 0 && t[i] == '}'
     }
 
+    fun parseCompact(bytes: ByteArray): Batch? {
+        if (bytes.size < COMPACT_HDR || bytes[0] != COMPACT_MAGIC) return null
+        val bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+        bb.position(1)
+        val verMode = bb.get().toInt() and 0xff
+        val ver = verMode ushr 4
+        if (ver != 1) return null
+        val mode = verMode and 0x0f
+        val seq = bb.int.toLong() and 0xffffffffL
+        val nrec = bb.get().toInt() and 0xff
+        val flags = bb.get().toInt() and 0xff
+        val t0 = bb.short.toInt() and 0xffff
+        val vCv = bb.short.toInt() and 0xffff
+        val pct = bb.get().toInt() and 0xff
+        bb.get() // tc
+        val power = if (flags and 1 != 0) POWER_DC_USB else POWER_BATTERY
+        val voltage = vCv / 100f
+        val base = Batch(seq, mode, SCREEN_W, SCREEN_H, power, voltage, pct, 0f)
+        return when (mode) {
+            MODE_RAW -> {
+                val recs = ArrayList<RawRecord>(nrec)
+                for (i in 0 until nrec) {
+                    if (bb.remaining() < COMPACT_RAW_REC) break
+                    recs.add(
+                        RawRecord(
+                            tMs = (t0 + i).toLong(),
+                            ax = MetricsCompact.f16ToF32(bb.short.toInt() and 0xffff),
+                            ay = MetricsCompact.f16ToF32(bb.short.toInt() and 0xffff),
+                            az = MetricsCompact.f16ToF32(bb.short.toInt() and 0xffff),
+                            gx = MetricsCompact.f16ToF32(bb.short.toInt() and 0xffff),
+                            gy = MetricsCompact.f16ToF32(bb.short.toInt() and 0xffff),
+                            gz = MetricsCompact.f16ToF32(bb.short.toInt() and 0xffff),
+                            distanceM = MetricsCompact.f16ToF32(bb.short.toInt() and 0xffff),
+                        ),
+                    )
+                }
+                base.copy(raw = recs)
+            }
+            else -> {
+                if (bb.remaining() < COMPACT_ATT_REC) return base
+                val rot = FloatArray(9) {
+                    MetricsCompact.f16ToF32(bb.short.toInt() and 0xffff)
+                }
+                val dist = MetricsCompact.f16ToF32(bb.short.toInt() and 0xffff)
+                val fx = MetricsCompact.f16ToF32(bb.short.toInt() and 0xffff)
+                val fy = MetricsCompact.f16ToF32(bb.short.toInt() and 0xffff)
+                val fz = MetricsCompact.f16ToF32(bb.short.toInt() and 0xffff)
+                val rec = ComputedRecord(
+                    tMs = t0.toLong(),
+                    distanceM = dist,
+                    footerX = fx,
+                    footerY = fy,
+                    footerZ = fz,
+                    zoomX = 1f,
+                    zoomY = 1f,
+                    zoomZ = 1f,
+                    rot = rot,
+                    axes = FloatArray(12),
+                )
+                base.copy(computed = listOf(rec))
+            }
+        }
+    }
+
     private fun parseStatusObject(o: JSONObject): Status = Status(
             seq = o.optLong("s"),
             mode = o.optInt("m"),
@@ -273,9 +365,27 @@ object ImuProtocol {
             cpuBleClamped = o.optInt("cpuclamp", 0) != 0,
             imuHzTarget = if (o.has("imuhz")) o.optInt("imuhz") else null,
             imuHzOverride = if (o.has("imuov")) o.optInt("imuov") else null,
+            benchActive = o.optInt("bench", 0) != 0,
+            benchSessionId = if (o.has("bsid")) o.optLong("bsid") else null,
+            benchSampleSeq = if (o.has("bseq")) o.optLong("bseq") else null,
+            benchUptimeMs = if (o.has("upt")) o.optLong("upt") else null,
+            renderHzTarget = if (o.has("rh")) o.optInt("rh") else null,
+            apbMhz = if (o.has("apb")) o.optInt("apb") else null,
+            spoolFreeB = if (o.has("spfree")) o.optInt("spfree") else null,
+            spoolCapB = if (o.has("spcap")) o.optInt("spcap") else null,
+            spoolPending = if (o.has("sppend")) o.optInt("sppend") else null,
+            dramFreeKb = if (o.has("dramf")) o.optInt("dramf") else null,
+            wrssiDbm = if (o.has("wrssi")) normalizeRssiDbm(o.optInt("wrssi")) else null,
+            fwVersion = o.optString("fw").takeIf { it.isNotBlank() && it != "zephyr" },
+            fwVersionCode = if (o.has("fwc") && o.optInt("fwc") > 0) o.optInt("fwc") else null,
         )
 
     fun crashDebugFromCaps(caps: Int): Boolean = (caps and CAP_CRASH_DEBUG) != 0
+
+    fun normalizeRssiDbm(rssi: Int): Int {
+        if (rssi == 127 || rssi > 20) return RSSI_UNAVAIL
+        return rssi.coerceAtLeast(RSSI_UNAVAIL)
+    }
 
     fun verdictCaption(level: Int, corr: Float?): String {
         val tag = when (level) {
@@ -292,7 +402,7 @@ object ImuProtocol {
 
     fun parseCaps(data: ByteArray): Int {
         if (data.size < 4) return 0
-        val bb = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
+        val bb = ByteBuffer.wrap(data, 0, 4).order(ByteOrder.LITTLE_ENDIAN)
         return bb.int
     }
 
@@ -305,6 +415,8 @@ object ImuProtocol {
         if (caps and CAP_WIFI != 0) parts.add("WiFi")
         if (caps and CAP_OTA != 0) parts.add("OTA")
         if (caps and CAP_CRASH_DEBUG != 0) parts.add("DBG")
+        if (caps and CAP_MT200 != 0) parts.add("MT200")
+        if (caps and CAP_RSSI != 0) parts.add("RSSI")
         return if (parts.isEmpty()) "caps:--" else "caps:${parts.joinToString("+")}"
     }
 
@@ -367,9 +479,45 @@ object ImuProtocol {
         return when (mode) {
             MODE_RAW -> base.copy(raw = parseRawArray(d))
             MODE_COMPUTED -> base.copy(computed = parseComputedArray(d))
-            MODE_SCENE -> base.copy(scene = parseSceneArray(d))
+            MODE_SCENE -> {
+                val computed = parseComputedArray(d)
+                if (computed.isNotEmpty()) base.copy(computed = computed)
+                else base.copy(scene = parseSceneArray(d))
+            }
             else -> base
         }
+    }
+
+    fun batchToUiJson(batch: Batch): String {
+        val d = JSONArray()
+        when {
+            batch.raw.isNotEmpty() -> batch.raw.forEach { r ->
+                d.put(
+                    JSONArray().put(r.tMs).put(r.ax.toDouble()).put(r.ay.toDouble())
+                        .put(r.az.toDouble()).put(r.gx.toDouble()).put(r.gy.toDouble())
+                        .put(r.gz.toDouble()).put(r.distanceM.toDouble()),
+                )
+            }
+            batch.computed.isNotEmpty() -> batch.computed.forEach { c ->
+                val row = JSONArray().put(c.tMs).put(c.distanceM.toDouble())
+                    .put(c.footerX.toDouble()).put(c.footerY.toDouble()).put(c.footerZ.toDouble())
+                    .put(c.zoomX.toDouble()).put(c.zoomY.toDouble()).put(c.zoomZ.toDouble())
+                c.rot.forEach { row.put(it.toDouble()) }
+                repeat(12) { row.put(0.0) }
+                d.put(row)
+            }
+        }
+        return JSONObject()
+            .put("s", batch.seq)
+            .put("m", batch.mode)
+            .put("w", batch.screenW)
+            .put("h", batch.screenH)
+            .put("p", batch.powerSource)
+            .put("v", batch.voltageV.toDouble())
+            .put("pct", batch.percent)
+            .put("tr", batch.trendV.toDouble())
+            .put("d", d)
+            .toString()
     }
 
     fun parseBatchLenient(json: String): Batch? = try {

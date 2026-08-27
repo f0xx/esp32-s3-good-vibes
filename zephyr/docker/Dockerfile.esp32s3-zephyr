@@ -1,0 +1,46 @@
+# ESP32-S3 Zephyr cross-build — glibc slim, not Alpine.
+#
+# Caveat: Zephyr SDK 0.16.8 publishes linux-x86_64 *glibc* toolchains only
+# (sdk-ng). Alpine/musl cannot run xtensa-espressif_esp32s3_zephyr-elf without
+# a glibc shim (gcompat); that is unreliable for cc1/libstdc++. Distro choice
+# is therefore debian:bookworm-slim (smallest glibc base). Image size is
+# dominated by the one Xtensa toolchain, not by Ubuntu userspace.
+#
+# West tree + this git repo are bind-mounted at run time (not baked in).
+#
+#   docker build -f zephyr/docker/Dockerfile.esp32s3-zephyr -t imu-zephyr-ci:0.16.8 zephyr/docker
+#   ./zephyr/scripts/docker-west-build.sh handshake
+FROM debian:bookworm-slim
+
+ARG ZEPHYR_SDK_VERSION=0.16.8
+ARG ZEPHYR_SDK_TOOLCHAIN=xtensa-espressif_esp32s3_zephyr-elf
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    ZEPHYR_SDK_INSTALL_DIR=/opt/zephyr-sdk-${ZEPHYR_SDK_VERSION} \
+    ZEPHYR_TOOLCHAIN_VARIANT=zephyr \
+    CMAKE_PREFIX_PATH=/opt/zephyr-sdk-${ZEPHYR_SDK_VERSION}
+
+RUN apt-get update && apt-get install --no-install-recommends -y \
+    git cmake ninja-build gperf ccache device-tree-compiler \
+    wget xz-utils file make gcc libc6-dev python3 python3-pip python3-venv \
+    python3-yaml python3-intelhex python3-pyelftools python3-packaging \
+    python3-requests python3-serial ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install --no-cache-dir --break-system-packages 'west>=1.2' anytree imgtool cryptography
+
+# Minimal SDK + one Xtensa toolchain (not the full multi-arch SDK).
+RUN mkdir -p /opt && cd /tmp \
+    && wget -q "https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZEPHYR_SDK_VERSION}/zephyr-sdk-${ZEPHYR_SDK_VERSION}_linux-x86_64_minimal.tar.xz" \
+    && tar -C /opt -xf "zephyr-sdk-${ZEPHYR_SDK_VERSION}_linux-x86_64_minimal.tar.xz" \
+    && rm -f "zephyr-sdk-${ZEPHYR_SDK_VERSION}_linux-x86_64_minimal.tar.xz" \
+    && "${ZEPHYR_SDK_INSTALL_DIR}/setup.sh" -t "${ZEPHYR_SDK_TOOLCHAIN}" -c -h \
+    && rm -rf /tmp/*
+
+ENV PATH="${ZEPHYR_SDK_INSTALL_DIR}/${ZEPHYR_SDK_TOOLCHAIN}/bin:${PATH}"
+
+WORKDIR /src
+LABEL org.imu.ci.sdk="${ZEPHYR_SDK_VERSION}" \
+      org.imu.ci.toolchain="${ZEPHYR_SDK_TOOLCHAIN}" \
+      org.imu.ci.base="debian:bookworm-slim"
+
+CMD ["./zephyr/scripts/ci-west-build.sh"]

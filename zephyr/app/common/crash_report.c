@@ -15,11 +15,12 @@
 #include <zephyr/sys/util.h>
 
 #include "crash_ring_store.h"
+#include "crash_rtc_capture.h"
+#include "fw_version.h"
 #include "power_manager.h"
 
 LOG_MODULE_REGISTER(crash_rpt, LOG_LEVEL_INF);
 
-#define CRASH_FW_VERSION "handshake v121"
 #define CRASH_PARSE_BUF  512U
 
 static uint8_t g_reset_code;
@@ -114,10 +115,11 @@ static void fill_pending_from_reset(struct crash_report_info *out, esp_reset_rea
 {
 	memset(out, 0, sizeof(*out));
 	out->valid = true;
+	out->soft = false;
 	out->reset_reason = (uint8_t)reason;
 	out->reason = reset_reason_str(reason);
 	out->uptime_ms = k_uptime_get_32();
-	snprintf(out->fw_version, sizeof(out->fw_version), "%s", CRASH_FW_VERSION);
+	snprintf(out->fw_version, sizeof(out->fw_version), "%s", FW_VERSION_NAME);
 }
 
 static bool scan_stored_coredump(struct crash_report_info *out)
@@ -167,6 +169,24 @@ static bool scan_stored_coredump(struct crash_report_info *out)
 #endif
 }
 
+/* Folds in exccause/excvaddr captured by crash_rtc_capture.c (RTC SRAM, no flash involved)
+ * for a genuine Zephyr-caught CPU exception on the *previous* boot — see that module's doc
+ * comment for exactly which crash classes this can and can't cover. No-op (leaves `info`
+ * untouched) if there's nothing valid to consume, which is the common case. */
+static void enrich_from_rtc_capture(struct crash_report_info *info)
+{
+	struct crash_rtc_capture cap;
+
+	if (!crash_rtc_capture_consume(&cap)) {
+		return;
+	}
+
+	info->exccause = cap.exccause;
+	info->excvaddr = cap.excvaddr;
+	LOG_WRN("crash detail recovered from RTC capture: reason=%u exccause=%u excvaddr=0x%08x "
+		"thread=%s", cap.reason, cap.exccause, cap.excvaddr, cap.thread_name);
+}
+
 static void persist_boot_crash(esp_reset_reason_t reason)
 {
 	struct crash_report_info info;
@@ -181,7 +201,25 @@ static void persist_boot_crash(esp_reset_reason_t reason)
 	}
 
 	if (!has_info) {
-		return;
+		/* Even if the reset reason alone didn't look crash-worthy, an RTC capture
+		 * existing means a Zephyr fatal error definitely happened right before this
+		 * boot — don't drop that on the floor just because esp_reset_reason() came
+		 * back with something reset_suggests_crash() doesn't recognize. */
+		struct crash_rtc_capture cap;
+
+		if (crash_rtc_capture_consume(&cap)) {
+			fill_pending_from_reset(&info, reason);
+			info.exccause = cap.exccause;
+			info.excvaddr = cap.excvaddr;
+			has_info = true;
+			LOG_WRN("crash detail recovered from RTC capture (reset reason was not "
+				"self-evidently a crash): exccause=%u excvaddr=0x%08x thread=%s",
+				cap.exccause, cap.excvaddr, cap.thread_name);
+		} else {
+			return;
+		}
+	} else {
+		enrich_from_rtc_capture(&info);
 	}
 
 	power_manager_telemetry_snapshot(&tel);
@@ -196,6 +234,42 @@ static void persist_boot_crash(esp_reset_reason_t reason)
 #if defined(CONFIG_DEBUG_COREDUMP) && defined(CONFIG_DEBUG_COREDUMP_BACKEND_FLASH_PARTITION)
 	(void)coredump_cmd(COREDUMP_CMD_INVALIDATE_STORED_DUMP, NULL);
 #endif
+}
+
+void crash_report_append_soft(const char *soft_reason, uint8_t reset_reason, uint8_t boot_part,
+			      uint8_t target_part, const char *ota_outcome)
+{
+	struct crash_report_info info;
+	struct crash_ring_telemetry tel;
+	char reason_buf[16];
+
+	if (soft_reason == NULL || soft_reason[0] == '\0') {
+		return;
+	}
+
+	snprintf(reason_buf, sizeof(reason_buf), "soft:%s", soft_reason);
+	fill_pending_from_reset(&info, (esp_reset_reason_t)reset_reason);
+	info.reason = reason_buf;
+	info.pc = 0U;
+	info.exccause = 0U;
+	info.excvaddr = 0U;
+	info.backtrace_count = 0U;
+	info.dump_size = 0U;
+	info.soft = true;
+	info.boot_part = boot_part;
+	info.target_part = target_part;
+	if (ota_outcome != NULL && ota_outcome[0] != '\0') {
+		snprintf(info.ota_outcome, sizeof(info.ota_outcome), "%s", ota_outcome);
+	}
+
+	power_manager_telemetry_snapshot(&tel);
+	const int slot = crash_ring_append_soft(&info, &tel);
+
+	if (slot >= 0) {
+		g_active_slot = (int8_t)slot;
+		memcpy(&g_pending, &info, sizeof(g_pending));
+		g_has_pending = true;
+	}
 }
 
 void crash_report_init(void)
@@ -304,7 +378,8 @@ int crash_report_info_json(char *buf, size_t len)
 	}
 
 	if (pending == 0U) {
-		return snprintf(buf, len, "{\"pending\":0,\"fw\":\"%s\"}", CRASH_FW_VERSION);
+		return snprintf(buf, len, "{\"pending\":0,\"fw\":\"%s\",\"fwc\":%u}",
+				FW_VERSION_NAME, (unsigned)FW_VERSION_CODE);
 	}
 
 	/* Single-slot detail shortcut only applies while exactly one crash is pending — with 2+

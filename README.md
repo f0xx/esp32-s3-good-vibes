@@ -4,6 +4,8 @@ Live IMU visualization, BLE phone relay, and cloud vibration ingest for the **Wa
 
 This repository bundles everything needed to build, flash, and operate the full stack:
 
+**Field operators:** start with **[docs/operator-howto.md](docs/operator-howto.md)** (printable PDF: [docs/operator-howto.pdf](docs/operator-howto.pdf)).
+
 | Component | Path | Role |
 |-----------|------|------|
 | **Zephyr firmware** (primary) | [`zephyr/`](zephyr/) | On-device app: IMU pipeline, live scene, BLE GATT, WiFi, power management |
@@ -11,6 +13,30 @@ This repository bundles everything needed to build, flash, and operate the full 
 | **Backend** | [`backend/`](backend/) | FastAPI ingest + TimescaleDB + Grafana dashboards |
 
 System overview: **[docs/architecture.md](docs/architecture.md)**
+
+---
+
+## Feature highlights (since last snapshot)
+
+Beyond the original live-IMU/BLE/cloud pipeline, the firmware and app now cover:
+
+| Area | What's new |
+|------|-----------|
+| **Crash reliability** | Ping-pong flash-backed crash ring (survives power loss mid-write), RTC-retained-memory capture of PC/EXCCAUSE/backtrace on hard faults (`crash_rtc_capture.c`) so genuine CPU exceptions — not just watchdog resets — are recorded for next-boot upload, and a repo-wide "safe flash erase" pattern (`flash_safety.c`) applied to every flash-backed store to stop watchdog resets from erasing flash mid-BLE-connection |
+| **Attitude / AHRS** | On-device AHRS fusion (`attitude.c`) streaming a quaternion + Euler angles over BLE, computed on the ESP32 itself; separated into its own high-power mobile-app mode (full CPU + IMU rate) since it isn't a battery-saving profile |
+| **Floor / mounting calibration** | `floor_calib.c` — BLE-triggered "bubble level" style calibration that averages gravity and stores a correction quaternion in flash NVS, applied on top of existing bias calibration and persistent across reboots |
+| **Vibration analysis** | On-device FFT (`vibro_fft.c`) and band-RMS scoring, multi-slot flash-backed reference profiles (`vibro_ref_store.c`), verdict history (`vibro_verdict_store.c`), and a wizard-style Android recording UI (`VibroRefWizardActivity.kt`) |
+| **Battery bench** | `battery_bench.c/.h` + Android `BatteryBenchActivity`/`BatteryBenchEstimator`/`BatteryBenchStore` — structured battery-life measurement/estimation flow |
+| **Geo / dead-reckoning** | Walk-distance + yaw fields streamed from firmware, phone GPS capture fused with IMU dead-reckoning (`GeoTracker.kt`), backend geo-ingest + route endpoints, and a Leaflet/OpenStreetMap route-comparison web page (`backend/web/map.html`) |
+| **AHRS debug web page** | `backend/web/ahrs.html` — live WebSocket-fed 3D/orientation debug view |
+| **OTA / recovery** | `ota_ab.c/.h` (A/B image slots) and `soft_reboot.c/.h` |
+| **Compact telemetry** | `metrics_compact.c/.h` — smaller wire format for STATUS/metrics fields |
+| **RGB status LED** | `vibro_led.c/.h` on top of the existing WS2812 driver, driven by vibration verdicts |
+| **Experimental: MT200 BLE-central bridge** | `mt200_bridge.c/.h` — ESP32 as BLE *central* to a Veepoo/H-Band MT200 clock. Proven live: **HR 92–99 bpm**, **SpO2 96–99%**, **steps (70 on this capture)**, **battery 62%**. G-sensor start (`F1 20`) switches the watch to streaming the step counter at ~1 Hz. Debug op `{"op":"mt200_scan"}`. Single-LE-link — phone H-Band must be off. Notes: **[docs/veepoo-proto-ble-reverse.md](docs/veepoo-proto-ble-reverse.md)** |
+| **Wearable ingest (prep)** | Dedicated `/v1/ingest/wearable` + latest/history APIs, `/app/good_vibes/wearable` live page, Grafana **Wearable (MT200)** dashboard. Rows land in TimescaleDB (`wearable_samples` hypertable). Phone is not a producer yet — schema is ready for the ESP32→phone relay |
+| **Backend model** | `Machine`/`Sensor`/`ReferenceProfile` data model, monotonic-trend early-warning scoring (`trend_score.py`), battery-bench ingest, AHRS/geo ingest, expanded Grafana dashboards (verdicts + battery bench + wearable). Database is already **TimescaleDB** (`timescale/timescaledb:latest-pg16`) — Grafana uses the existing Postgres datasource |
+
+Detailed phase-by-phase history: **[ROADMAP.md](ROADMAP.md)**. Raw feature wishlist / vision doc: **[features.list](features.list)**.
 
 ---
 
@@ -43,6 +69,7 @@ Accu rated as 3.7V / 420mAh LiPo
 ![Battery soldering pins](backend/assets/simg0000.jpg)
 
 Accu +3.7v (red) <-> BAT pin (ETA6098)
+
 Accu Gnd (black) <-> G pin (common ground)
 
 ---
@@ -178,6 +205,27 @@ Details: **[docs/battery.md](docs/battery.md)**
 
 ---
 
+## Repository layout
+
+```
+esp32-s3-imu-basics/
+├── README.md                      ← this file
+├── docs/                          ← detailed guides (see index below)
+├── zephyr/
+│   ├── boards/waveshare/esp32s3_lcd_147b/   ← out-of-tree board definition
+│   ├── app/handshake/             ← main firmware
+│   ├── app/smoke/                 ← hardware smoke test
+│   └── scripts/                   ← flash-zephyr.sh, serial capture
+├── esp32_s3_imu_basics/           ← Arduino sketch + scripts
+├── android/ESP32S3ImuSim/         ← Kotlin BLE client
+├── backend/                       ← FastAPI + docker-compose
+├── backups/                       ← full-flash recovery (local .bin, not in git)
+├── ROADMAP.md                     ← phase-by-phase implementation history
+└── features.list                  ← raw feature wishlist / vision doc
+```
+
+---
+
 ## Documentation index
 
 | Document | Contents |
@@ -190,7 +238,10 @@ Details: **[docs/battery.md](docs/battery.md)**
 | [docs/android-app.md](docs/android-app.md) | Build/install APK, BLE/cloud settings |
 | [docs/backend.md](docs/backend.md) | Docker deploy, API, Grafana, firewall |
 | [docs/battery.md](docs/battery.md) | ADC path, HUD labels, validation |
+| [docs/dual-firmware-probing.md](docs/dual-firmware-probing.md) | Switching Arduino ↔ Zephyr, protocol parity |
 | [docs/zephyr-experiment.md](docs/zephyr-experiment.md) | Zephyr port notes and history |
+| [docs/metrics.md](docs/metrics.md) | On-device/backend metrics reference |
+| [docs/veepoo-proto-ble-reverse.md](docs/veepoo-proto-ble-reverse.md) | Veepoo/MT200 BLE protocol, tools, live HR/SpO2 results, step opcodes, integration plan |
 
 ---
 

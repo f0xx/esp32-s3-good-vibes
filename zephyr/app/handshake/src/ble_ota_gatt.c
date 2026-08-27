@@ -9,6 +9,9 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/reboot.h>
 
+#include "ota_ab.h"
+#include "soft_reboot.h"
+
 LOG_MODULE_REGISTER(ble_ota, LOG_LEVEL_INF);
 
 #define BT_UUID_OTA_SVC_VAL \
@@ -63,6 +66,18 @@ static ssize_t read_ctrl(struct bt_conn *conn, const struct bt_gatt_attr *attr, 
 	return bt_gatt_attr_read(conn, attr, buf, len, offset, g_status, strlen(g_status));
 }
 
+static void ota_finish_and_reboot(void)
+{
+	const uint8_t from = soft_reboot_boot_partition();
+	const uint8_t target = (from == 0U) ? 1U : (from == 1U) ? 0U : 1U;
+
+	set_status("done", NULL);
+	g_receiving = false;
+	if (ota_ab_finish_and_reboot(&g_flash_ctx) != 0) {
+		set_status("error", "ab switch failed");
+	}
+}
+
 static ssize_t write_ctrl(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf,
 			  uint16_t len, uint16_t offset, uint8_t flags)
 {
@@ -99,14 +114,11 @@ static ssize_t write_ctrl(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 		g_expected = 0;
 		g_received = 0;
 		set_status("idle", NULL);
-	} else if (strstr(json, "\"op\":\"finish\"") != NULL) {
-		if (g_receiving && flash_img_buffered_write(&g_flash_ctx, NULL, 0, true) == 0) {
-			set_status("done", NULL);
-			g_receiving = false;
-			k_msleep(200);
-			sys_reboot(SYS_REBOOT_COLD);
+	} else if (strstr(json, "\"op\":\"finish\"") != NULL || strstr(json, "\"op\":\"reboot\"") != NULL) {
+		if (g_receiving) {
+			ota_finish_and_reboot();
 		} else {
-			set_status("error", "finish failed");
+			set_status("error", "not receiving");
 		}
 	}
 	return len;
@@ -131,6 +143,9 @@ static ssize_t write_data(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 	}
 
 	g_received += len;
+	if (g_received >= g_expected) {
+		ota_finish_and_reboot();
+	}
 	return len;
 }
 
@@ -144,6 +159,6 @@ BT_GATT_SERVICE_DEFINE(
 int ble_ota_gatt_init(void)
 {
 	set_status("idle", NULL);
-	LOG_INF("BLE OTA service registered");
+	LOG_INF("BLE OTA service registered (A/B mcuboot)");
 	return 0;
 }

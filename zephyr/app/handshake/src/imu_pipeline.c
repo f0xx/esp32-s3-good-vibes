@@ -3,11 +3,13 @@
 
 #include "attitude.h"
 #include "device_config.h"
+#include "floor_calib.h"
 #include "imu_cal.h"
 #include "imu_pipeline.h"
 #include "imu_sample.h"
 #include "power_manager.h"
 #include "qmi8658.h"
+#include "scene_zoom.h"
 #include "vibro_capture.h"
 #include "walk_distance.h"
 
@@ -40,6 +42,10 @@ static bool g_recovering;
 static uint32_t g_fail_streak;
 static uint32_t g_last_imu_ms;
 static uint32_t g_hb_ticks;
+static uint32_t g_dup_streak;
+static uint32_t g_dup_window;
+static struct imu_sample g_prev_sample;
+static bool g_have_prev_sample;
 
 static void apply_imu_scale(struct imu_sample *sample)
 {
@@ -187,6 +193,7 @@ static void imu_poll_once(void)
 void imu_pipeline_poll(void)
 {
 	imu_poll_once();
+	floor_calib_poll();
 }
 
 uint32_t imu_pipeline_take_hb_ticks(void)
@@ -195,6 +202,30 @@ uint32_t imu_pipeline_take_hb_ticks(void)
 
 	g_hb_ticks = 0;
 	return n;
+}
+
+void imu_pipeline_log_motion(void)
+{
+	struct imu_sample s;
+	struct attitude_estimator att;
+	const uint32_t dups = g_dup_window;
+	const uint32_t streak = g_dup_streak;
+
+	g_dup_window = 0;
+
+	if (!imu_pipeline_snapshot(&s, &att)) {
+		LOG_INF("motion snapshot-fail dup=%u streak=%u", dups, streak);
+		return;
+	}
+
+	const float *z = scene_zoom_current();
+
+	LOG_INF("motion ax=%.2f ay=%.2f az=%.2f gx=%.1f gy=%.1f gz=%.1f "
+		"rpy=%.1f %.1f %.1f zoom=%.2f dup=%u streak=%u",
+		(double)s.ax, (double)s.ay, (double)s.az, (double)s.gx, (double)s.gy,
+		(double)s.gz, (double)(att.state.roll * 57.29578f),
+		(double)(att.state.pitch * 57.29578f), (double)(att.state.yaw * 57.29578f),
+		z != NULL ? (double)z[0] : 0.0, dups, streak);
 }
 
 void imu_pipeline_request_recover(void)
@@ -230,6 +261,7 @@ bool imu_pipeline_init(void)
 
 	walk_distance_init(&g_walk, &wcfg);
 	vibro_capture_init();
+	floor_calib_init();
 	load_config_from_device();
 
 	if (!init_hw_and_calibrate()) {
@@ -262,6 +294,8 @@ bool imu_pipeline_read_raw(struct imu_sample *out)
 
 	imu_cal_apply(&g_cal, &sample);
 	apply_imu_scale(&sample);
+	floor_calib_feed(&sample);
+	floor_calib_apply(&sample);
 	*out = sample;
 	g_latest = sample;
 	return true;
@@ -341,6 +375,16 @@ bool imu_pipeline_tick(float dt_sec)
 
 	g_fail_streak = 0;
 	attitude_update(&g_attitude, &sample, dt_sec);
+	if (g_have_prev_sample && sample.ax == g_prev_sample.ax && sample.ay == g_prev_sample.ay &&
+	    sample.az == g_prev_sample.az && sample.gx == g_prev_sample.gx &&
+	    sample.gy == g_prev_sample.gy && sample.gz == g_prev_sample.gz) {
+		g_dup_streak++;
+		g_dup_window++;
+	} else {
+		g_dup_streak = 0;
+		g_have_prev_sample = true;
+		g_prev_sample = sample;
+	}
 	walk_distance_update(&g_walk, &sample, &g_attitude.state, dt_sec, k_uptime_get_32());
 	vibro_capture_push(&sample);
 

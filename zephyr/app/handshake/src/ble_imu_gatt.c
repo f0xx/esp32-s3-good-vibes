@@ -9,6 +9,10 @@
 #include <stdarg.h>
 #include <string.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
@@ -20,6 +24,11 @@
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/util.h>
 
+#if defined(CONFIG_SOC_SERIES_ESP32S3)
+#include <esp_heap_caps.h>
+#endif
+
+#include "battery_bench.h"
 #include "battery_monitor.h"
 #include "board_config.h"
 #include "ble_imu_protocol.h"
@@ -28,18 +37,25 @@
 #include "chip_temp.h"
 #include "clock_sync.h"
 #include "crash_report.h"
+#include "soft_reboot.h"
 #include "bist.h"
 #include "crash_debug.h"
 #include "display_panel.h"
+#include "fw_version.h"
+#include "flash_safety.h"
 #include "imu_pipeline.h"
+#include "metrics_compact.h"
 #include "power_manager.h"
 #include "scene_snapshot.h"
 #include "scene_zoom.h"
 #include "device_config.h"
 #include "vibro_capture.h"
 #include "vibro_schedule.h"
+#include "vibro_verdict_store.h"
 #include "radio_scheduler.h"
 #include "stall_watchdog.h"
+#include "vibro_led.h"
+#include "mt200_bridge.h"
 
 LOG_MODULE_REGISTER(ble_imu, LOG_LEVEL_INF);
 
@@ -54,6 +70,7 @@ static struct bt_uuid_128 imu_caps_uuid = BT_UUID_INIT_128(BT_UUID_IMU_CAPS_VAL)
 static struct bt_uuid_128 imu_screen_uuid = BT_UUID_INIT_128(BT_UUID_IMU_SCREEN_VAL);
 static struct bt_uuid_128 imu_cpu_mhz_uuid = BT_UUID_INIT_128(BT_UUID_IMU_CPU_MHZ_VAL);
 static struct bt_uuid_128 imu_imu_hz_uuid = BT_UUID_INIT_128(BT_UUID_IMU_IMU_HZ_VAL);
+static struct bt_uuid_128 imu_bench_uuid = BT_UUID_INIT_128(BT_UUID_IMU_BENCH_VAL);
 
 static uint8_t g_mode = BLE_IMU_MODE_COMPUTED;
 static uint16_t g_poll_ms = BLE_IMU_DEFAULT_POLL_MS;
@@ -66,15 +83,36 @@ static struct bt_conn *g_conn;
 
 static char g_status_json[2][BLE_IMU_STATUS_JSON_MAX];
 static char g_data_json[2][BLE_IMU_ATT_PAYLOAD_MAX];
+static uint8_t g_compact[2][BLE_IMU_ATT_PAYLOAD_MAX];
 static atomic_t g_json_pub_idx;
 static size_t g_status_len[2];
 static size_t g_data_len[2];
+static size_t g_compact_len[2];
 
 static struct bt_gatt_attr *g_notify_attr;
 static uint32_t g_commit_count;
 static atomic_t g_need_prep_batch;
 static int64_t g_poll_next_ms;
 static bool g_poll_armed;
+
+/*
+ * bt_gatt_notify() loss detection + bounded retry — the 30Hz IMU stream previously discarded
+ * its return value entirely (see the notify-send block below), so a transient TX-queue-full
+ * (-ENOMEM, e.g. right after a connection-interval hiccup) silently dropped that sample with
+ * no retry and no counter. A resent notify carries the *same* seq/payload as the failed
+ * attempt (we don't rebuild a new sample or advance g_seq for a retry), which the phone side
+ * already treats as a no-op duplicate (BleImuClient.kt dedups on `seq == lastSeq`), so this
+ * needs zero Android-side changes to be safe to ship. NOTIFY_DROP_COUNT (retries exhausted)
+ * is surfaced in STATUS as "ndrop" purely for observability; there's no phone-initiated
+ * resend-by-seq-gap yet — that would need a dedicated request characteristic plus Android
+ * gap tracking, which is a natural follow-up once this baseline is validated in the field.
+ */
+#define NOTIFY_RETRY_MAX 3U
+#define NOTIFY_RETRY_DELAY_MS 8U
+static bool g_notify_resend_pending;
+static uint8_t g_notify_retry_count;
+static uint32_t g_notify_fail_count;
+static uint32_t g_notify_drop_count;
 
 static int json_write_idx(void)
 {
@@ -118,12 +156,20 @@ static bool g_screen_want;
 static uint8_t g_cpu_mhz_want;
 static uint8_t g_imu_hz_want;
 static atomic_t g_defer_notify;
+static atomic_t g_notify_skip_poll;
 static atomic_t g_defer_time;
 static atomic_t g_defer_mode;
 static atomic_t g_defer_screen;
 static atomic_t g_defer_poll;
 static atomic_t g_defer_cpu_mhz;
 static atomic_t g_defer_imu_hz;
+static atomic_t g_defer_bench;
+static uint8_t g_bench_cmd_want;
+
+static bool bench_blocks_config(void)
+{
+	return battery_bench_config_locked();
+}
 #define BLE_CONNECT_GRACE_MS BLE_IMU_CONNECT_GRACE_MS
 /* Defer batch/notify traffic briefly after grace — stacking flash spool + batch prep on the
  * grace boundary correlated with TG0WDT_SYS_RST (see ble_crash_gatt_looper_tick comment). */
@@ -154,6 +200,7 @@ static int64_t g_connect_grace_until;
 static int64_t g_traffic_ready_at;
 static bool g_grace_prep_pending;
 static atomic_t g_defer_notify_send;
+static int64_t g_last_disconnect_at;
 
 static bool in_connect_grace(void)
 {
@@ -170,9 +217,146 @@ bool ble_imu_in_connect_grace(void)
 	return in_connect_grace();
 }
 
+bool ble_imu_connect_settled(uint32_t extra_margin_ms)
+{
+	return g_connected && k_uptime_get() >= (g_traffic_ready_at + (int64_t)extra_margin_ms);
+}
+
+/* True once there has been no BLE connection at all for at least min_idle_ms — i.e. the link
+ * layer has had time to fully tear down and isn't running a connection-event schedule that a
+ * flash erase's interrupts-disabled window could collide with. Used to gate the crash-ring's
+ * deferred RAM-clear flush (see crash_ring_flush_ram_clears()'s doc comment): unlike the old
+ * connect-settled margin, this only allows the flash write once truly disconnected, since a
+ * live connection turned out to be unsafe at *any* offset from connect, not just near the
+ * boundaries first tried. */
+bool ble_imu_disconnected_settled(uint32_t min_idle_ms)
+{
+	return !g_connected && k_uptime_get() >= (g_last_disconnect_at + (int64_t)min_idle_ms);
+}
+
+/* Strong override of the flash_safety.h weak default — see that header's doc comment.
+ * Every flash-backed store in this app funnels its erase-triggering ops through this one
+ * check now, so there's a single place that encodes the "live BLE connection is unsafe for
+ * flash_area_erase() at any offset" finding instead of N different ad-hoc margins.
+ *
+ * Was 500ms — real hardware testing (v139, vibro_ref_store commits) showed that's NOT enough:
+ * three separate TG0WDT_SYS_RST crashes were captured, each firing commit_reference_to_flash()
+ * 500-520ms after "disconnected", i.e. right at the old threshold. Advertising restarts near-
+ * instantly on disconnect (see ble_imu_gatt_looper_disconnected()), so at 500ms the BLE
+ * controller/link-layer teardown + adv restart is still very plausibly mid-flight — same
+ * "connection-adjacent radio activity" hazard as a live connection, just on the other side of
+ * the disconnect edge. Bumped to a much larger margin to give that real headroom. */
+#define FLASH_ERASE_DISCONNECT_SETTLE_MS 4000U
+
+bool app_flash_erase_safe(void)
+{
+	return ble_imu_disconnected_settled(FLASH_ERASE_DISCONNECT_SETTLE_MS);
+}
+
 static float json_safe(float v)
 {
 	return isfinite(v) ? v : 0.0f;
+}
+
+#define BLE_C1_MAGIC     0xC1U
+#define BLE_C1_VER       1U
+#define BLE_C1_HDR       14U
+#define BLE_C1_RAW_REC   14U
+#define BLE_C1_ATT_REC   26U
+
+static void c1_put_u16(uint8_t *p, uint16_t v)
+{
+	p[0] = (uint8_t)(v & 0xffU);
+	p[1] = (uint8_t)(v >> 8);
+}
+
+static void c1_put_u32(uint8_t *p, uint32_t v)
+{
+	p[0] = (uint8_t)(v & 0xffU);
+	p[1] = (uint8_t)((v >> 8) & 0xffU);
+	p[2] = (uint8_t)((v >> 16) & 0xffU);
+	p[3] = (uint8_t)((v >> 24) & 0xffU);
+}
+
+static void c1_put_f16(uint8_t *p, float v)
+{
+	c1_put_u16(p, metrics_f32_to_f16(json_safe(v)));
+}
+
+static size_t pack_compact_raw(uint8_t *dst, size_t cap, uint32_t seq, uint8_t flags,
+			       uint16_t v_cv, uint8_t pct, int8_t tc,
+			       const struct imu_pipeline_raw_entry *entries, size_t n,
+			       const struct imu_sample *fallback, uint32_t t_ms, float walk_m)
+{
+	size_t nrec = n;
+	size_t off;
+	size_t i;
+
+	if (nrec == 0U) {
+		nrec = 1U;
+	}
+	if (BLE_C1_HDR + nrec * BLE_C1_RAW_REC > cap) {
+		nrec = (cap - BLE_C1_HDR) / BLE_C1_RAW_REC;
+	}
+	if (nrec == 0U) {
+		return 0U;
+	}
+
+	dst[0] = BLE_C1_MAGIC;
+	dst[1] = (uint8_t)((BLE_C1_VER << 4) | (g_mode & 0x0fU));
+	c1_put_u32(dst + 2, seq);
+	dst[6] = (uint8_t)nrec;
+	dst[7] = flags;
+	c1_put_u16(dst + 8, (uint16_t)(n > 0U ? entries[0].t_ms : t_ms));
+	c1_put_u16(dst + 10, v_cv);
+	dst[12] = pct;
+	dst[13] = (uint8_t)tc;
+	off = BLE_C1_HDR;
+
+	for (i = 0; i < nrec; i++) {
+		const struct imu_sample *s = (n > 0U) ? &entries[i].sample : fallback;
+		float dm = walk_m;
+
+		c1_put_f16(dst + off, s->ax);
+		c1_put_f16(dst + off + 2, s->ay);
+		c1_put_f16(dst + off + 4, s->az);
+		c1_put_f16(dst + off + 6, s->gx);
+		c1_put_f16(dst + off + 8, s->gy);
+		c1_put_f16(dst + off + 10, s->gz);
+		c1_put_f16(dst + off + 12, dm);
+		off += BLE_C1_RAW_REC;
+	}
+	return off;
+}
+
+static size_t pack_compact_attitude(uint8_t *dst, size_t cap, uint32_t seq, uint8_t flags,
+				    uint16_t v_cv, uint8_t pct, int8_t tc, uint32_t t_ms,
+				    float walk_m, const struct mat3 *rot, const float *footer)
+{
+	if (cap < BLE_C1_HDR + BLE_C1_ATT_REC) {
+		return 0U;
+	}
+
+	dst[0] = BLE_C1_MAGIC;
+	dst[1] = (uint8_t)((BLE_C1_VER << 4) | (g_mode & 0x0fU));
+	c1_put_u32(dst + 2, seq);
+	dst[6] = 1U;
+	dst[7] = flags;
+	c1_put_u16(dst + 8, (uint16_t)t_ms);
+	c1_put_u16(dst + 10, v_cv);
+	dst[12] = pct;
+	dst[13] = (uint8_t)tc;
+
+	for (int r = 0; r < 3; r++) {
+		for (int c = 0; c < 3; c++) {
+			c1_put_f16(dst + BLE_C1_HDR + (size_t)(r * 3 + c) * 2U, rot->m[r][c]);
+		}
+	}
+	c1_put_f16(dst + BLE_C1_HDR + 18, walk_m);
+	c1_put_f16(dst + BLE_C1_HDR + 20, footer[0]);
+	c1_put_f16(dst + BLE_C1_HDR + 22, footer[1]);
+	c1_put_f16(dst + BLE_C1_HDR + 24, footer[2]);
+	return BLE_C1_HDR + BLE_C1_ATT_REC;
 }
 
 static void append_raw_record(char *dst, size_t dst_size, size_t *len, uint32_t t_ms,
@@ -324,19 +508,59 @@ static void refresh_json(uint32_t record_count, const char *records, size_t reco
 	struct imu_sample sample;
 	const struct battery_state *bat = battery_monitor_state();
 	const struct vibro_verdict vib = vibro_capture_verdict();
+
+	stall_watchdog_feed_main();
 	const float volts = bat != NULL ? bat->voltage_v : BAT_FULL_V;
 	const float pct = bat != NULL ? (float)bat->percent : 100.0f;
 	const float trend = bat != NULL ? bat->trend_v : 0.0f;
 	const unsigned power_src = (bat != NULL && bat->on_dc) ? 1U : 0U;
-	const bool have_sample = imu_pipeline_snapshot(&sample, NULL);
+	struct attitude_estimator att = { .state = { .rotation = mat3_identity() } };
+	const bool have_sample = imu_pipeline_snapshot(&sample, &att);
 
 	const int w = json_write_idx();
 
+	/* Rotation matrix (attitude_update() runs every tick regardless of BLE render mode —
+	 * see imu_pipeline_tick()) piggybacked on the always-on DATA JSON header so AHRS
+	 * consumers (web debug page) get it at full BLE-tick rate without a dedicated
+	 * characteristic or poll path. See attitude.c: complementary filter, no magnetometer,
+	 * so yaw is gyro-integrated only and will drift — roll/pitch are accel-corrected.
+	 *
+	 * Encoded as int16 (x10000, i.e. 4 decimal digits) rather than %f — this exact
+	 * function has a documented history (see read_data() comment above) of wedging the
+	 * BT stack/render thread when snprintf does too much float-to-ASCII work per call, and
+	 * adding 9 more %f conversions to an already-hot per-tick path reproduced that (render
+	 * stall panic, v142 first flash). Integer formatting avoids newlib's float printf path
+	 * entirely; client divides by 10000.0. */
+	const int32_t r00 = (int32_t)(att.state.rotation.m[0][0] * 10000.0f);
+	const int32_t r01 = (int32_t)(att.state.rotation.m[0][1] * 10000.0f);
+	const int32_t r02 = (int32_t)(att.state.rotation.m[0][2] * 10000.0f);
+	const int32_t r10 = (int32_t)(att.state.rotation.m[1][0] * 10000.0f);
+	const int32_t r11 = (int32_t)(att.state.rotation.m[1][1] * 10000.0f);
+	const int32_t r12 = (int32_t)(att.state.rotation.m[1][2] * 10000.0f);
+	const int32_t r20 = (int32_t)(att.state.rotation.m[2][0] * 10000.0f);
+	const int32_t r21 = (int32_t)(att.state.rotation.m[2][1] * 10000.0f);
+	const int32_t r22 = (int32_t)(att.state.rotation.m[2][2] * 10000.0f);
+	/* Cumulative walk distance (cm) + yaw heading (deg x100) for phone-side dead-reckoning
+	 * (Phase 3: GPS anchor + IMU-estimated route). walk_distance.c already tracked this for
+	 * the on-device 3D scene render but never exposed it as a named field — same "int, not
+	 * float" rule as rot4 above, same reasoning. */
+	const int32_t walk_cm = (int32_t)(imu_pipeline_walk_distance_m() * 100.0f);
+	const int32_t yaw_deg100 = (int32_t)(att.state.yaw * (180.0f / (float)M_PI) * 100.0f);
+	struct mt200_telem wt;
+
+	mt200_bridge_telem(&wt);
+
 	int n = snprintf(g_data_json[w], sizeof(g_data_json[w]),
 			 "{\"s\":%u,\"m\":%u,\"w\":%d,\"h\":%d,\"n\":%u,\"p\":%u,\"v\":%.2f,"
-			 "\"pct\":%u,\"tr\":%.3f,\"d\":[%.*s]}",
+			 "\"pct\":%u,\"tr\":%.3f,\"rot4\":[%d,%d,%d,%d,%d,%d,%d,%d,%d],"
+			 "\"wdcm\":%d,\"yawd100\":%d,"
+			 "\"whr\":%u,\"wsp\":%u,\"wst\":%u,\"wbat\":%u,\"wok\":%u,\"wrssi\":%d,"
+			 "\"d\":[%.*s]}",
 			 g_seq, g_mode, PANEL_W, PANEL_H, record_count, power_src, (double)volts,
-			 (unsigned)pct, (double)trend, (int)records_len, records);
+			 (unsigned)pct, (double)trend, r00, r01, r02, r10, r11, r12, r20, r21, r22,
+			 walk_cm, yaw_deg100, (unsigned)wt.hr, (unsigned)wt.spo2,
+			 (unsigned)wt.steps, (unsigned)wt.bat_pct,
+			 wt.flags != 0U ? 1U : 0U, (int)wt.rssi, (int)records_len, records);
 	if (n < 0) {
 		g_data_len[w] = 0;
 	} else {
@@ -346,14 +570,36 @@ static void refresh_json(uint32_t record_count, const char *records, size_t reco
 
 	n = snprintf(g_status_json[w], sizeof(g_status_json[w]),
 		     "{\"s\":%u,\"m\":%u,\"n\":%u,\"b\":%u,\"p\":%u,\"v\":%.2f,\"pct\":%u,"
-		     "\"tr\":%.3f,\"pp\":%u,\"fw\":\"zephyr\",\"imu\":%u,\"scr\":%u,"
-		     "\"cpumhz\":%u,\"cpuov\":%u,\"cpuact\":%u,\"cpuclamp\":%u,\"imuhz\":%u,\"imuov\":%u",
+		     "\"tr\":%.3f,\"pp\":%u,\"fw\":\"" FW_VERSION_NAME "\",\"fwc\":%u,\"imu\":%u,\"scr\":%u,"
+		     "\"cpumhz\":%u,\"cpuov\":%u,\"cpuact\":%u,\"cpuclamp\":%u,\"imuhz\":%u,\"imuov\":%u,"
+		     "\"wrssi\":%d",
 		     g_seq, g_mode, record_count, (unsigned)g_data_len[w], power_src, (double)volts,
-		     (unsigned)pct, (double)trend, POWER_PROFILE_DC_FULL,
+		     (unsigned)pct, (double)trend, POWER_PROFILE_DC_FULL, (unsigned)FW_VERSION_CODE,
 		     imu_pipeline_live() ? 1U : 0U, power_manager_screen_on() ? 1U : 0U,
 		     (unsigned)power_manager_cpu_mhz_desired(), (unsigned)power_manager_cpu_mhz_override(),
 		     (unsigned)power_manager_cpu_mhz_settled(), power_manager_cpu_ble_clamped() ? 1U : 0U,
-		     (unsigned)power_manager_imu_hz_target(), (unsigned)power_manager_imu_hz_override());
+		     (unsigned)power_manager_imu_hz_target(), (unsigned)power_manager_imu_hz_override(),
+		     (int)wt.rssi);
+
+	if (n > 0) {
+		uint32_t spcap = 0U;
+		uint32_t spused = 0U;
+		uint16_t sppend = 0U;
+		uint32_t spfree = 0U;
+		uint32_t dramf_kb = 0U;
+
+		vibro_verdict_store_spool_stats(&spcap, &spused, &sppend);
+		spfree = spused < spcap ? spcap - spused : 0U;
+#if defined(CONFIG_SOC_SERIES_ESP32S3)
+		dramf_kb = (uint32_t)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024U);
+#endif
+		n += snprintf(g_status_json[w] + n, sizeof(g_status_json[w]) - (size_t)n,
+			      ",\"apb\":%u,\"spcap\":%u,\"spused\":%u,\"spfree\":%u,\"sppend\":%u,"
+			      "\"dramf\":%u",
+			      (unsigned)power_manager_apb_mhz_actual(), (unsigned)spcap,
+			      (unsigned)spused, (unsigned)spfree, (unsigned)sppend,
+			      (unsigned)dramf_kb);
+	}
 
 	if (chip_temp_valid() && n > 0) {
 		n += snprintf(g_status_json[w] + n, sizeof(g_status_json[w]) - (size_t)n, ",\"tc\":%.1f",
@@ -379,11 +625,18 @@ static void refresh_json(uint32_t record_count, const char *records, size_t reco
 		{
 			const struct vibro_band_rms bands = vibro_capture_band_rms();
 
+			stall_watchdog_feed_main();
 			if (bands.valid && n > 0) {
+				uint16_t b16[VIBRO_BAND_COUNT];
+
+				metrics_f32_array_to_f16(bands.bands, b16, VIBRO_BAND_COUNT);
 				n += snprintf(g_status_json[w] + n, sizeof(g_status_json[w]) - (size_t)n,
 					      ",\"bnd\":[%.4f,%.4f,%.4f,%.4f]",
 					      (double)bands.bands[0], (double)bands.bands[1],
 					      (double)bands.bands[2], (double)bands.bands[3]);
+				n += snprintf(g_status_json[w] + n, sizeof(g_status_json[w]) - (size_t)n,
+					      ",\"b16\":[%u,%u,%u,%u]", (unsigned)b16[0],
+					      (unsigned)b16[1], (unsigned)b16[2], (unsigned)b16[3]);
 			}
 		}
 	}
@@ -460,9 +713,19 @@ static void refresh_json(uint32_t record_count, const char *records, size_t reco
 			      ",\"radio\":\"%s\"", radio_scheduler_mode_str());
 	}
 
+	if (n > 0 && g_notify_drop_count > 0U) {
+		/* Retries-exhausted count for the 30Hz notify stream — see
+		 * NOTIFY_RETRY_MAX's doc comment. Omitted entirely while zero to save
+		 * bytes in the common case. */
+		n += snprintf(g_status_json[w] + n, sizeof(g_status_json[w]) - (size_t)n,
+			      ",\"ndrop\":%u", g_notify_drop_count);
+	}
+
 	if (n > 0) {
 		n += snprintf(g_status_json[w] + n, sizeof(g_status_json[w]) - (size_t)n,
-			      ",\"rr\":\"%s\"", crash_report_reset_reason_str());
+			      ",\"rr\":\"%s\",\"boot_part\":\"%s\"",
+			      crash_report_reset_reason_str(),
+			      soft_reboot_partition_label(soft_reboot_boot_partition()));
 	}
 
 #if defined(CONFIG_APP_CRASH_DEBUG)
@@ -476,6 +739,16 @@ static void refresh_json(uint32_t record_count, const char *records, size_t reco
 		}
 	}
 #endif
+
+	if (n > 0 && battery_bench_active()) {
+		struct battery_bench_snapshot snap;
+
+		battery_bench_snapshot_fill(&snap);
+		n += snprintf(g_status_json[w] + n, sizeof(g_status_json[w]) - (size_t)n,
+			      ",\"bench\":1,\"bsid\":%u,\"bseq\":%u,\"upt\":%u,"
+			      "\"rh\":%u",
+			      snap.session_id, snap.sample_seq, snap.uptime_ms, snap.render_hz);
+	}
 
 	if (n > 0) {
 		n = clock_sync_append_status_json(g_status_json[w], sizeof(g_status_json[w]), n);
@@ -493,67 +766,69 @@ static void refresh_json(uint32_t record_count, const char *records, size_t reco
 static void build_batch(void)
 {
 	stall_watchdog_feed_main();
-	char records[512];
-	size_t records_len = 0;
-	uint32_t record_count = 0;
 	const uint32_t t_ms = clock_sync_now_ms32();
 	struct imu_sample sample;
 	struct attitude_estimator att;
+	const struct battery_state *bat = battery_monitor_state();
+	const int w = json_write_idx();
+	uint8_t flags = 0;
+	uint16_t v_cv;
+	uint8_t pct;
+	int8_t tc = 127;
+	float walk_m;
+	static int64_t last_status_ms;
 
 	if (!imu_pipeline_snapshot(&sample, &att)) {
+		g_compact_len[w] = 0;
 		refresh_json(0, "", 0);
 		return;
 	}
 
-	records[0] = '\0';
+	if (bat != NULL && bat->on_dc) {
+		flags |= 1U;
+	}
+	if (power_manager_screen_on()) {
+		flags |= 2U;
+	}
+	v_cv = (uint16_t)((bat != NULL ? bat->voltage_v : BAT_FULL_V) * 100.0f + 0.5f);
+	pct = (uint8_t)(bat != NULL ? bat->percent : 100);
+	if (chip_temp_valid()) {
+		const float t = chip_temp_celsius();
 
-	const float walk_m = imu_pipeline_walk_distance_m();
+		if (t > -40.0f && t < 125.0f) {
+			tc = (int8_t)(t + (t >= 0.0f ? 0.5f : -0.5f));
+		}
+	} else {
+		const float t = sample.temp_c;
+
+		if (t > -40.0f && t < 125.0f) {
+			tc = (int8_t)(t + (t >= 0.0f ? 0.5f : -0.5f));
+		}
+	}
+
+	walk_m = imu_pipeline_walk_distance_m();
 
 	if (g_mode == BLE_IMU_MODE_RAW) {
-		/*
-		 * RAW mode previously shipped only the single latest snapshot per BLE tick —
-		 * with IMU sampling at up to 100 Hz but the BLE tick at ~30 Hz (g_poll_ms), that
-		 * silently discarded roughly 2 of every 3 samples for any client actually wanting
-		 * raw fidelity (vibro/FFT diagnosis). Draining the ring buffered by
-		 * imu_pipeline_tick() ships every sample since the last tick instead, amortizing
-		 * the fixed per-notify/connection-interval cost across several samples. Each
-		 * append_raw_record() call self-limits against BLE_IMU_COMMIT_BYTES, so a burst
-		 * larger than the JSON budget just tail-drops (record_count only counts what
-		 * actually fit) rather than corrupting the buffer.
-		 */
 		struct imu_pipeline_raw_entry entries[IMU_PIPELINE_RAW_RING_CAP];
 		const size_t n = imu_pipeline_drain_raw(entries, ARRAY_SIZE(entries));
 
-		if (n == 0U) {
-			append_raw_record(records, sizeof(records), &records_len, t_ms, &sample,
-					  walk_m);
-			record_count = (records_len > 0U) ? 1U : 0U;
-		} else {
-			for (size_t i = 0; i < n; i++) {
-				const size_t before = records_len;
-
-				append_raw_record(records, sizeof(records), &records_len,
-						  entries[i].t_ms, &entries[i].sample, walk_m);
-				if (records_len > before) {
-					record_count++;
-				}
-			}
-		}
+		g_compact_len[w] = pack_compact_raw(g_compact[w], sizeof(g_compact[w]), g_seq,
+						    flags, v_cv, pct, tc, entries, n, &sample,
+						    t_ms, walk_m);
 	} else {
-		struct scene_snapshot snap = scene_snapshot_build(
-			PANEL_W, PANEL_H, scene_zoom_current(), &att.state.rotation, &sample,
-			walk_m);
+		const float footer[3] = { sample.ax, sample.ay, sample.az };
 
-		if (g_mode == BLE_IMU_MODE_SCENE) {
-			append_scene_record(records, sizeof(records), &records_len, t_ms, &snap);
-		} else {
-			append_computed_record(records, sizeof(records), &records_len, t_ms, &snap,
-					       &att.state.rotation);
-		}
-		record_count = (records_len > 0U) ? 1U : 0U;
+		g_compact_len[w] = pack_compact_attitude(g_compact[w], sizeof(g_compact[w]), g_seq,
+							 flags, v_cv, pct, tc, t_ms, walk_m,
+							 &att.state.rotation, footer);
 	}
 
-	refresh_json(record_count, records, records_len);
+	if (last_status_ms == 0 || (k_uptime_get() - last_status_ms) >= 500) {
+		last_status_ms = k_uptime_get();
+		refresh_json(g_compact[w][6], "", 0);
+	} else {
+		json_publish(w);
+	}
 	stall_watchdog_feed_main();
 }
 
@@ -602,6 +877,11 @@ static void poll_tick(void)
 
 	const int64_t now = k_uptime_get();
 
+	if (atomic_cas(&g_notify_skip_poll, 1, 0)) {
+		g_poll_next_ms = now + 200;
+		return;
+	}
+
 	if (now < g_poll_next_ms) {
 		return;
 	}
@@ -613,6 +893,16 @@ static void poll_tick(void)
 
 	if (g_traffic_paused) {
 		g_poll_next_ms = now + 500;
+		return;
+	}
+
+	/* A previous send_notify() failed (see the g_defer_notify_send block's rc check) and
+	 * has retry budget left — resend the exact same buffer/seq instead of building (and
+	 * thus advancing past) a brand-new sample. */
+	if (g_notify_resend_pending && g_notify_enabled) {
+		g_notify_resend_pending = false;
+		send_notify();
+		g_poll_next_ms = now + g_poll_ms;
 		return;
 	}
 
@@ -642,7 +932,7 @@ static void poll_tick(void)
 		struct imu_sample s;
 
 		if (imu_pipeline_snapshot(&s, NULL)) {
-			LOG_INF("batch s=%u imu=%s ax=%.3f ay=%.3f az=%.3f json=%uB", g_seq,
+			LOG_DBG("batch s=%u imu=%s ax=%.3f ay=%.3f az=%.3f json=%uB", g_seq,
 				imu_pipeline_live() ? "live" : "off", (double)s.ax, (double)s.ay,
 				(double)s.az, (unsigned)g_data_len[atomic_get(&g_json_pub_idx)]);
 		}
@@ -677,6 +967,9 @@ static ssize_t write_mode(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 
 	if (offset != 0 || len < 1) {
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+	}
+	if (bench_blocks_config()) {
+		return BT_GATT_ERR(BT_ATT_ERR_WRITE_NOT_PERMITTED);
 	}
 
 	g_mode = *(const uint8_t *)buf;
@@ -740,6 +1033,9 @@ static ssize_t write_poll_ms(struct bt_conn *conn, const struct bt_gatt_attr *at
 	if (offset != 0 || len < 2) {
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
+	if (bench_blocks_config()) {
+		return BT_GATT_ERR(BT_ATT_ERR_WRITE_NOT_PERMITTED);
+	}
 
 	const uint8_t *b = buf;
 	uint16_t ms = sys_get_le16(b);
@@ -777,6 +1073,9 @@ static ssize_t write_time(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 	if (offset != 0 || len < 8) {
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
+	if (bench_blocks_config()) {
+		return BT_GATT_ERR(BT_ATT_ERR_WRITE_NOT_PERMITTED);
+	}
 
 	int64_t unix_ms = 0;
 	int16_t tz_min = clock_sync_tz_offset_min();
@@ -804,6 +1103,8 @@ static ssize_t write_time(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 	return len;
 }
 
+/** 4-byte LE uint32 capability mask. Not a handshake ACK — STATUS "ack" is
+ *  vibro offload seq. Phone reads this char after connect (see ImuProtocol.parseCaps). */
 static ssize_t read_caps(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			 void *buf, uint16_t len, uint16_t offset)
 {
@@ -836,6 +1137,9 @@ static ssize_t write_screen(struct bt_conn *conn, const struct bt_gatt_attr *att
 	if (offset != 0 || len < 1) {
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
+	if (bench_blocks_config()) {
+		return BT_GATT_ERR(BT_ATT_ERR_WRITE_NOT_PERMITTED);
+	}
 
 	const bool on = (*(const uint8_t *)buf) != 0U;
 
@@ -864,6 +1168,9 @@ static ssize_t write_cpu_mhz(struct bt_conn *conn, const struct bt_gatt_attr *at
 
 	if (offset != 0 || len < 1) {
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+	}
+	if (bench_blocks_config()) {
+		return BT_GATT_ERR(BT_ATT_ERR_WRITE_NOT_PERMITTED);
 	}
 
 	/* 0 stays 0 (auto); any nonzero byte is rounded to the nearest supported tier by
@@ -894,6 +1201,9 @@ static ssize_t write_imu_hz(struct bt_conn *conn, const struct bt_gatt_attr *att
 	if (offset != 0 || len < 1) {
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
+	if (bench_blocks_config()) {
+		return BT_GATT_ERR(BT_ATT_ERR_WRITE_NOT_PERMITTED);
+	}
 
 	uint8_t hz = *(const uint8_t *)buf;
 
@@ -907,6 +1217,36 @@ static ssize_t write_imu_hz(struct bt_conn *conn, const struct bt_gatt_attr *att
 
 	g_imu_hz_want = hz;
 	atomic_set(&g_defer_imu_hz, 1);
+	return len;
+}
+
+static ssize_t read_bench(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+			  void *buf, uint16_t len, uint16_t offset)
+{
+	ARG_UNUSED(conn);
+	ARG_UNUSED(attr);
+
+	uint8_t out[9];
+
+	out[0] = battery_bench_active() ? 1U : 0U;
+	sys_put_le32(battery_bench_session_id(), &out[1]);
+	sys_put_le32(battery_bench_sample_seq(), &out[5]);
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, out, sizeof(out));
+}
+
+static ssize_t write_bench(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+			   const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
+{
+	ARG_UNUSED(conn);
+	ARG_UNUSED(attr);
+	ARG_UNUSED(flags);
+
+	if (offset != 0 || len < 1) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+	}
+
+	g_bench_cmd_want = *(const uint8_t *)buf;
+	atomic_set(&g_defer_bench, 1);
 	return len;
 }
 
@@ -942,7 +1282,11 @@ BT_GATT_SERVICE_DEFINE(
 	BT_GATT_CHARACTERISTIC(&imu_imu_hz_uuid.uuid,
 			       BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
 			       BT_GATT_PERM_READ | BT_GATT_PERM_WRITE, read_imu_hz,
-			       write_imu_hz, NULL));
+			       write_imu_hz, NULL),
+	BT_GATT_CHARACTERISTIC(&imu_bench_uuid.uuid,
+			       BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
+			       BT_GATT_PERM_READ | BT_GATT_PERM_WRITE, read_bench,
+			       write_bench, NULL));
 
 static void mtu_updated(struct bt_conn *conn, uint16_t tx, uint16_t rx)
 {
@@ -1025,6 +1369,8 @@ int ble_imu_gatt_init(void)
 	atomic_set(&g_json_pub_idx, 0);
 	g_status_len[0] = 0;
 	g_data_len[0] = 0;
+	g_compact_len[0] = 0;
+	g_compact_len[1] = 0;
 	clock_sync_begin();
 	g_caps = ble_imu_zephyr_caps();
 	build_batch();
@@ -1076,8 +1422,24 @@ int ble_imu_gatt_looper_adv_start(bool restart)
 	return ble_imu_advertise_start_now();
 }
 
+static bool conn_is_phone_link(struct bt_conn *conn)
+{
+	struct bt_conn_info info;
+
+	if (conn == NULL || bt_conn_get_info(conn, &info) != 0) {
+		return false;
+	}
+	/* Central links (MT200 bridge) also fire BT_CONN_CB; only the incoming
+	 * peripheral role is the phone. Treating the watch as "the IMU client"
+	 * stops advertising and the phone can never connect. */
+	return info.role == BT_CONN_ROLE_PERIPHERAL;
+}
+
 void ble_imu_on_connected(struct bt_conn *conn, uint8_t err)
 {
+	if (!conn_is_phone_link(conn)) {
+		return;
+	}
 	(void)ble_looper_post_connected(conn, err);
 }
 
@@ -1098,7 +1460,9 @@ void ble_imu_gatt_set_traffic_paused(bool paused)
 
 void ble_imu_on_disconnected(struct bt_conn *conn, uint8_t reason)
 {
-	ARG_UNUSED(conn);
+	if (!conn_is_phone_link(conn)) {
+		return;
+	}
 	(void)ble_looper_post_disconnected(reason);
 }
 
@@ -1135,6 +1499,9 @@ void ble_imu_gatt_looper_disconnected(uint8_t reason)
 	g_adv_stop_pending = false;
 	g_status_read_idx = -1;
 	g_data_read_idx = -1;
+	g_last_disconnect_at = k_uptime_get();
+	g_notify_resend_pending = false;
+	g_notify_retry_count = 0;
 
 	if (g_conn) {
 		bt_conn_unref(g_conn);
@@ -1151,6 +1518,11 @@ bool ble_imu_link_active(void)
 	return g_connected;
 }
 
+void ble_imu_gatt_bench_sample(void)
+{
+	schedule_prep_batch();
+}
+
 void ble_imu_gatt_looper_tick(void)
 {
 	stall_watchdog_feed_main();
@@ -1161,16 +1533,12 @@ void ble_imu_gatt_looper_tick(void)
 		return;
 	}
 
-	if (atomic_get(&g_need_prep_batch) != 0 && ble_traffic_ready()) {
-		atomic_set(&g_need_prep_batch, 0);
-		build_batch();
-	}
-
 	if (atomic_get(&g_defer_notify) != 0) {
 		atomic_set(&g_defer_notify, 0);
 		g_notify_enabled = g_notify_want;
 		LOG_INF("NOTIFY %s", g_notify_enabled ? "enabled" : "disabled");
 		if (g_notify_enabled) {
+			atomic_set(&g_notify_skip_poll, 1);
 			if (ble_traffic_ready()) {
 				schedule_prep_batch();
 				schedule_poll_immediate();
@@ -1180,6 +1548,11 @@ void ble_imu_gatt_looper_tick(void)
 		} else {
 			g_poll_armed = false;
 		}
+	}
+
+	if (atomic_get(&g_need_prep_batch) != 0 && ble_traffic_ready()) {
+		atomic_set(&g_need_prep_batch, 0);
+		build_batch();
 	}
 
 	if (g_grace_prep_pending && g_notify_enabled && ble_traffic_ready()) {
@@ -1200,17 +1573,17 @@ void ble_imu_gatt_looper_tick(void)
 		}
 	}
 
-	if (atomic_get(&g_defer_mode) != 0 && !in_connect_grace()) {
+	if (atomic_get(&g_defer_mode) != 0) {
 		atomic_set(&g_defer_mode, 0);
 		schedule_traffic_if_ready();
 	}
 
-	if (atomic_get(&g_defer_poll) != 0 && !in_connect_grace()) {
+	if (atomic_get(&g_defer_poll) != 0) {
 		atomic_set(&g_defer_poll, 0);
 		schedule_poll_immediate();
 	}
 
-	if (atomic_get(&g_defer_screen) != 0 && !in_connect_grace()) {
+	if (atomic_get(&g_defer_screen) != 0) {
 		atomic_set(&g_defer_screen, 0);
 		power_manager_on_screen(g_screen_want);
 		schedule_traffic_if_ready();
@@ -1227,12 +1600,23 @@ void ble_imu_gatt_looper_tick(void)
 		schedule_traffic_if_ready();
 	}
 
+	if (atomic_get(&g_defer_bench) != 0 && !in_connect_grace()) {
+		atomic_set(&g_defer_bench, 0);
+		if (g_bench_cmd_want == BLE_IMU_BENCH_CMD_STOP) {
+			(void)battery_bench_stop();
+		} else if (g_bench_cmd_want == BLE_IMU_BENCH_CMD_START) {
+			(void)battery_bench_start();
+		}
+		schedule_prep_batch();
+	}
+
 	if (atomic_cas(&g_defer_notify_send, 1, 0)) {
 		if (g_connected && g_notify_enabled && g_notify_attr != NULL && g_conn != NULL &&
 		    ble_traffic_ready()) {
 			const int idx = atomic_get(&g_json_pub_idx);
 			const uint16_t mtu = bt_gatt_get_mtu(g_conn);
 			const uint16_t att_payload_max = (mtu > 3U) ? (uint16_t)(mtu - 3U) : 0U;
+			int rc;
 
 			/*
 			 * Ship the batch JSON directly in the notification instead of just a
@@ -1246,20 +1630,49 @@ void ble_imu_gatt_looper_tick(void)
 			 * cases apart by payload length and still does a Read in that case, so
 			 * older/degraded links keep working exactly as before.
 			 */
-			if (att_payload_max > 0U && g_data_len[idx] > 0U &&
-			    g_data_len[idx] <= (size_t)att_payload_max) {
-				(void)bt_gatt_notify(g_conn, g_notify_attr, g_data_json[idx],
-						     (uint16_t)g_data_len[idx]);
+			if (att_payload_max > 0U && g_compact_len[idx] > 0U &&
+			    g_compact_len[idx] <= (size_t)att_payload_max) {
+				rc = bt_gatt_notify(g_conn, g_notify_attr, g_compact[idx],
+						    (uint16_t)g_compact_len[idx]);
+			} else if (att_payload_max > 0U && g_data_len[idx] > 0U &&
+				   g_data_len[idx] <= (size_t)att_payload_max) {
+				rc = bt_gatt_notify(g_conn, g_notify_attr, g_data_json[idx],
+						    (uint16_t)g_data_len[idx]);
 			} else {
 				uint8_t payload[4];
 
 				sys_put_le32(g_seq, payload);
-				(void)bt_gatt_notify(g_conn, g_notify_attr, payload,
-						     sizeof(payload));
+				rc = bt_gatt_notify(g_conn, g_notify_attr, payload,
+						    sizeof(payload));
+			}
+
+			/* Loss detection + bounded retry — see NOTIFY_RETRY_MAX's doc
+			 * comment. A nonzero rc (typically -ENOMEM, TX queue momentarily
+			 * full) means this sample never went out; retry the exact same
+			 * buffer almost immediately instead of waiting a full g_poll_ms
+			 * and silently moving on. */
+			if (rc != 0) {
+				g_notify_fail_count++;
+				if (g_notify_retry_count < NOTIFY_RETRY_MAX) {
+					g_notify_retry_count++;
+					g_notify_resend_pending = true;
+					g_poll_next_ms = k_uptime_get() + NOTIFY_RETRY_DELAY_MS;
+				} else {
+					g_notify_drop_count++;
+					g_notify_retry_count = 0;
+					LOG_WRN("notify: retries exhausted, dropping seq=%u "
+						"(fail=%u drop=%u)",
+						g_seq, g_notify_fail_count, g_notify_drop_count);
+				}
+			} else {
+				g_notify_retry_count = 0;
 			}
 		}
 	}
 
 	poll_tick();
+	if (g_connected && power_manager_tft_render_enabled()) {
+		stall_watchdog_feed_render();
+	}
 	stall_watchdog_feed_main();
 }

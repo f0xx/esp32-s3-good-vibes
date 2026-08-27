@@ -11,6 +11,7 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
@@ -68,6 +69,40 @@
             android:label="@string/crash_debug_title"
             android:parentActivityName=".MainActivity"
             android:screenOrientation="fullSensor" />
+
+        <activity
+            android:name=".BatteryBenchActivity"
+            android:exported="false"
+            android:label="@string/battery_bench_title"
+            android:parentActivityName=".MainActivity"
+            android:screenOrientation="fullSensor" />
+
+        <activity
+            android:name=".VibroRefWizardActivity"
+            android:exported="false"
+            android:label="@string/vibro_ref_wizard_title"
+            android:parentActivityName=".MainActivity"
+            android:screenOrientation="fullSensor" />
+
+        <activity
+            android:name=".FloorCalibActivity"
+            android:exported="false"
+            android:label="@string/floor_calib_title"
+            android:parentActivityName=".MainActivity"
+            android:screenOrientation="fullSensor" />
+
+        <activity
+            android:name=".AhrsActivity"
+            android:exported="false"
+            android:label="@string/ahrs_title"
+            android:parentActivityName=".MainActivity"
+            android:screenOrientation="fullSensor" />
+
+        <activity
+            android:name=".OtaInstallActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
         <service
             android:name=".ImuBleForegroundService"

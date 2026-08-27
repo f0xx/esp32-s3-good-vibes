@@ -35,10 +35,21 @@ struct vibro_ref_profile {
 int vibro_ref_store_init(void);
 bool vibro_ref_store_valid(uint8_t slot);
 int vibro_ref_store_read(uint8_t slot, struct vibro_ref_profile *out);
+/** Erases + writes the slot's sector — caller must only invoke this when
+ * app_flash_erase_safe() (see flash_safety.h) is true. Returns -EBUSY otherwise. */
 int vibro_ref_store_write(uint8_t slot, const struct vibro_ref_profile *prof);
+/** Marks the slot as logically deleted in RAM immediately (vibro_ref_store_valid()/read()
+ * reflect this right away); the actual flash_area_erase() is deferred to
+ * vibro_ref_store_poll() until it's safe to run. Always returns 0 (barring bad slot). */
 int vibro_ref_store_delete(uint8_t slot);
-/** Pass -1 to clear (no active reference). */
+/** Erase all slots and clear active reference — deferred like vibro_ref_store_delete(). */
+int vibro_ref_store_clear_all(void);
+/** Pass -1 to clear (no active reference). Header flash write is deferred like
+ * vibro_ref_store_delete(); vibro_ref_store_active_slot() reflects the change immediately. */
 int vibro_ref_store_set_active(int8_t slot);
 int8_t vibro_ref_store_active_slot(void);
 /** Compact metadata for all slots (no mag[]/band arrays) — for BLE listing. */
 int vibro_ref_store_list_json(char *buf, size_t len);
+/** Call periodically (e.g. from vibro_capture_poll()) to flush deferred slot erases and
+ * header writes once app_flash_erase_safe() is true. No-op while unsafe. */
+void vibro_ref_store_poll(void);

@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<title>Operator HOW-TO — ESP32-S3 IMU</title>
+<style>
+@page { size: A4; margin: 16mm 14mm 18mm 14mm; }
+:root { --ink:#15202b; --muted:#4a5568; --line:#d8dee6; --accent:#0b6e4f; --head:#0f3d4c; }
+html { font-size: 11pt; }
+body { font-family: "Noto Sans", "DejaVu Sans", "Liberation Sans", sans-serif;
+       color: var(--ink); line-height: 1.45; max-width: 900px; margin: 0 auto; }
+h1 { color: var(--head); font-size: 1.7rem; border-bottom: 3px solid var(--accent); padding-bottom: .25rem; page-break-after: avoid; }
+h2 { color: var(--head); font-size: 1.25rem; margin-top: 1.6rem; page-break-after: avoid; border-bottom: 1px solid var(--line); }
+h3 { color: #1a4a58; font-size: 1.05rem; margin-top: 1.2rem; page-break-after: avoid; }
+h4 { margin-top: 1rem; page-break-after: avoid; }
+p, li { orphans: 3; widows: 3; }
+table { border-collapse: collapse; width: 100%; margin: .7rem 0 1rem; font-size: .92rem; page-break-inside: auto; }
+th, td { border: 1px solid var(--line); padding: .28rem .45rem; vertical-align: top; }
+th { background: #e8f3ef; color: var(--head); text-align: left; }
+tr { page-break-inside: avoid; }
+tr:nth-child(even) td { background: #f7faf9; }
+code { font-family: "Noto Sans Mono", "DejaVu Sans Mono", monospace; font-size: .86em;
+       background: #f1f5f4; padding: .05rem .25rem; border-radius: 3px; }
+pre { background: #15202b; color: #e8eef2; padding: .7rem .9rem; border-radius: 6px;
+      overflow: hidden; font-size: .78rem; page-break-inside: avoid; }
+.diagram { text-align: center; margin: 1rem 0 1.2rem; page-break-inside: avoid; }
+.diagram img { max-width: 100%; height: auto; }
+.caption { font-size: .85rem; color: var(--muted); margin-top: .3rem; }
+blockquote { border-left: 4px solid var(--accent); margin: .8rem 0; padding: .2rem .8rem; color: var(--muted); }
+hr { border: 0; border-top: 1px solid var(--line); margin: 1.4rem 0; }
+.title-block { background: linear-gradient(120deg,#0f3d4c,#0b6e4f); color: #fff;
+               padding: 1.2rem 1.4rem; border-radius: 8px; margin-bottom: 1.4rem; }
+.title-block h1 { color: #fff; border: 0; margin: 0 0 .3rem; }
+.title-block p { margin: 0; opacity: .92; }
+.toc-page { page-break-after: always; break-after: page; }
+.toc-page h1 { font-size: 1.55rem; margin: 0 0 .85rem; }
+nav.toc ul { list-style: none; padding: 0; margin: 0; }
+nav.toc > ul > li { margin: .28rem 0 .08rem; font-weight: 650; }
+nav.toc ul ul { padding-left: 1.15rem; }
+nav.toc ul ul li { margin: .04rem 0; font-weight: 400; font-size: .92rem; }
+nav.toc a { color: var(--ink); text-decoration: none; }
+nav.toc a:hover { color: var(--accent); }
+@media print {
+  body { max-width: none; }
+  .toc-page { page-break-after: always; break-after: page; }
+}
+</style></head>
+<body>
+<div class="toc-page">
+<h1>Contents</h1>
+<nav class="toc">
+<ul>
+<li><a href="#0-read-this-first">0. Read this first</a>
+<ul>
+<li><a href="#topology-cheat-sheet">Topology cheat-sheet</a></li>
+</ul>
+</li>
+<li><a href="#1-shared-prerequisites-every-use-case">1. Shared prerequisites (every use case)</a>
+<ul>
+<li><a href="#11-hardware-checklist">1.1 Hardware checklist</a></li>
+<li><a href="#12-first-boot-board">1.2 First boot — board</a></li>
+<li><a href="#13-first-launch-phone">1.3 First launch — phone</a></li>
+<li><a href="#14-cloud-do-this-once-if-you-want-dashboards">1.4 Cloud (do this once if you want dashboards)</a></li>
+<li><a href="#15-where-to-look-three-layers">1.5 Where to look — three layers</a></li>
+</ul>
+</li>
+<li><a href="#2-body-health-measurements">2. Body health measurements</a>
+<ul>
+<li><a href="#21-variant-a-esp32-only-no-watch">2.1 Variant A — ESP32 only (no watch)</a></li>
+<li><a href="#22-variant-b-esp32-mt200-recommended-for-hr-spo2">2.2 Variant B — ESP32 + MT200 (recommended for HR / SpO2)</a></li>
+<li><a href="#23-preparations-body">2.3 Preparations (body)</a></li>
+<li><a href="#24-phone-pipeline-body">2.4 Phone pipeline (body)</a></li>
+<li><a href="#25-metrics-attention-dashboard-raw">2.5 Metrics — attention, dashboard, raw</a></li>
+</ul>
+</li>
+<li><a href="#3-vibration-analysis-machines">3. Vibration analysis (machines)</a>
+<ul>
+<li><a href="#31-what-you-are-actually-measuring">3.1 What you are actually measuring</a></li>
+<li><a href="#32-preparations-vibro">3.2 Preparations (vibro)</a></li>
+<li><a href="#33-phone-pipeline-vibro">3.3 Phone pipeline (vibro)</a></li>
+<li><a href="#34-metrics-attention-dashboard-raw">3.4 Metrics — attention, dashboard, raw</a></li>
+</ul>
+</li>
+<li><a href="#4-other-operator-workflows">4. Other operator workflows</a>
+<ul>
+<li><a href="#41-floor-mounting-calibration">4.1 Floor / mounting calibration</a></li>
+<li><a href="#42-ahrs-orientation-lab">4.2 AHRS / orientation lab</a></li>
+<li><a href="#43-battery-bench">4.3 Battery bench</a></li>
+<li><a href="#44-wifi-wizard-provisioning-only">4.4 WiFi wizard (provisioning only)</a></li>
+<li><a href="#45-ota-app-then-firmware">4.5 OTA (app then firmware)</a></li>
+<li><a href="#46-crash-debug-lab">4.6 Crash debug (lab)</a></li>
+</ul>
+</li>
+<li><a href="#5-topology-deep-dive-faq-of-combinations">5. Topology deep-dive (FAQ of combinations)</a>
+<ul>
+<li><a href="#51-esp32-phone-no-watch">5.1 ESP32 + phone (no watch)</a></li>
+<li><a href="#52-esp32-mt200-phone">5.2 ESP32 + MT200 + phone</a></li>
+<li><a href="#53-mt200-phone-no-esp32">5.3 MT200 + phone (no ESP32)</a></li>
+<li><a href="#54-esp32-mt200-no-phone">5.4 ESP32 + MT200, no phone</a></li>
+<li><a href="#55-two-phones">5.5 Two phones</a></li>
+<li><a href="#56-autopilot-rendezvous-unattended-vibro">5.6 Autopilot / rendezvous (unattended vibro)</a></li>
+</ul>
+</li>
+<li><a href="#6-data-analysis-from-prep-to-output">6. Data analysis — from prep to output</a>
+</li>
+<li><a href="#7-troubleshooting-faq">7. Troubleshooting FAQ</a>
+</li>
+<li><a href="#8-quick-recipes">8. Quick recipes</a>
+</li>
+<li><a href="#9-file-url-index">9. File / URL index</a>
+</li>
+<li><a href="#appendix-acrylic-status-led">Appendix: Acrylic status LED</a>
+</li>
+</ul>
+</nav>
+</div>
+<div class="title-block"><h1>Operator HOW-TO — ESP32-S3 IMU, phone, and MT200</h1>
+</div>
+<p><strong>Audience:</strong> field operator (not firmware developer).</p>
+<p><strong>Kit:</strong> Waveshare <strong>ESP32-S3-LCD-1.47B</strong> (QMI8658 IMU), Android app <strong>ESP32S3 IMU sim</strong>, optional <strong>Veepoo / H-Band MT200</strong> watch, optional cloud <strong>Good Vibes</strong>.</p>
+<p><strong>Firmware on the board:</strong> handshake (<code>handshake v160</code> at the time of writing). BLE name: <code>ESP32S3 IMU sim</code>.</p>
+<p><strong>Cloud (production):</strong> <code>https://apps.f0xx.org/app/good_vibes</code></p>
+<p>This is the complete field FAQ: every supported topology, how to prepare hardware, how to tune the phone pipeline, and where each metric lives (app vs Grafana vs raw files).</p>
+<hr/>
+<h2 id="0-read-this-first">0. Read this first</h2>
+<table>
+<thead><tr><th>Rule</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>The <strong>phone never talks to the MT200</strong>. Only the ESP32 can hold the watch link.</td><td>The watch is <strong>single-LE-link</strong>. H-Band XOR ESP32 XOR a laptop.</td></tr>
+<tr><td>The <strong>ESP32 never talks to Good Vibes by itself</strong> in the current handshake build.</td><td>WiFi STA is compiled <strong>off</strong> (<code>CONFIG_WIFI=n</code>). The phone is the relay.</td></tr>
+<tr><td><strong>Raw IMU samples stay on the BLE link / phone UI.</strong> Cloud stores <strong>verdicts</strong>, <strong>wearable samples</strong>, <strong>spectra (on demand)</strong>, <strong>crashes</strong>, <strong>battery bench</strong>.</td><td>Bandwidth and flash.</td></tr>
+<tr><td>Glue the <strong>board</strong>, not a flying wire to the IMU. The QMI8658 is on the PCB (I2C SDA 48 / SCL 47).</td><td>You measure whatever mechanical path reaches that chip.</td></tr>
+<tr><td>After moving the sensor to a new machine, <strong>re-run the reference wizard</strong>.</td><td>Old “healthy” fingerprints become false ALERTs.</td></tr>
+</tbody></table>
+<h3 id="topology-cheat-sheet">Topology cheat-sheet</h3>
+<table>
+<thead><tr><th>Case</th><th>Hardware</th><th>Our app?</th><th>What you get</th></tr></thead>
+<tbody>
+<tr><td><strong>A</strong> ESP32 + phone</td><td>Board + Android</td><td>Yes</td><td>Live IMU, steps/walk, vibro, AHRS, cloud relay</td></tr>
+<tr><td><strong>B</strong> ESP32 + MT200 + phone</td><td>Board + watch + Android</td><td>Yes</td><td>Case A <strong>plus</strong> HR / SpO2 / steps from the watch, hop RSSI</td></tr>
+<tr><td><strong>C</strong> MT200 + phone only</td><td>Watch + H-Band</td><td><strong>No</strong></td><td>Use the vendor <strong>H Band</strong> app. ESP32S3ImuSim cannot pair the watch.</td></tr>
+<tr><td><strong>D</strong> ESP32 alone</td><td>Board, no phone</td><td>Limited</td><td>LCD scene, RGB LED, local verdicts; <strong>no cloud</strong>, no watch (bridge needs the debug build, still no HTTP)</td></tr>
+<tr><td><strong>E</strong> ESP32 + WiFi (no phone)</td><td>—</td><td><strong>Not current</strong></td><td>Handshake has WiFi <strong>disabled</strong>. Re-enable only with a coexistence-tested firmware.</td></tr>
+</tbody></table>
+<div class="diagram"><img src="howto-assets/howto-d01.png" alt="Pipeline diagram 1"/><div class="caption">Figure 1</div></div>
+<hr/>
+<h2 id="1-shared-prerequisites-every-use-case">1. Shared prerequisites (every use case)</h2>
+<h3 id="11-hardware-checklist">1.1 Hardware checklist</h3>
+<ol><li>Board charged or on USB-C (USB is fine for setup; <strong>unplug USB</strong> for battery-life or vibro-on-machine work).</li><li>Phone: Bluetooth on, location permission allowed (Android BLE scan), notification permission for the foreground relay.</li><li>App installed: package <code>com.esp32s3.imusim</code>. Test phone in this project is BL6000Pro; any Android 8+ works.</li><li>Optional watch: MT200 charged, <strong>H Band force-stopped and Bluetooth disconnected from the watch</strong>. If H-Band holds the link, the ESP32 cannot connect.</li></ol>
+<h3 id="12-first-boot-board">1.2 First boot — board</h3>
+<ol><li>USB-C to a PC if you need a console; otherwise just power the battery.</li><li>LCD should show the handshake scene (horizon / live IMU). Serial (115200) should contain <code>handshake vNN</code>, <code>crash ring ready</code>, <code>BOOT armed (released=1)</code>.</li><li>BLE advertising name: <strong>ESP32S3 IMU sim</strong>.</li><li>Acrylic edge LED (WS2812 on GPIO38) shows setup / arm / fault / battery — see <a href="#appendix-acrylic-status-led">Appendix: Acrylic status LED</a>.</li></ol>
+<h3 id="13-first-launch-phone">1.3 First launch — phone</h3>
+<ol><li>Open <strong>ESP32S3 IMU sim</strong>.</li><li>Grant Bluetooth / nearby devices / notifications when asked.</li><li>Tap <strong>Connect</strong>. Wait until the status line shows connected (not “Disconnected”).</li><li>Leave the app in the background if you want the <strong>autopilot relay</strong> (periodic BLE sync). Foreground gives the live scene.</li></ol>
+<h3 id="14-cloud-do-this-once-if-you-want-dashboards">1.4 Cloud (do this once if you want dashboards)</h3>
+<ol><li><strong>Device… → Cloud</strong>.</li><li>URL: <code>https://apps.f0xx.org/app/good_vibes</code> (default).</li><li>Paste the API key (or <strong>Import from clipboard</strong> / setup link).</li><li>Device ID: leave default or set a stable name per board (Grafana filters on this).</li><li>Group ID: e.g. <code>press-1</code>, <code>body-lab</code>.</li><li><strong>Test connection</strong>, then <strong>Upload now</strong> after you have data.</li><li>Bridge mode: leave <strong>Rendezvous</strong> unless you are lab-debugging (then shorter interval).</li></ol>
+<div class="diagram"><img src="howto-assets/howto-d02.png" alt="Pipeline diagram 2"/><div class="caption">Figure 2</div></div>
+<h3 id="15-where-to-look-three-layers">1.5 Where to look — three layers</h3>
+<table>
+<thead><tr><th>Layer</th><th>What it is</th><th>When to use</th></tr></thead>
+<tbody>
+<tr><td><strong>Phone UI</strong></td><td>Live scene, vibro caption, banners</td><td>Tuning, “is it alive?”</td></tr>
+<tr><td><strong>Good Vibes web</strong></td><td><code>…/app/good_vibes/</code> verdicts; <code>…/wearable</code> live HR/steps</td><td>Shift overview, CSV/TSV export</td></tr>
+<tr><td><strong>Grafana</strong></td><td>Verdicts, wearable, crashes, battery bench</td><td>Trends, lag, RSSI, edge features</td></tr>
+</tbody></table>
+<p>Production Grafana (behind the same host): <code>https://apps.f0xx.org/app/good_vibes/grafana/</code></p>
+<table>
+<thead><tr><th>Dashboard</th><th>UID</th><th>Use</th></tr></thead>
+<tbody>
+<tr><td>ESP32 IMU Verdicts</td><td><code>imu-verdicts</code></td><td>RMS, corr, bands, edge, battery, ingest lag</td></tr>
+<tr><td>Wearable (MT200)</td><td><code>imu-wearable</code></td><td>HR, SpO2, steps, walk_cm, hop RSSI, silent gaps</td></tr>
+<tr><td>ESP32 IMU Crashes</td><td><code>imu-crashes</code></td><td>Fault ring uploads</td></tr>
+<tr><td>Battery bench</td><td><code>imu-battery-bench</code></td><td>Discharge sessions</td></tr>
+</tbody></table>
+<hr/>
+<h2 id="2-body-health-measurements">2. Body health measurements</h2>
+<p>Two hardware variants. Software path is the same on the phone; the watch only adds PPG / step counter samples.</p>
+<h3 id="21-variant-a-esp32-only-no-watch">2.1 Variant A — ESP32 only (no watch)</h3>
+<p><strong>What the board measures:</strong> 6-axis IMU (accel + gyro). Firmware derives <strong>walk distance / steps-like walk_cm</strong>, attitude, and live scene. There is <strong>no optical HR or SpO2</strong> on the ESP32.</p>
+<p><strong>What you watch for:</strong> motion, gait/walk_cm, orientation, battery, chip temperature.</p>
+<h3 id="22-variant-b-esp32-mt200-recommended-for-hr-spo2">2.2 Variant B — ESP32 + MT200 (recommended for HR / SpO2)</h3>
+<p><strong>What the watch measures:</strong> heart rate, SpO2, on-watch step counter, watch battery.</p>
+<p><strong>What the ESP32 adds:</strong> IMU walk_cm, BLE RSSI of the watch hop, relay to the phone.</p>
+<p><strong>Hard rules</strong></p>
+<ul><li>Wear the watch <strong>snug, optical window on skin</strong>. Table / no contact → HR stays <code>0</code> for ~30 s then still 0 (not a firmware bug).</li><li>HR lock takes <strong>~30 s</strong> on-wrist (<code>D0</code> frames). SpO2 is <strong>mutually exclusive with HR</strong> (shared PPG). Firmware cycles them; do not expect both at 1 Hz.</li><li><strong>Quit H Band</strong> completely before powering the ESP32 bridge.</li><li>Wrist RSSI is often −70 dBm on a table and −80…−86 dBm on-wrist. First connect can fail with RF noise; the bridge retries.</li></ul>
+<p>Current handshake merges crash-debug extras by default (<code>CRASH_DEBUG=1</code>), which <strong>includes the MT200 central bridge</strong> and autostart after BLE is up.</p>
+<div class="diagram"><img src="howto-assets/howto-d03.png" alt="Pipeline diagram 3"/><div class="caption">Figure 3</div></div>
+<h3 id="23-preparations-body">2.3 Preparations (body)</h3>
+<ol><li>Charge board + watch. Confirm LCD alive.</li><li>Strap the board so the <strong>IMU chip side</strong> is toward the body segment you care about (waist / ankle / chest pack). Avoid a floppy lanyard — the QMI8658 will report strap bounce as motion.</li><li>Optional: <strong>Device… → Floor level calibration</strong> on a known-level table if you care about tilt, not if the board is worn loosely.</li><li>Phone: Connect BLE.</li><li><strong>Device… → Profile wizard</strong> → <strong>Body sensor (computed)</strong> (live IMU + steps, performance power) <strong>or</strong> <strong>Body sensor (scene mirror)</strong> if you want the LCD/scene mode mirrored.</li><li>Cloud as in §1.4. Group ID e.g. <code>body</code>.</li><li>For watch: put MT200 on wrist, kill H-Band, wait ~1 min after ESP boot for HR lock.</li></ol>
+<h3 id="24-phone-pipeline-body">2.4 Phone pipeline (body)</h3>
+<table>
+<thead><tr><th>Step</th><th>Menu / control</th><th>Setting</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Main <strong>Connect</strong></td><td>Stay connected or rely on autopilot</td></tr>
+<tr><td>2</td><td>Mode chips</td><td><strong>Computed IMU</strong> for gait/steps; <strong>Angles / scene</strong> to watch the LCD horizon</td></tr>
+<tr><td>3</td><td>Profile wizard</td><td>Body computed / body scene</td></tr>
+<tr><td>4</td><td>Cloud</td><td>Enabled, device_id unique per wearer or per board</td></tr>
+<tr><td>5</td><td>Do <strong>not</strong> open Vibro reference wizard</td><td>That path is for machines</td></tr>
+<tr><td>6</td><td>Optional <strong>AHRS live view</strong></td><td>Full CPU 240 MHz + 100 Hz IMU — <strong>not</strong> a battery saver; yaw drifts (no magnetometer)</td></tr>
+</tbody></table>
+<h3 id="25-metrics-attention-dashboard-raw">2.5 Metrics — attention, dashboard, raw</h3>
+<table>
+<thead><tr><th>Metric</th><th>Meaning</th><th>Healthy-ish</th><th>Phone</th><th>Dashboard</th><th>Raw</th></tr></thead>
+<tbody>
+<tr><td>HR</td><td>Optical bpm</td><td>40–180 locked; 0 = no lock</td><td>Wearable live page after upload</td><td>Grafana <strong>Wearable</strong></td><td><code>wearable_samples</code> kind=<code>hr</code></td></tr>
+<tr><td>SpO2</td><td>%</td><td>95–100 on-wrist; <code>1</code> on wire = wear fail, not 1%</td><td>Wearable page</td><td>Grafana Wearable</td><td>kind=<code>spo2</code></td></tr>
+<tr><td>Watch steps</td><td>Watch pedometer</td><td>Monotonic during walk</td><td>Wearable page</td><td>Grafana Wearable</td><td>kind=<code>steps</code></td></tr>
+<tr><td>IMU <code>walk_cm</code></td><td>Board integrated walk</td><td>Rises when the <strong>board</strong> moves</td><td>STATUS / wearable page</td><td>Grafana Wearable (compare vs watch steps)</td><td>kind=<code>walk_cm</code></td></tr>
+<tr><td>ESP↔phone RSSI</td><td>Phone-measured</td><td>Roughly −40…−80 indoor</td><td>STATUS</td><td>Wearable RSSI panels</td><td>ingest rssi fields</td></tr>
+<tr><td>MT200↔ESP RSSI</td><td>ESP-measured</td><td>−70 table, worse on wrist; −127 = N/A</td><td>STATUS</td><td>Wearable hop RSSI</td><td><code>mt200</code> rssi</td></tr>
+<tr><td>Battery % / V</td><td>Board LiPo</td><td>Trend down off USB</td><td>Main caption</td><td>Verdicts + wearable</td><td>STATUS <code>pct</code>,<code>v</code></td></tr>
+<tr><td>Chip temp</td><td>SoC</td><td>Rises in AHRS / sun</td><td>STATUS</td><td>Verdicts</td><td><code>tc</code></td></tr>
+</tbody></table>
+<p><strong>Do not</strong> treat IMU walk_cm and watch steps as the same counter. They disagree on purpose (different sensors). Use them as a <strong>cross-check</strong>: watch steps up + walk_cm flat ⇒ board isn’t on the walking limb.</p>
+<p><strong>Live web:</strong> <code>https://apps.f0xx.org/app/good_vibes/wearable</code></p>
+<p><strong>CSV:</strong> Good Vibes <strong>Download CSV</strong> / Copy TSV (delivery lag included on new ingest).</p>
+<hr/>
+<h2 id="3-vibration-analysis-machines">3. Vibration analysis (machines)</h2>
+<p>This is the industrial path: edge FFT / band RMS <strong>on the ESP32</strong>, phone as relay, cloud verdicts.</p>
+<h3 id="31-what-you-are-actually-measuring">3.1 What you are actually measuring</h3>
+<p>The QMI8658 sits on the <strong>PCB</strong>, near the I2C header (SDA GPIO48, SCL GPIO47). You are <strong>not</strong> measuring a bearing race directly unless the mechanical path is stiff.</p>
+<div class="diagram"><img src="howto-assets/howto-d04.png" alt="Pipeline diagram 4"/><div class="caption">Figure 4</div></div>
+<table>
+<thead><tr><th>Target</th><th>Where to glue / clamp</th><th>Axis hint</th></tr></thead>
+<tbody>
+<tr><td><strong>Rolling bearing (radial)</strong></td><td>Bearing housing, load zone if known; else drive-end cap</td><td>Radial = across shaft; keep board flat on housing</td></tr>
+<tr><td><strong>Thrust / axial</strong></td><td>Housing face along shaft centreline</td><td>IMU X/Y in the plane of the board; note which way the USB points and <strong>write it on the machine</strong></td></tr>
+<tr><td><strong>Rotor unbalance</strong></td><td>Rigid housing, <strong>not</strong> a guard sheet-metal</td><td>Same as radial bearing</td></tr>
+<tr><td><strong>Stator / frame</strong></td><td>Motor foot or stator yoke, away from cooling fans that flap</td><td>Often lower frequency; use <strong>Low RPM</strong> or <strong>Ultra-low RPM</strong> preset</td></tr>
+<tr><td><strong>Gearbox</strong></td><td>Split line or bearing cap, not the inspection cover</td><td></td></tr>
+<tr><td><strong>Pump / fan</strong></td><td>Pump volute or fan pillow block</td><td>Prefer <strong>Intermittent</strong> if the machine is not 24/7</td></tr>
+</tbody></table>
+<p><strong>Mounting rules</strong></p>
+<ol><li><strong>Stiff path:</strong> cyanoacrylate on a cleaned paint-free pad, or a strong magnet on a steel housing. Foam tape is for demos only (it low-pass-filters).</li><li><strong>One orientation forever</strong> after the reference wizard. Rotating the board 90° invalidates fingerprints.</li><li><strong>Do not</strong> mount on a vibrating cable tray or the plastic LCD bezel as the only contact — couple the <strong>back of the PCB / metal can</strong> to the machine.</li><li>LCD can face out for a glance; the IMU still needs the stiff path.</li><li>Keep USB cable off the machine while capturing (cable slap looks like an ALERT).</li></ol>
+<h3 id="32-preparations-vibro">3.2 Preparations (vibro)</h3>
+<ol><li>Machine in <strong>normal idle / normal production</strong> — not a crash-stop, not a cold start unless that *is* the reference.</li><li>Glue/clamp as above. Mark USB direction with a paint pen.</li><li>Phone BLE connect. Unplug USB from the board if you care about battery schedule / deep sleep.</li><li><strong>Device… → Profile wizard</strong> — pick a vibro preset (table below).</li><li><strong>Vibro… → Reference wizard</strong> on <strong>this</strong> mounting. Confirm erase if the sensor moved.</li><li>Cloud group_id = machine name. Device ID = this board.</li></ol>
+<h3 id="33-phone-pipeline-vibro">3.3 Phone pipeline (vibro)</h3>
+<div class="diagram"><img src="howto-assets/howto-d05.png" alt="Pipeline diagram 5"/><div class="caption">Figure 5</div></div>
+<table>
+<thead><tr><th>Preset (Profile wizard)</th><th>When</th><th>Capture idea</th></tr></thead>
+<tbody>
+<tr><td><strong>Vibro: normal</strong></td><td>Typical 50/60 Hz machines, continuous</td><td>~15 s window / 60 s interval, 100 Hz IMU</td></tr>
+<tr><td><strong>Vibro: low RPM diagnosis</strong></td><td>Slow shafts, more time per rev</td><td>30 s / 120 s, 50 Hz</td></tr>
+<tr><td><strong>Vibro: ultra-low RPM</strong></td><td>Very slow / high inertia</td><td>60 s / 5 min, 25 Hz</td></tr>
+<tr><td><strong>Vibro: intermittent machine</strong></td><td>Starts/stops; save battery</td><td>Hourly random slot, deep sleep, mix windows</td></tr>
+<tr><td><strong>Vibro: machine monitor (mix)</strong></td><td>Unattended monitor</td><td>Intermittent + mix/dyn sub-windows</td></tr>
+</tbody></table>
+<p>Then:</p>
+<ol><li><strong>Vibro… → Reference wizard…</strong></li></ol>
+<p>- Erase slots if this is a new machine.</p>
+<p>- Choose 1–5 references (3 is a good default).</p>
+<p>- Each take: <strong>normal idle vibration ~12 s</strong>, hold still relative to the housing (you are not “shaking” a turbine).</p>
+<p>- <strong>Upload &amp; finish</strong>.</p>
+<ol><li><strong>Vibro… → Vibro mode</strong> to switch diagnosis tier later without the full wizard.</li><li><strong>Vibro… → Capture mix…</strong> (expert) only if you know mix/dyn ratios.</li><li><strong>Vibro… → FFT analyze</strong> switches the ESP to <strong>Raw IMU</strong>, collects a burst, uploads a 128-bin spectrum. Use when Grafana verdicts look wrong and you want a picture of the line.</li><li><strong>Vibro… → Verdict history</strong> — last on-phone levels without opening Grafana.</li></ol>
+<p>Acrylic LED (GPIO38): <strong>red</strong> solid on WARN/ALERT (and other NOK); <strong>off</strong> when armed and healthy. Colour chart: <a href="#appendix-acrylic-status-led">Appendix: Acrylic status LED</a>.</p>
+<h3 id="34-metrics-attention-dashboard-raw">3.4 Metrics — attention, dashboard, raw</h3>
+<table>
+<thead><tr><th>Metric</th><th>Meaning</th><th>Attention</th><th>Phone</th><th>Dashboard</th><th>Raw</th></tr></thead>
+<tbody>
+<tr><td><code>vd</code> level</td><td>0 OK, 1 WARN, 2 ALERT</td><td>ALERT after a good reference ⇒ process change or loose mount</td><td>Vibro caption</td><td>Grafana <strong>Verdicts</strong></td><td><code>verdicts.level</code></td></tr>
+<tr><td><code>vrms</code> / <code>vpeak</code></td><td>Time-domain energy</td><td>Step change after maintenance</td><td>Caption</td><td>Verdicts RMS panel</td><td>columns</td></tr>
+<tr><td><code>vcorr</code> / <code>bcorr</code></td><td>Similarity to reference</td><td>Drop ⇒ spectral shape changed</td><td>Caption</td><td>band_corr panel</td><td><code>raw_json</code></td></tr>
+<tr><td><code>bdmax</code></td><td>Worst band delta</td><td>Which band moved</td><td>Caption</td><td>band_delta_max</td><td><code>raw_json</code></td></tr>
+<tr><td><code>bnd[]</code> / <code>b16[]</code></td><td>4 band RMS</td><td>Compare to ref bands</td><td>—</td><td>band time series</td><td><code>raw_json.bands</code></td></tr>
+<tr><td><code>cr</code> crest</td><td>Peakiness</td><td>Impacts, looseness</td><td>Caption</td><td>edge_crest</td><td><code>raw_json</code></td></tr>
+<tr><td><code>zcr</code></td><td>Zero-crossing rate</td><td>High-frequency hash</td><td>Caption</td><td>edge_zcr_hz</td><td><code>raw_json</code></td></tr>
+<tr><td><code>hfr</code></td><td>High-frequency ratio</td><td>Bearing-ish vs 1× running speed</td><td>Caption</td><td>edge_hf_ratio</td><td><code>raw_json</code></td></tr>
+<tr><td><code>edge_score</code> / <code>edge_risk</code></td><td><strong>Server</strong> heuristic</td><td>Trend, not a trip</td><td>—</td><td>Verdicts</td><td>computed on ingest</td></tr>
+<tr><td>Spectrum bins</td><td>Phone FFT of RAW</td><td>“What frequency?”</td><td>FFT toast</td><td>(API spectra)</td><td><code>POST /v1/ingest/spectra</code></td></tr>
+<tr><td>LED</td><td>Local</td><td>Red = act now</td><td>Eyes</td><td>—</td><td>—</td></tr>
+</tbody></table>
+<p><strong>Live web:</strong> <code>https://apps.f0xx.org/app/good_vibes/</code></p>
+<p><strong>Do not</strong> stare at live RAW IMU in Grafana — it is not stored. Use FFT upload or the phone scene.</p>
+<p><strong>False ALERT checklist:</strong> loose glue, USB cable, reference taken while the machine was off, board rotated, nearby hammering, deep-sleep preset on a machine that should be continuous.</p>
+<hr/>
+<h2 id="4-other-operator-workflows">4. Other operator workflows</h2>
+<h3 id="41-floor-mounting-calibration">4.1 Floor / mounting calibration</h3>
+<p><strong>Device… → Floor level calibration…</strong></p>
+<ul><li>Purpose: persistent tilt correction vs a <strong>true level</strong> (bubble). Not a vibration reference.</li><li>Place board on a known-flat surface, still, <strong>Start</strong>.</li><li>Clear if you remount at a new angle.</li></ul>
+<h3 id="42-ahrs-orientation-lab">4.2 AHRS / orientation lab</h3>
+<p><strong>Device… → AHRS live view (full speed)…</strong></p>
+<ul><li>Complementary filter, gyro+accel, <strong>no magnetometer</strong> → yaw drifts.</li><li>Forces 240 MHz + 100 Hz. Leave the screen to restore Auto.</li><li>3D debug page on the backend: <code>ahrs.html</code> (lab).</li></ul>
+<h3 id="43-battery-bench">4.3 Battery bench</h3>
+<p><strong>Device… → Battery bench…</strong></p>
+<ul><li>Unplug USB. Start. Config locks until Stop.</li><li>Samples upload when cloud is on. Grafana <strong>Battery bench</strong>.</li></ul>
+<h3 id="44-wifi-wizard-provisioning-only">4.4 WiFi wizard (provisioning only)</h3>
+<p><strong>Device… → WiFi wizard</strong> still talks <strong>over BLE</strong>. Handshake <strong>does not bring WiFi STA up</strong> in the current <code>prj.conf</code>. Use it only if you are on a firmware that re-enabled WiFi. Hotspot fallback (when implemented on that build): <code>ESP32-IMU-Setup</code> / <code>imu12345</code> → <code>http://192.168.4.1</code>.</p>
+<h3 id="45-ota-app-then-firmware">4.5 OTA (app then firmware)</h3>
+<ol><li>Phone and board connected (or autopilot will pick up later).</li><li><strong>Device… → Check for OTA</strong>.</li><li><strong>APK first</strong>, then firmware. The phone refuses FW OTA if the app is too old (<code>min_apk_versionCode</code>).</li><li>USB <code>flash-zephyr.sh handshake</code> remains the recovery path if BLE OTA fails.</li></ol>
+<h3 id="46-crash-debug-lab">4.6 Crash debug (lab)</h3>
+<p><strong>Device… → Crash debug (dev)…</strong> only on builds with <code>dbg=1</code>. Injects a fault; relay uploads the crash ring. Grafana <strong>Crashes</strong>. Do not use on a production machine capture.</p>
+<hr/>
+<h2 id="5-topology-deep-dive-faq-of-combinations">5. Topology deep-dive (FAQ of combinations)</h2>
+<h3 id="51-esp32-phone-no-watch">5.1 ESP32 + phone (no watch)</h3>
+<div class="diagram"><img src="howto-assets/howto-d06.png" alt="Pipeline diagram 6"/><div class="caption">Figure 6</div></div>
+<p><strong>Use:</strong> body IMU, vibration, AHRS, battery bench.</p>
+<p><strong>You will not see:</strong> HR, SpO2, watch steps. Wearable page may still show <code>walk_cm</code> from the IMU.</p>
+<h3 id="52-esp32-mt200-phone">5.2 ESP32 + MT200 + phone</h3>
+<div class="diagram"><img src="howto-assets/howto-d07.png" alt="Pipeline diagram 7"/><div class="caption">Figure 7</div></div>
+<p><strong>Use:</strong> body health with optical sensors <strong>and</strong> optional vibro if the board is also on a machine (unusual — pick one mounting).</p>
+<p><strong>Setup extra:</strong> H-Band off; wait for HR lock; compare watch steps vs <code>walk_cm</code>.</p>
+<h3 id="53-mt200-phone-no-esp32">5.3 MT200 + phone (no ESP32)</h3>
+<p><strong>Not supported by ESP32S3 IMU sim.</strong> Use <strong>H Band</strong>. Our cloud never sees those samples unless some other bridge exists.</p>
+<h3 id="54-esp32-mt200-no-phone">5.4 ESP32 + MT200, no phone</h3>
+<p>Watch samples sit in ESP RAM/STATUS only. <strong>No Good Vibes</strong>. LCD will not show a medical dashboard. Bring a phone for ingest.</p>
+<h3 id="55-two-phones">5.5 Two phones</h3>
+<p>Only one BLE central should hold the ESP32. A second phone can open Good Vibes in a browser (cloud), not a second BLE connection.</p>
+<h3 id="56-autopilot-rendezvous-unattended-vibro">5.6 Autopilot / rendezvous (unattended vibro)</h3>
+<p>Phone in a locker near the machine:</p>
+<ol><li>Cloud on, bridge <strong>Rendezvous</strong>.</li><li>Intermittent / machine-monitor preset so the ESP sleeps between windows.</li><li>Phone must stay powered and in BLE range. WorkManager uploads when the WAN is up.</li></ol>
+<div class="diagram"><img src="howto-assets/howto-d08.png" alt="Pipeline diagram 8"/><div class="caption">Figure 8</div></div>
+<hr/>
+<h2 id="6-data-analysis-from-prep-to-output">6. Data analysis — from prep to output</h2>
+<div class="diagram"><img src="howto-assets/howto-d09.png" alt="Pipeline diagram 9"/><div class="caption">Figure 9</div></div>
+<p><strong>Recommended daily loop</strong></p>
+<ol><li>Grafana Wearable or Verdicts — last 24 h, look for <strong>holes</strong> (relay down) vs <strong>ALERT clusters</strong> (real process).</li><li>Good Vibes table — CSV if you need Sheets.</li><li>Phone only when Grafana is ambiguous (FFT, ref wizard, LED).</li></ol>
+<p><strong>Export:</strong> Good Vibes <strong>Download CSV</strong> joins wearable + telemetry + verdicts + ingest batches (<code>lag_ms</code>, RSSI, bytes). Historical rows may have empty <code>delivered_at</code> until new ingest.</p>
+<hr/>
+<h2 id="7-troubleshooting-faq">7. Troubleshooting FAQ</h2>
+<p><strong>Connect button does nothing / scan empty</strong></p>
+<p>Bluetooth + location permission; board advertising; another phone already connected.</p>
+<p><strong>Connected but no IMU</strong></p>
+<p>Wait 2 s for CCC; reboot board; confirm handshake not <code>smoke</code> firmware (<code>WS147B-Zephyr</code> is smoke-only).</p>
+<p><strong>Watch never locks HR</strong></p>
+<p>H-Band still connected; watch not on skin; wait 30+ s; RSSI −90 or −127; crash-debug/MT200 not in this image (<code>CRASH_DEBUG=0</code>).</p>
+<p><strong>SpO2 is 1%</strong></p>
+<p>Wear-fail flag, not saturation. Tighten strap. Stop expecting HR in the same second.</p>
+<p><strong>ALERT with a quiet machine</strong></p>
+<p>Bad or empty references; mount loose; USB cable; board moved. Re-wizard.</p>
+<p><strong>Grafana empty, phone live</strong></p>
+<p>Cloud key/URL; <strong>Upload now</strong>; WAN; device_id mismatch vs Grafana variable.</p>
+<p><strong>Two data holes: wearable vs verdicts</strong></p>
+<p>Different pipelines. Wearable is fire-and-forget; verdicts retry via JSONL. A quiet STATUS does not mean the watch ingest died.</p>
+<p><strong>OTA offered forever</strong></p>
+<p>Phone APK still older than manifest <code>min_apk_versionCode</code>, or FW_VERSION_CODE not bumped on the image you flashed.</p>
+<p><strong>Cast builder vs IMU builder (lab)</strong></p>
+<p>Android Cast and IMU are <strong>separate tenants</strong>. IMU jobs must show project <code>imu</code>, containers <code>imu-bld-*</code> / <code>imu-zephyr-bld-*</code>, channel <code>imu</code>. Never <code>androidcast-bld-*</code>, never Cast OTA version <code>00.01.00.xxxx</code>. See <code>ci/cast/README.md</code>.</p>
+<p><strong>What does the acrylic LED colour mean? (board status / readiness)</strong></p>
+<p>Single WS2812 on GPIO38. ✓ = that RGB channel is on. Empty = off. <code>*reserved*</code> = that colour combo is not wired. Flash is 2 s on / 2 s off. Healthy armed run is <strong>off</strong>. Full date/FW wiring: <a href="#appendix-acrylic-status-led">Appendix: Acrylic status LED</a>.</p>
+<table>
+<thead><tr><th>Condition</th><th>R</th><th>G</th><th>B</th></tr></thead>
+<tbody>
+<tr><td>Setup — no reference profiles (solid blue)</td><td></td><td></td><td>✓</td></tr>
+<tr><td>Await arm — refs recorded, not started (blue flash 2s/2s)</td><td></td><td></td><td>✓</td></tr>
+<tr><td>OK pulse — NVS/config saved (~2 s solid blue)</td><td></td><td></td><td>✓</td></tr>
+<tr><td>NOK — WARN/ALERT or armed without loaded ref (solid red)</td><td>✓</td><td></td><td></td></tr>
+<tr><td>Battery ≤10% SOC on battery, not USB/DC (yellow flash 2s/2s)</td><td>✓</td><td>✓</td><td></td></tr>
+<tr><td>Operational — armed, refs OK, no fault (off)</td><td></td><td></td><td></td></tr>
+<tr><td>Green only</td><td>*reserved*</td><td>*reserved*</td><td>*reserved*</td></tr>
+<tr><td>Magenta (R+B)</td><td>*reserved*</td><td>*reserved*</td><td>*reserved*</td></tr>
+<tr><td>Cyan (G+B)</td><td>*reserved*</td><td>*reserved*</td><td>*reserved*</td></tr>
+<tr><td>White (R+G+B)</td><td>*reserved*</td><td>*reserved*</td><td>*reserved*</td></tr>
+</tbody></table>
+<hr/>
+<h2 id="8-quick-recipes">8. Quick recipes</h2>
+<p><strong>Body + watch, 10 minutes</strong></p>
+<p>Kill H-Band → power ESP → Connect phone → Profile <strong>Body sensor (computed)</strong> → Cloud on → wear watch → wait for HR → open <code>/wearable</code>.</p>
+<p><strong>New pump, 20 minutes</strong></p>
+<p>Glue on bearing cap → Connect → Profile <strong>Vibro: normal</strong> → Reference wizard ×3 at idle → Cloud group <code>pump-7</code> → confirm LED <strong>off</strong> after arm (healthy run) → Grafana Verdicts.</p>
+<p><strong>Overnight unattended</strong></p>
+<p>Intermittent or machine-monitor preset → Rendezvous bridge → phone plugged in BLE range → morning Grafana + CSV.</p>
+<hr/>
+<h2 id="9-file-url-index">9. File / URL index</h2>
+<table>
+<thead><tr><th>Thing</th><th>Where</th></tr></thead>
+<tbody>
+<tr><td>App package</td><td><code>com.esp32s3.imusim</code></td></tr>
+<tr><td>BLE name</td><td><code>ESP32S3 IMU sim</code></td></tr>
+<tr><td>Cloud</td><td><code>https://apps.f0xx.org/app/good_vibes</code></td></tr>
+<tr><td>Wearable UI</td><td><code>…/wearable</code></td></tr>
+<tr><td>Grafana</td><td><code>…/grafana/</code></td></tr>
+<tr><td>Phone queue</td><td>app files <code>offload/verdicts.jsonl</code> (+ gzip)</td></tr>
+<tr><td>Firmware flash</td><td><code>zephyr/scripts/flash-zephyr.sh handshake</code></td></tr>
+<tr><td>Acrylic LED colours</td><td><a href="#appendix-acrylic-status-led">Appendix: Acrylic status LED</a></td></tr>
+<tr><td>MT200 protocol notes</td><td><a href="veepoo-proto-ble-reverse.md">veepoo-proto-ble-reverse.md</a></td></tr>
+<tr><td>Metrics schema</td><td><a href="metrics.md">metrics.md</a></td></tr>
+<tr><td>Architecture</td><td><a href="architecture.md">architecture.md</a></td></tr>
+</tbody></table>
+<hr/>
+<h2 id="appendix-acrylic-status-led">Appendix: Acrylic status LED</h2>
+<p><strong>Wired:</strong> 2026-08-23 (handshake <code>vibro_led.c</code> schema in commit <code>7de0208</code>).</p>
+<p><strong>Firmware:</strong> <code>handshake v160</code> (<code>FW_VERSION_NAME</code> / <code>FW_VERSION_CODE</code> 160 in <code>zephyr/app/common/fw_version.h</code>).</p>
+<p>The red acrylic edge light is a <strong>single WS2812</strong> pixel on <strong>GPIO38</strong> (GRB wire order). Channel drive is 48/255 when on. Handshake turns the pixel <strong>off</strong> at boot, then <code>vibro_led</code> owns it for the rest of the run. The diffuser is red: a firmware <strong>green</strong> channel looks red through the plastic, so the “OK pulse” is driven as <strong>blue</strong>, not green.</p>
+<p><strong>Solid vs flash.</strong> Solid means the channel stays on. Flash is 2 s on / 2 s off (<code>LED_FLASH_PERIOD_MS</code> 4000, <code>LED_FLASH_ON_MS</code> 2000). The OK pulse is a <strong>solid ~2 s</strong> burst (<code>LED_OK_PULSE_MS</code>), then the base state returns. Flash off-phases look the same as operational off.</p>
+<p><strong>Priority</strong> (first match wins): OK pulse → battery critical → setup (no refs) → await arm → NOK → off.</p>
+<p>✓ = that RGB channel is driven for the condition. Empty = channel off. <code>*reserved*</code> = that colour combo is <strong>not wired</strong> in this firmware.</p>
+<table>
+<thead><tr><th>Condition</th><th>R</th><th>G</th><th>B</th></tr></thead>
+<tbody>
+<tr><td>Setup — no reference profiles in flash (solid blue)</td><td></td><td></td><td>✓</td></tr>
+<tr><td>Await arm — refs recorded, not started / CMD 10 (blue flash 2s/2s)</td><td></td><td></td><td>✓</td></tr>
+<tr><td>OK pulse — NVS / config saved (~2 s solid blue)</td><td></td><td></td><td>✓</td></tr>
+<tr><td>NOK — verdict WARN/ALERT, or armed without a loaded reference (solid red)</td><td>✓</td><td></td><td></td></tr>
+<tr><td>Battery critical — ≤10% SOC <strong>and</strong> on battery, not USB/DC (yellow flash 2s/2s)</td><td>✓</td><td>✓</td><td></td></tr>
+<tr><td>Operational — armed, refs OK, no active fault (off)</td><td></td><td></td><td></td></tr>
+<tr><td>Green only</td><td>*reserved*</td><td>*reserved*</td><td>*reserved*</td></tr>
+<tr><td>Magenta (R+B)</td><td>*reserved*</td><td>*reserved*</td><td>*reserved*</td></tr>
+<tr><td>Cyan (G+B)</td><td>*reserved*</td><td>*reserved*</td><td>*reserved*</td></tr>
+<tr><td>White (R+G+B)</td><td>*reserved*</td><td>*reserved*</td><td>*reserved*</td></tr>
+</tbody></table>
+<p><strong>Not a colour in this table.</strong> BLE advertising, BLE connected, charging / on USB, OTA, crash, MT200 watch link, and WiFi do <strong>not</strong> set the acrylic LED. Charging specifically suppresses the yellow battery flash (<code>on_dc</code> → not critical). Smoke firmware (<code>WS147B-Zephyr</code>) only turns the pixel off; it does not use this schema.</p>
+</body></html>

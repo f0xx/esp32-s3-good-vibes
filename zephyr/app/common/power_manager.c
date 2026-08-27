@@ -20,6 +20,9 @@
 
 LOG_MODULE_REGISTER(power_mgr, LOG_LEVEL_INF);
 
+/** After screen-on while BLE is connected, cap CPU/render briefly to avoid VHCI races. */
+#define SCREEN_BLE_RAMP_MS 4000
+
 static const struct device *g_display;
 static struct device_config_v1 g_cfg;
 static bool g_screen_on = true;
@@ -31,6 +34,7 @@ static bool (*g_panel_hw_fn)(bool on);
 static bool g_cpu_apply_pending;
 static bool g_cpu_ready;
 static bool g_ble_active;
+static int64_t g_screen_ble_ramp_until;
 static bool g_bt_controller_on;
 static bool (*g_display_busy_query)(void);
 static void (*g_imu_reschedule)(void);
@@ -50,6 +54,7 @@ static uint8_t g_cpu_mhz_override;
 static uint8_t g_imu_hz_override;
 static uint8_t g_cpu_desired_mhz = 240;
 static bool g_cpu_ble_clamped;
+static bool g_bench_lock;
 
 static uint8_t clamp_cpu_mhz(uint8_t mhz)
 {
@@ -275,6 +280,10 @@ static void apply_screen_off_idle_tiers(uint8_t *target_cpu, uint8_t *imu_hz)
  */
 static void apply_rates(void)
 {
+	if (g_bench_lock) {
+		return;
+	}
+
 	const struct battery_state *bat = battery_monitor_state();
 	const bool on_dc = (bat == NULL || !bat->valid) ? true : bat->on_dc;
 	uint8_t target_cpu;
@@ -330,6 +339,16 @@ static void apply_rates(void)
 	}
 	if (g_imu_hz_override != 0U) {
 		imu_hz = g_imu_hz_override;
+	}
+
+	if (g_screen_on && g_ble_active && g_screen_ble_ramp_until > 0 &&
+	    k_uptime_get() < g_screen_ble_ramp_until) {
+		if (target_cpu > OPMODE_CPU_MHZ_DEMO_BAT) {
+			target_cpu = OPMODE_CPU_MHZ_DEMO_BAT;
+		}
+		if (render_hz > (RENDER_HZ_DEFAULT / 4U)) {
+			render_hz = (uint8_t)(RENDER_HZ_DEFAULT / 4U);
+		}
 	}
 
 	/*
@@ -396,8 +415,28 @@ void power_manager_set_bt_controller_on(bool on)
 	apply_rates();
 }
 
+bool power_manager_bench_locked(void)
+{
+	return g_bench_lock;
+}
+
+void power_manager_set_bench_lock(bool lock)
+{
+	if (g_bench_lock == lock) {
+		return;
+	}
+	g_bench_lock = lock;
+	if (!lock) {
+		apply_rates();
+	}
+	LOG_INF("bench lock -> %s", lock ? "ON" : "OFF");
+}
+
 void power_manager_set_cpu_mhz_override(uint8_t mhz)
 {
+	if (g_bench_lock) {
+		return;
+	}
 	if (g_cpu_mhz_override == mhz) {
 		return;
 	}
@@ -415,6 +454,9 @@ uint8_t power_manager_cpu_mhz_override(void)
 
 void power_manager_set_imu_hz_override(uint8_t hz)
 {
+	if (g_bench_lock) {
+		return;
+	}
 	if (g_imu_hz_override == hz) {
 		return;
 	}
@@ -475,6 +517,9 @@ bool power_manager_staging_mode(void)
 
 void power_manager_toggle_mode(void)
 {
+	if (g_bench_lock) {
+		return;
+	}
 	g_staging_mode = !g_staging_mode;
 	device_config_set_staging_mode(g_staging_mode);
 	apply_rates();
@@ -494,6 +539,9 @@ void power_manager_mark_ready(void)
 
 void power_manager_on_screen(bool on)
 {
+	if (g_bench_lock) {
+		return;
+	}
 	if (g_screen_on == on) {
 		return;
 	}
@@ -506,6 +554,11 @@ void power_manager_on_screen(bool on)
 	}
 
 	g_screen_on = on;
+	if (on && g_ble_active) {
+		g_screen_ble_ramp_until = k_uptime_get() + (int64_t)SCREEN_BLE_RAMP_MS;
+	} else if (!on) {
+		g_screen_ble_ramp_until = 0;
+	}
 	device_config_set_user_screen(on);
 	battery_monitor_settle(1500U);
 	apply_rates();
@@ -544,6 +597,14 @@ void power_manager_tick(void)
 	}
 
 	apply_cpu_deferred();
+
+	if (g_screen_ble_ramp_until > 0 && k_uptime_get() >= g_screen_ble_ramp_until) {
+		g_screen_ble_ramp_until = 0;
+		apply_rates();
+		if (g_imu_reschedule != NULL) {
+			g_imu_reschedule();
+		}
+	}
 
 	/* Reapply runs regardless of g_screen_on now — panel_backlight_reapply() re-asserts
 	 * whichever duty (on-percent or zero) matches the current g_on state, guarding against

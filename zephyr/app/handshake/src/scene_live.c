@@ -3,6 +3,7 @@
  * drawWalkOverlay (Arduino production loop @ 30 Hz).
  */
 
+#include <math.h>
 #include <stdio.h>
 #include <time.h>
 
@@ -144,6 +145,31 @@ static void draw_walk_overlay(float distance_m)
 	panel_draw_text(hud_x + 14, hud_y + 4, COL_WALK, buf, SCENE_FONT_BODY);
 }
 
+static int16_t snap_i16(float v)
+{
+	if (!isfinite(v)) {
+		return 0;
+	}
+	if (v > 32767.0f) {
+		return 32767;
+	}
+	if (v < -32768.0f) {
+		return -32768;
+	}
+	return (int16_t)v;
+}
+
+static void draw_seg(float x0, float y0, float x1, float y1, uint16_t color)
+{
+	if (!isfinite(x0) || !isfinite(y0) || !isfinite(x1) || !isfinite(y1)) {
+		return;
+	}
+	if (fabsf(x0 - x1) < 0.5f && fabsf(y0 - y1) < 0.5f) {
+		return;
+	}
+	panel_draw_line(snap_i16(x0), snap_i16(y0), snap_i16(x1), snap_i16(y1), color);
+}
+
 void scene_live_init(const struct device *display)
 {
 	scene_zoom_init();
@@ -186,16 +212,32 @@ void scene_live_draw(const struct device *display)
 	}
 
 	const float walk_m = imu_pipeline_walk_distance_m();
+	/* Draw tilt from this sample's accelerometer, not only the complementary-filter
+	 * matrix. A "stationary" lock used to freeze yaw (and a stuck filter would freeze
+	 * the cube) while the HUD tick still moved. */
+	const float roll_acc = atan2f(sample.ay, sample.az);
+	const float pitch_acc = atan2f(-sample.ax, sqrtf(sample.ay * sample.ay + sample.az * sample.az));
+	struct mat3 rot;
+
+	attitude_rotation_zyx(&rot, roll_acc, pitch_acc, att.state.yaw);
+
 	const struct scene_snapshot snap = scene_snapshot_build(
-		PANEL_W, PANEL_H, scene_zoom_current(), &att.state.rotation, &sample, walk_m);
+		PANEL_W, PANEL_H, scene_zoom_current(), &rot, &sample, walk_m);
 
 	panel_draw_circle(snap.center_x, snap.center_y, 3, COL_TEXT, true);
+	/* Sliding tick in the cube band (~y=170). White so it is not confused with the
+	 * green Y axis (PANEL_YELLOW 0x07FF reads green on this BGR panel). */
+	{
+		const uint16_t tick_x = (uint16_t)(4U + ((k_uptime_get_32() / 40U) % 40U));
+
+		panel_fb_fill_rect(tick_x, (uint16_t)snap.center_y + 36U, 5U, 2U, PANEL_WHITE);
+	}
 
 	for (int i = 0; i < 3; i++) {
 		const uint16_t colors[3] = { COL_X, COL_Y, COL_Z };
 
-		panel_draw_line((int16_t)snap.axes[i].p0.x, (int16_t)snap.axes[i].p0.y,
-				(int16_t)snap.axes[i].p1.x, (int16_t)snap.axes[i].p1.y, colors[i]);
+		draw_seg(snap.axes[i].p0.x, snap.axes[i].p0.y, snap.axes[i].p1.x,
+			 snap.axes[i].p1.y, colors[i]);
 	}
 
 	panel_draw_text(4, PANEL_H - 48, COL_X, "X", SCENE_FONT_AXIS);
@@ -210,15 +252,15 @@ void scene_live_draw(const struct device *display)
 		const int a = edges[e][0];
 		const int b = edges[e][1];
 
-		panel_draw_line((int16_t)snap.corners[a].x, (int16_t)snap.corners[a].y,
-				(int16_t)snap.corners[b].x, (int16_t)snap.corners[b].y, COL_TEXT);
+		draw_seg(snap.corners[a].x, snap.corners[a].y, snap.corners[b].x,
+			 snap.corners[b].y, COL_TEXT);
 	}
 
 	const int16_t footer_y = PANEL_H - 28;
 	char buf[48];
 
-	snprintf(buf, sizeof(buf), "2D->3D: %.2f %.2f %.2f", (double)snap.footer_unproject.x,
-		 (double)snap.footer_unproject.y, (double)snap.footer_unproject.z);
+	snprintf(buf, sizeof(buf), "rpy %.0f %.0f %.0f", (double)(roll_acc * 57.29578f),
+		 (double)(pitch_acc * 57.29578f), (double)(att.state.yaw * 57.29578f));
 	panel_draw_text(4, footer_y, COL_FOOT, buf, SCENE_FONT_BODY);
 
 	draw_walk_overlay(walk_m);

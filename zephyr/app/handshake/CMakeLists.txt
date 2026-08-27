@@ -2,7 +2,10 @@ cmake_minimum_required(VERSION 3.20.0)
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(waveshare_handshake)
 
-target_include_directories(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../common)
+target_include_directories(app PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../common
+)
 
 get_filename_component(APP_ROOT ${CMAKE_CURRENT_SOURCE_DIR} REALPATH)
 set(COMMON_DIR ${APP_ROOT}/../common)
@@ -21,9 +24,12 @@ target_sources(app PRIVATE
   src/panel_draw.c
   src/panel_font_glcd.c
   src/panel_fb.c
+  src/mt200_bridge.c
   src/qmi8658.c
   src/scene_live.c
   src/ws2812_gpio38.c
+  src/vibro_led.c
+  ${COMMON_DIR}/battery_bench.c
   ${COMMON_DIR}/battery_adc_esp32.c
   ${COMMON_DIR}/attitude.c
   ${COMMON_DIR}/battery_monitor.c
@@ -34,8 +40,13 @@ target_sources(app PRIVATE
   ${COMMON_DIR}/crash_debug.c
   ${COMMON_DIR}/crash_report.c
   ${COMMON_DIR}/crash_ring_store.c
+  ${COMMON_DIR}/crash_rtc_capture.c
   ${COMMON_DIR}/device_config.c
+  ${COMMON_DIR}/ota_ab.c
+  ${COMMON_DIR}/soft_reboot.c
   ${COMMON_DIR}/device_profile.c
+  ${COMMON_DIR}/flash_safety.c
+  ${COMMON_DIR}/floor_calib.c
   ${COMMON_DIR}/imu_cal.c
   ${COMMON_DIR}/net_profile_store.c
   ${COMMON_DIR}/network_manager.c
@@ -48,6 +59,8 @@ target_sources(app PRIVATE
   ${COMMON_DIR}/stall_watchdog.c
   ${COMMON_DIR}/vibro_capture.c
   ${COMMON_DIR}/vibro_band_rms.c
+  ${COMMON_DIR}/vibro_fft.c
+  ${COMMON_DIR}/metrics_compact.c
   ${COMMON_DIR}/vibro_features.c
   ${COMMON_DIR}/vibro_verdict_store.c
   ${COMMON_DIR}/vibro_ref_store.c

@@ -11,6 +11,7 @@
 #include "device_config.h"
 #include "net_profile_store.h"
 #include "power_manager.h"
+#include "soft_reboot.h"
 
 LOG_MODULE_REGISTER(boot_btn, LOG_LEVEL_INF);
 
@@ -62,6 +63,9 @@ bool boot_button_screen_on(void)
 }
 
 static bool g_mode_toggle_pending;
+static uint32_t g_last_tap_ms;
+
+#define BOOT_TAP_DEBOUNCE_MS 500U
 
 bool boot_button_take_toggle_request(void)
 {
@@ -75,6 +79,13 @@ bool boot_button_take_toggle_request(void)
 
 static void toggle_mode(void)
 {
+	const uint32_t now = k_uptime_get_32();
+
+	if (g_last_tap_ms != 0U && (now - g_last_tap_ms) < BOOT_TAP_DEBOUNCE_MS) {
+		LOG_INF("BOOT tap ignored (debounce %ums)", BOOT_TAP_DEBOUNCE_MS);
+		return;
+	}
+	g_last_tap_ms = now;
 	g_mode_toggle_pending = true;
 	LOG_INF("BOOT tap → demo/staging mode toggle queued");
 }
@@ -95,6 +106,7 @@ static void erase_nvs_and_reboot(void)
 	}
 	LOG_WRN("BOOT: sys_reboot (NVS erase complete)");
 	k_msleep(100);
+	soft_reboot_schedule(SOFT_REBOOT_BOOT_BTN, soft_reboot_boot_partition(), 255U);
 	sys_reboot(SYS_REBOOT_COLD);
 }
 
@@ -109,6 +121,7 @@ static void erase_wifi_and_reboot(void)
 	net_profile_store_clear_all();
 	LOG_WRN("BOOT: sys_reboot (WiFi erase complete)");
 	k_msleep(100);
+	soft_reboot_schedule(SOFT_REBOOT_BOOT_BTN, soft_reboot_boot_partition(), 255U);
 	sys_reboot(SYS_REBOOT_COLD);
 }
 

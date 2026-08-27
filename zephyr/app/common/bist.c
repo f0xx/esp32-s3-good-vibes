@@ -6,6 +6,8 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <esp_heap_caps.h>
+#include <esp_flash.h>
+#include <esp_err.h>
 
 #include "crash_ring_store.h"
 #include "device_config.h"
@@ -14,7 +16,7 @@ LOG_MODULE_REGISTER(bist, LOG_LEVEL_INF);
 
 #if defined(CONFIG_APP_CRASH_DEBUG)
 
-#define BIST_TEST_MAX 4U
+#define BIST_TEST_MAX 5U
 
 bool qmi8658_ready(void);
 uint8_t qmi8658_who_am_i(void);
@@ -153,6 +155,55 @@ static void bist_crash_ring(struct bist_line *lines, uint8_t *count)
 	line_pass(ln);
 }
 
+static size_t bist_psram_bytes(void)
+{
+	size_t total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+
+	if (total > 0U) {
+		return total;
+	}
+#if defined(CONFIG_ESP_SPIRAM_SIZE)
+	return (size_t)CONFIG_ESP_SPIRAM_SIZE;
+#else
+	return 0U;
+#endif
+}
+
+static size_t bist_dram_bytes(void)
+{
+	size_t total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
+
+	if (total > 0U) {
+		return total;
+	}
+	/* heap_caps_get_total_size() often returns 0 under Zephyr even when DRAM is fine. */
+	return (size_t)(CONFIG_HEAP_MEM_POOL_SIZE + 256U * 1024U);
+}
+
+static void bist_mem(struct bist_line *lines, uint8_t *count)
+{
+	struct bist_line *ln = line_add(lines, count, "mem", BIST_FLAG_MEM);
+	uint32_t flash_hw = 0U;
+	const size_t psram_total = bist_psram_bytes();
+	const size_t dram_total = bist_dram_bytes();
+	esp_err_t err = esp_flash_get_size(NULL, &flash_hw);
+
+	if (ln == NULL) {
+		return;
+	}
+
+	snprintf(ln->detail, sizeof(ln->detail), "flash_hw=%uMB psram=%uMB dram=%uMB",
+		 (unsigned)(flash_hw / (1024U * 1024U)), (unsigned)(psram_total / (1024U * 1024U)),
+		 (unsigned)(dram_total / (1024U * 1024U)));
+
+	if (err != ESP_OK || flash_hw < (8U * 1024U * 1024U)) {
+		line_fail(ln);
+		return;
+	}
+
+	line_pass(ln);
+}
+
 static void bist_log_report(const struct bist_line *lines, uint8_t count)
 {
 	LOG_INF("BIST report (%u tests, %ums):", count, g_last.elapsed_ms);
@@ -196,6 +247,7 @@ void bist_run(void)
 	bist_heap(lines, &count);
 	bist_cfg(lines, &count);
 	bist_crash_ring(lines, &count);
+	bist_mem(lines, &count);
 
 	g_last.elapsed_ms = k_uptime_get_32() - t0;
 	bist_log_report(lines, count);

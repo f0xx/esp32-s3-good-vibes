@@ -63,7 +63,7 @@ int ws2812_gpio38_init(void)
 	return 0;
 }
 
-void ws2812_gpio38_rgb(uint8_t r, uint8_t g, uint8_t b)
+void ws2812_gpio38_grb(uint8_t green, uint8_t red, uint8_t blue)
 {
 	unsigned int key;
 
@@ -72,12 +72,17 @@ void ws2812_gpio38_rgb(uint8_t r, uint8_t g, uint8_t b)
 	}
 
 	key = irq_lock();
-	ws2812_send_byte(g);
-	ws2812_send_byte(r);
-	ws2812_send_byte(b);
+	ws2812_send_byte(green);
+	ws2812_send_byte(red);
+	ws2812_send_byte(blue);
 	irq_unlock(key);
 
 	esp_rom_delay_us(300);
+}
+
+void ws2812_gpio38_rgb(uint8_t r, uint8_t g, uint8_t b)
+{
+	ws2812_gpio38_grb(g, r, b);
 }
 
 void ws2812_gpio38_off(void)
