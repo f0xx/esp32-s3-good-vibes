@@ -15,6 +15,8 @@
 #include <zephyr/sys/crc.h>
 #include <zephyr/sys/util.h>
 
+#include "stall_watchdog.h"
+
 LOG_MODULE_REGISTER(crash_ring, LOG_LEVEL_INF);
 
 #define CRASH_RING_PARTITION   scratch_partition
@@ -27,6 +29,7 @@ LOG_MODULE_REGISTER(crash_ring, LOG_LEVEL_INF);
 #define CRASH_HDR_MAGIC  0x43525348U /* CRSH */
 #define CRASH_REC_MAGIC  0x43525352U /* CRSR */
 #define CRASH_FLAG_PENDING 0x01U
+#define CRASH_FLAG_SOFT    0x02U
 
 #define CRASH_RING_SECTOR_BYTES 4096U
 /*
@@ -79,8 +82,11 @@ struct crash_ring_record {
 	uint8_t render_hz;
 	uint8_t imu_hz;
 	uint8_t power_profile;
+	uint8_t boot_part;
+	uint8_t target_part;
 	char reason[16];
 	char fw_version[24];
+	char ota_outcome[16];
 	uint32_t backtrace[CRASH_REPORT_BACKTRACE_MAX];
 	uint32_t crc32;
 } __packed;
@@ -91,6 +97,10 @@ static bool g_loaded;
  * persist_ring() call writes to the *other* sector and only flips this after that write fully
  * succeeds — see persist_ring()'s doc comment. */
 static uint8_t g_active_sector;
+/* RAM-only "logically cleared" bits — see crash_ring_flush_ram_clears()'s doc comment. Bit s set
+ * means slot s should read as not-pending even though flash still has CRASH_FLAG_PENDING set;
+ * the flag only gets written to flash once it's safe to do so (BLE fully disconnected). */
+static uint32_t g_ram_cleared_mask;
 
 static void sync_next_seq_from_slots(void);
 
@@ -220,7 +230,15 @@ static int persist_ring(int8_t override_slot, const struct crash_ring_record *ov
 		return err;
 	}
 
+	/* Feed right before/after the erase (interrupts+cache disabled on both cores for the
+	 * duration on ESP32) — defense in depth so a software watchdog channel never reads as
+	 * starved because of this call specifically. Does not by itself fix a hazard that comes
+	 * from starving something outside this task (e.g. the BLE controller's link-layer
+	 * timing) — see ble_crash_gatt_looper_tick()'s CRASH_CLEAR_SAFETY_MARGIN_MS for the
+	 * actual mitigation for that. */
+	stall_watchdog_feed_main();
 	err = flash_area_erase(fa, sector_base(target), CRASH_RING_SECTOR_BYTES);
+	stall_watchdog_feed_main();
 	if (err != 0) {
 		LOG_ERR("crash ring erase failed sector=%u (%d)", target, err);
 		flash_area_close(fa);
@@ -249,6 +267,7 @@ static int persist_ring(int8_t override_slot, const struct crash_ring_record *ov
 		}
 	}
 
+	stall_watchdog_feed_main();
 	flash_area_close(fa);
 	if (err != 0) {
 		LOG_ERR("crash ring persist failed sector=%u (%d)", target, err);
@@ -338,6 +357,11 @@ int crash_ring_init(void)
 
 int crash_ring_append(const struct crash_report_info *info, const struct crash_ring_telemetry *tel)
 {
+	return crash_ring_append_soft(info, tel);
+}
+
+int crash_ring_append_soft(const struct crash_report_info *info, const struct crash_ring_telemetry *tel)
+{
 	struct crash_ring_record rec;
 	uint8_t slot;
 
@@ -354,11 +378,19 @@ int crash_ring_append(const struct crash_report_info *info, const struct crash_r
 	rec.excvaddr = info->excvaddr;
 	rec.reset_reason = info->reset_reason;
 	rec.flags = CRASH_FLAG_PENDING;
+	if (info->soft) {
+		rec.flags |= CRASH_FLAG_SOFT;
+	}
+	rec.boot_part = info->boot_part;
+	rec.target_part = info->target_part;
 	rec.dump_size = (uint16_t)MIN(info->dump_size, 0xFFFFU);
 	rec.bt_count = MIN(info->backtrace_count, CRASH_REPORT_BACKTRACE_MAX);
 	snprintf(rec.reason, sizeof(rec.reason), "%s",
 		 info->reason != NULL ? info->reason : "unknown");
 	snprintf(rec.fw_version, sizeof(rec.fw_version), "%s", info->fw_version);
+	if (info->ota_outcome[0] != '\0') {
+		snprintf(rec.ota_outcome, sizeof(rec.ota_outcome), "%s", info->ota_outcome);
+	}
 	for (uint8_t i = 0; i < rec.bt_count; i++) {
 		rec.backtrace[i] = info->backtrace[i];
 	}
@@ -376,6 +408,9 @@ int crash_ring_append(const struct crash_report_info *info, const struct crash_r
 	 * so overwriting the oldest slot when the ring wraps is safe and never touches the other
 	 * slots' data. */
 	slot = (uint8_t)(g_hdr.write_idx % CRASH_RING_SLOTS);
+	/* This slot is about to hold a brand-new record — any stale RAM-only "cleared" bit for
+	 * the record it used to hold no longer applies. */
+	g_ram_cleared_mask &= ~BIT(slot);
 
 	g_hdr.write_idx = (g_hdr.write_idx + 1U) % CRASH_RING_SLOTS;
 	if (g_hdr.count < CRASH_RING_SLOTS) {
@@ -404,6 +439,9 @@ uint8_t crash_ring_pending_count(void)
 	for (uint8_t s = 0; s < CRASH_RING_SLOTS; s++) {
 		struct crash_ring_record rec;
 
+		if ((g_ram_cleared_mask & BIT(s)) != 0U) {
+			continue;
+		}
 		if (read_record(s, &rec) == 0 && (rec.flags & CRASH_FLAG_PENDING) != 0U) {
 			pending++;
 		}
@@ -422,7 +460,7 @@ bool crash_ring_slot_pending(uint8_t slot)
 {
 	struct crash_ring_record rec;
 
-	if (!g_loaded || read_record(slot, &rec) != 0) {
+	if (!g_loaded || (g_ram_cleared_mask & BIT(slot)) != 0U || read_record(slot, &rec) != 0) {
 		return false;
 	}
 	return (rec.flags & CRASH_FLAG_PENDING) != 0U;
@@ -436,6 +474,14 @@ bool crash_ring_slot_pending(uint8_t slot)
  * path shrink each entry so 2+ pending crashes still fit in one read instead of falling back to
  * per-slot write+read ping-pong for every slot.
  */
+static const char *soft_reason_json(const struct crash_ring_record *rec)
+{
+	if (strncmp(rec->reason, "soft:", 5) == 0) {
+		return rec->reason + 5;
+	}
+	return rec->reason;
+}
+
 static int append_record_json(char *buf, size_t off, size_t len, uint8_t slot,
 			       const struct crash_ring_record *rec, uint8_t max_bt,
 			       bool include_detail)
@@ -465,13 +511,41 @@ static int append_record_json(char *buf, size_t off, size_t len, uint8_t slot,
 	}
 
 	if (include_detail) {
-		n = snprintf(buf + off, len - off,
-			     "],\"detail\":{\"render_hz\":%u,\"imu_hz\":%u,\"bat_mv\":%u,"
-			     "\"bat_pct\":%u,\"power_profile\":%u,\"dump_size\":%u}}",
-			     rec->render_hz, rec->imu_hz, rec->bat_mv, rec->bat_pct,
-			     rec->power_profile, rec->dump_size);
+		if ((rec->flags & CRASH_FLAG_SOFT) != 0U) {
+			n = snprintf(buf + off, len - off,
+				     "],\"soft\":1,\"srr\":\"%s\",\"detail\":{\"render_hz\":%u,"
+				     "\"imu_hz\":%u,\"bat_mv\":%u,\"bat_pct\":%u,"
+				     "\"power_profile\":%u,\"dump_size\":%u,\"boot_part\":\"%c\","
+				     "\"target_part\":\"%c\"",
+				     soft_reason_json(rec), rec->render_hz, rec->imu_hz, rec->bat_mv,
+				     rec->bat_pct, rec->power_profile, rec->dump_size,
+				     rec->boot_part <= 1U ? ('A' + rec->boot_part) : '?',
+				     rec->target_part <= 1U ? ('A' + rec->target_part) : '?');
+			if (rec->ota_outcome[0] != '\0' && off + (size_t)n < len - 32U) {
+				off += (size_t)n;
+				total += (size_t)n;
+				n = snprintf(buf + off, len - off, ",\"ota_outcome\":\"%s\"",
+					     rec->ota_outcome);
+			}
+			if (n > 0 && off + (size_t)n < len - 4U) {
+				off += (size_t)n;
+				total += (size_t)n;
+				n = snprintf(buf + off, len - off, ",\"fatal\":0}}");
+			}
+		} else {
+			n = snprintf(buf + off, len - off,
+				     "],\"detail\":{\"render_hz\":%u,\"imu_hz\":%u,\"bat_mv\":%u,"
+				     "\"bat_pct\":%u,\"power_profile\":%u,\"dump_size\":%u}}",
+				     rec->render_hz, rec->imu_hz, rec->bat_mv, rec->bat_pct,
+				     rec->power_profile, rec->dump_size);
+		}
 	} else {
-		n = snprintf(buf + off, len - off, "]}");
+		if ((rec->flags & CRASH_FLAG_SOFT) != 0U) {
+			n = snprintf(buf + off, len - off, "],\"soft\":1,\"srr\":\"%s\"}",
+				     soft_reason_json(rec));
+		} else {
+			n = snprintf(buf + off, len - off, "]}");
+		}
 	}
 	if (n <= 0) {
 		return -ENOMEM;
@@ -529,6 +603,9 @@ int crash_ring_list_json(char *buf, size_t len)
 	for (uint8_t s = 0; s < CRASH_RING_SLOTS; s++) {
 		struct crash_ring_record rec;
 
+		if ((g_ram_cleared_mask & BIT(s)) != 0U) {
+			continue;
+		}
 		if (read_record(s, &rec) != 0 || (rec.flags & CRASH_FLAG_PENDING) == 0U) {
 			continue;
 		}
@@ -565,6 +642,11 @@ int crash_ring_info_json(uint8_t slot, char *buf, size_t len)
 	struct crash_ring_record rec;
 	int err;
 
+	if (slot < CRASH_RING_SLOTS && (g_ram_cleared_mask & BIT(slot)) != 0U) {
+		snprintf(buf, len, "{\"pending\":0,\"slot\":%u}", slot);
+		return -ENOENT;
+	}
+
 	err = read_record(slot, &rec);
 	if (err != 0) {
 		snprintf(buf, len, "{\"pending\":0,\"slot\":%u}", slot);
@@ -578,12 +660,12 @@ int crash_ring_clear_slot(uint8_t slot)
 	if (slot >= CRASH_RING_SLOTS || !crash_ring_slot_valid(slot)) {
 		return -ENOENT;
 	}
-	return persist_ring(-1, NULL, BIT(slot));
+	g_ram_cleared_mask |= BIT(slot);
+	return 0;
 }
 
-/* Clears several slots' pending flags in ONE ping-pong cycle instead of one cycle per slot —
- * see persist_ring()'s doc comment for why chaining N separate cycles from a single BLE GATT
- * write used to risk losing data if a reset landed mid-cycle. */
+/* Marks several slots cleared in RAM in one shot — see crash_ring_flush_ram_clears()'s doc
+ * comment for why the actual flash write is deferred instead of happening here. */
 int crash_ring_clear_slots(const uint8_t *slots, size_t n)
 {
 	uint32_t mask = 0U;
@@ -596,13 +678,23 @@ int crash_ring_clear_slots(const uint8_t *slots, size_t n)
 			mask |= BIT(slots[i]);
 		}
 	}
-	if (mask == 0U) {
-		return 0;
-	}
-	return persist_ring(-1, NULL, mask);
+	g_ram_cleared_mask |= mask;
+	return 0;
 }
 
 void crash_ring_clear_all(void)
 {
-	persist_ring(-1, NULL, BIT_MASK(CRASH_RING_SLOTS));
+	g_ram_cleared_mask |= BIT_MASK(CRASH_RING_SLOTS);
+}
+
+void crash_ring_flush_ram_clears(void)
+{
+	uint32_t mask = g_ram_cleared_mask;
+
+	if (mask == 0U || !g_loaded) {
+		return;
+	}
+	if (persist_ring(-1, NULL, mask) == 0) {
+		g_ram_cleared_mask &= ~mask;
+	}
 }

@@ -7,6 +7,8 @@
 #include <zephyr/storage/flash_map.h>
 #include <zephyr/sys/crc.h>
 
+#include "flash_safety.h"
+
 LOG_MODULE_REGISTER(vibro_spool, LOG_LEVEL_INF);
 
 #define VERDICT_SPOOL_PARTITION   scratch_partition
@@ -260,6 +262,19 @@ int vibro_verdict_store_append(uint32_t seq, uint32_t uptime_ms,
 		struct verdict_spool_record existing;
 
 		if (read_record(slot, &existing) == 0 && (existing.flags & VERDICT_FLAG_PENDING) != 0U) {
+			/* Ring-wrap onto a still-unacked slot needs a full-spool erase
+			 * (format_spool()) — same flash_area_erase()-during-live-BLE hazard as
+			 * every other store here (see flash_safety.h). This path is rare (spool
+			 * only wraps when the backend hasn't ACKed 8 verdicts yet), so rather
+			 * than build a full deferred-ring like crash_ring_store, just drop this
+			 * one verdict when it's unsafe to erase — far better than a watchdog
+			 * reset, and the verdict stream resumes on the next safe append(). */
+			if (!app_flash_erase_safe()) {
+				LOG_WRN("verdict spool: wrap onto pending slot=%u while BLE "
+					"active — dropping seq=%u (erase deferred)",
+					slot, seq);
+				return -EBUSY;
+			}
 			if (format_spool() != 0) {
 				return -EIO;
 			}
@@ -341,6 +356,32 @@ uint32_t vibro_verdict_store_first_pending_seq(void)
 		}
 	}
 	return min_seq;
+}
+
+void vibro_verdict_store_spool_stats(uint32_t *cap_bytes, uint32_t *used_bytes,
+				     uint16_t *pending_out)
+{
+	const uint16_t pending = vibro_verdict_store_pending_count();
+	const uint32_t cap = VERDICT_SPOOL_FLASH_BYTES;
+	uint32_t used = VERDICT_HEADER_SIZE;
+
+	if (cap_bytes != NULL) {
+		*cap_bytes = cap;
+	}
+	if (pending_out != NULL) {
+		*pending_out = pending;
+	}
+	if (g_loaded) {
+		used += (uint32_t)g_hdr.count * VERDICT_RECORD_SIZE;
+	} else {
+		used += (uint32_t)pending * VERDICT_RECORD_SIZE;
+	}
+	if (used > cap) {
+		used = cap;
+	}
+	if (used_bytes != NULL) {
+		*used_bytes = used;
+	}
 }
 
 bool vibro_verdict_store_ack(uint32_t seq)

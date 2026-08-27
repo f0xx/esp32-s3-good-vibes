@@ -9,10 +9,19 @@
 struct vec2 projection_project(struct vec3 point, int screen_w, int screen_h,
 			       const struct camera3d *cam)
 {
+	if (!isfinite(point.x) || !isfinite(point.y) || !isfinite(point.z) || cam == NULL ||
+	    cam->near_plane <= 0.0f || cam->aspect <= 0.0f) {
+		return (struct vec2){ (float)screen_w * 0.5f, (float)screen_h * 0.5f };
+	}
+
 	const float f = 1.0f / tanf((cam->fov_deg * 0.5f) * ((float)M_PI / 180.0f));
-	const float z = fmaxf(point.z, cam->near_plane);
+	const float z = (point.z > cam->near_plane) ? point.z : cam->near_plane;
 	const float sx = (point.x * f / (z * cam->aspect)) * (screen_w * 0.5f) + screen_w * 0.5f;
 	const float sy = (-point.y * f / z) * (screen_h * 0.5f) + screen_h * 0.5f;
+
+	if (!isfinite(sx) || !isfinite(sy)) {
+		return (struct vec2){ (float)screen_w * 0.5f, (float)screen_h * 0.5f };
+	}
 
 	return (struct vec2){ sx, sy };
 }

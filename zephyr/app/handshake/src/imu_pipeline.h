@@ -40,3 +40,5 @@ bool imu_pipeline_live(void);
 bool imu_pipeline_ready(void);
 bool imu_pipeline_recovering(void);
 void imu_pipeline_request_recover(void);
+/** 10s heartbeat: ax/ay/az + rpy + identical-sample streak (stuck IMU vs frozen filter). */
+void imu_pipeline_log_motion(void);

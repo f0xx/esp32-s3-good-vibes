@@ -17,8 +17,11 @@
 
 #include <zephyr/logging/log.h>
 #include <zephyr/storage/flash_map.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/crc.h>
 #include <zephyr/sys/util.h>
+
+#include "flash_safety.h"
 
 LOG_MODULE_REGISTER(vibro_ref, LOG_LEVEL_INF);
 
@@ -69,6 +72,14 @@ BUILD_ASSERT(sizeof(struct vibro_ref_record) <= VIBRO_REF_SLOT_BYTES,
 
 static struct vibro_ref_header g_hdr;
 static bool g_loaded;
+
+/* Deferred-erase state — see flash_safety.h. Deletes/clear-all/active-slot changes only
+ * touch RAM here; the real flash_area_erase()/write_header() calls happen from
+ * vibro_ref_store_poll() once app_flash_erase_safe() says it's safe (BLE idle). Reads
+ * consult g_pending_erase_mask so a "deleted" slot looks gone immediately even though the
+ * flash erase hasn't happened yet. */
+static atomic_t g_pending_erase_mask;
+static atomic_t g_hdr_dirty;
 
 static uint32_t hdr_crc(const struct vibro_ref_header *hdr)
 {
@@ -140,6 +151,9 @@ int vibro_ref_store_read(uint8_t slot, struct vibro_ref_profile *out)
 	if (out == NULL || slot >= VIBRO_REF_STORE_SLOTS) {
 		return -EINVAL;
 	}
+	if (atomic_test_bit(&g_pending_erase_mask, slot)) {
+		return -ENOENT;
+	}
 
 	err = flash_area_open(VIBRO_REF_PARTITION_ID, &fa);
 	if (err != 0) {
@@ -181,6 +195,9 @@ bool vibro_ref_store_valid(uint8_t slot)
 	if (slot >= VIBRO_REF_STORE_SLOTS) {
 		return false;
 	}
+	if (atomic_test_bit(&g_pending_erase_mask, slot)) {
+		return false;
+	}
 
 	err = flash_area_open(VIBRO_REF_PARTITION_ID, &fa);
 	if (err != 0) {
@@ -200,6 +217,12 @@ int vibro_ref_store_write(uint8_t slot, const struct vibro_ref_profile *prof)
 
 	if (prof == NULL || slot >= VIBRO_REF_STORE_SLOTS) {
 		return -EINVAL;
+	}
+	if (!app_flash_erase_safe()) {
+		/* Caller (vibro_capture's ref-commit poll) is expected to only call this once
+		 * app_flash_erase_safe() is true and retry later otherwise — this check is a
+		 * belt-and-suspenders guard against a future caller forgetting to gate it. */
+		return -EBUSY;
 	}
 
 	memset(&rec, 0, sizeof(rec));
@@ -232,6 +255,8 @@ int vibro_ref_store_write(uint8_t slot, const struct vibro_ref_profile *prof)
 	if (err != 0) {
 		LOG_ERR("ref store write slot=%u failed (%d)", slot, err);
 	} else {
+		/* Fresh data now on flash — any earlier pending delete of this slot is moot. */
+		atomic_clear_bit(&g_pending_erase_mask, slot);
 		LOG_INF("ref store slot=%u saved name=%s dur=%ums mag_len=%u", slot, rec.name,
 			rec.duration_ms, rec.mag_len);
 	}
@@ -240,24 +265,30 @@ int vibro_ref_store_write(uint8_t slot, const struct vibro_ref_profile *prof)
 
 int vibro_ref_store_delete(uint8_t slot)
 {
-	const struct flash_area *fa;
-	int err;
-
 	if (slot >= VIBRO_REF_STORE_SLOTS) {
 		return -EINVAL;
 	}
 
-	err = flash_area_open(VIBRO_REF_PARTITION_ID, &fa);
-	if (err != 0) {
-		return err;
+	/* Deferred — see g_pending_erase_mask doc comment. Slot looks gone immediately
+	 * (vibro_ref_store_valid()/read() mask it out) even though flash_area_erase() hasn't
+	 * run yet; vibro_ref_store_poll() does the real erase once BLE is idle. */
+	atomic_set_bit(&g_pending_erase_mask, slot);
+	if (g_hdr.active_slot == (int8_t)slot) {
+		g_hdr.active_slot = -1;
+		atomic_set(&g_hdr_dirty, 1);
 	}
-	err = flash_area_erase(fa, slot_offset(slot), VIBRO_REF_SLOT_BYTES);
-	flash_area_close(fa);
+	return 0;
+}
 
-	if (err == 0 && g_hdr.active_slot == (int8_t)slot) {
-		(void)vibro_ref_store_set_active(-1);
+int vibro_ref_store_clear_all(void)
+{
+	for (uint8_t s = 0; s < VIBRO_REF_STORE_SLOTS; s++) {
+		atomic_set_bit(&g_pending_erase_mask, s);
 	}
-	return err;
+	g_hdr.active_slot = -1;
+	atomic_set(&g_hdr_dirty, 1);
+	LOG_WRN("ref store: all slots marked for clear (erase deferred until BLE idle)");
+	return 0;
 }
 
 int vibro_ref_store_set_active(int8_t slot)
@@ -266,7 +297,45 @@ int vibro_ref_store_set_active(int8_t slot)
 		return -EINVAL;
 	}
 	g_hdr.active_slot = slot;
-	return write_header();
+	atomic_set(&g_hdr_dirty, 1);
+	return 0;
+}
+
+void vibro_ref_store_poll(void)
+{
+	uint32_t mask;
+
+	if (!app_flash_erase_safe()) {
+		return;
+	}
+
+	mask = (uint32_t)atomic_get(&g_pending_erase_mask);
+	if (mask != 0U) {
+		const struct flash_area *fa;
+
+		if (flash_area_open(VIBRO_REF_PARTITION_ID, &fa) == 0) {
+			for (uint8_t s = 0; s < VIBRO_REF_STORE_SLOTS; s++) {
+				if ((mask & BIT(s)) == 0U) {
+					continue;
+				}
+				if (flash_area_erase(fa, slot_offset(s), VIBRO_REF_SLOT_BYTES) ==
+				    0) {
+					atomic_clear_bit(&g_pending_erase_mask, s);
+					LOG_INF("ref store slot=%u erased (deferred)", s);
+				} else {
+					LOG_ERR("ref store slot=%u deferred erase failed", s);
+				}
+			}
+			flash_area_close(fa);
+		}
+	}
+
+	if (atomic_cas(&g_hdr_dirty, 1, 0)) {
+		if (write_header() != 0) {
+			LOG_ERR("ref store deferred header write failed");
+			atomic_set(&g_hdr_dirty, 1);
+		}
+	}
 }
 
 int8_t vibro_ref_store_active_slot(void)

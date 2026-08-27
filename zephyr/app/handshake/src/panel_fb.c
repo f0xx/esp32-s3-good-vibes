@@ -19,17 +19,29 @@ LOG_MODULE_REGISTER(panel_fb, LOG_LEVEL_INF);
 
 static K_MUTEX_DEFINE(g_display_mtx);
 
-#define FB_FLUSH_ROWS 80
+#define FB_FLUSH_ROWS 16
 #define FB_PIXELS     ((size_t)PANEL_W * (size_t)PANEL_H)
 #define FB_BYTES      (FB_PIXELS * sizeof(uint16_t))
 #define DISPLAY_MTX_WAIT_MS 2000
 
 static uint16_t *fb;
+/* Internal SRAM bounce — PSRAM framebuffer is not esp_ptr_dma_capable(). Copying
+ * each strip here means display_write() always sees a cache-coherent, DMA-safe
+ * buffer. HUD is strip y=0; cube/axes start ~y=160. A PSRAM/SPI desync that
+ * only applied the first strip matches "header alive, cube frozen". */
+static uint16_t strip_ram[PANEL_W * FB_FLUSH_ROWS] __aligned(32);
 static bool fb_ready;
 static bool fb_failed;
 static bool fb_logged;
 static volatile bool g_display_busy;
 static uint32_t g_last_flush_ms;
+
+/* Per-strip stall diagnostic — see panel_fb_flush_stall_info() doc in panel_fb.h. */
+#define STRIP_WARN_MS 250U
+static volatile int16_t g_flush_cur_y = -1;
+static volatile uint32_t g_flush_cur_start_ms;
+static volatile int g_flush_last_ret;
+static volatile uint32_t g_flush_last_elapsed_ms;
 
 static int ensure_fb(void)
 {
@@ -121,7 +133,7 @@ void panel_fb_flush(const struct device *display)
 	}
 
 	if (!fb_logged) {
-		LOG_INF("framebuffer %ux%u (%u KiB), flush %u-row strips",
+		LOG_INF("framebuffer %ux%u (%u KiB), flush %u-row DRAM bounce",
 			PANEL_W, PANEL_H, (unsigned)(FB_BYTES / 1024U), FB_FLUSH_ROWS);
 		fb_logged = true;
 	}
@@ -145,13 +157,62 @@ void panel_fb_flush(const struct device *display)
 
 		desc.height = rows;
 		desc.buf_size = (size_t)PANEL_W * rows * sizeof(uint16_t);
-		display_write(display, 0, y, &desc, &fb[(size_t)y * PANEL_W]);
+		memcpy(strip_ram, &fb[(size_t)y * PANEL_W], desc.buf_size);
+
+		g_flush_cur_y = (int16_t)y;
+		g_flush_cur_start_ms = k_uptime_get_32();
+
+		int ret = display_write(display, 0, y, &desc, strip_ram);
+		if (ret != 0) {
+			(void)display_blanking_off(display);
+			memcpy(strip_ram, &fb[(size_t)y * PANEL_W], desc.buf_size);
+			ret = display_write(display, 0, y, &desc, strip_ram);
+		}
+		const uint32_t elapsed = k_uptime_get_32() - g_flush_cur_start_ms;
+
+		g_flush_last_ret = ret;
+		g_flush_last_elapsed_ms = elapsed;
+		g_flush_cur_y = -1;
+
+		if (ret != 0 || elapsed > STRIP_WARN_MS) {
+			/* Anomalous: Zephyr's SPI completion wait (spi_context.h) already bounds a
+			 * transceive to roughly transfer-time + CONFIG_SPI_COMPLETION_TIMEOUT_
+			 * TOLERANCE (~200ms default) for this display's size/frequency, so this
+			 * line firing at all is diagnostic gold for the render-stall-panic bug —
+			 * see panel_fb_flush_stall_info() doc. */
+			LOG_WRN("display_write(y=%u) took %ums ret=%d (expected <%ums)",
+				(unsigned)y, elapsed, ret, STRIP_WARN_MS);
+		}
+
 		stall_watchdog_feed_render();
 	}
 
 	g_last_flush_ms = k_uptime_get_32() - t0;
 	k_mutex_unlock(&g_display_mtx);
 	g_display_busy = false;
+}
+
+int panel_fb_flush_stall_info(char *buf, size_t buf_len)
+{
+	const int16_t y = g_flush_cur_y;
+
+	if (buf == NULL || buf_len == 0U) {
+		return 0;
+	}
+	if (y < 0) {
+		/* Not currently mid-strip — report the last completed one, which is still
+		 * useful if the stall is actually in spi_context_lock()'s bus-mutex wait
+		 * (unbounded K_FOREVER) rather than inside display_write() itself. */
+		const int n = snprintf(buf, buf_len, "idle (last y=? last_ret=%d last=%ums)",
+					g_flush_last_ret, g_flush_last_elapsed_ms);
+		return (n > 0 && (size_t)n < buf_len) ? n : 0;
+	}
+
+	const uint32_t since = k_uptime_get_32() - g_flush_cur_start_ms;
+	const int n = snprintf(buf, buf_len, "display_write(y=%d) running for %ums so far", y,
+			       since);
+
+	return (n > 0 && (size_t)n < buf_len) ? n : 0;
 }
 
 bool panel_display_busy(void)

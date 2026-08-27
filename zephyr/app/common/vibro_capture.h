@@ -51,15 +51,20 @@ void vibro_capture_push(const struct imu_sample *sample);
  * VIBRO_REF_MAX_RECORD_SEC wall-clock seconds or VIBRO_REF_MAG_MAX samples,
  * whichever comes first. */
 bool vibro_capture_start_reference(uint8_t slot, const char *name);
-/** Stop recording (or no-op if not recording) and persist the result to flash,
- * making it the active reference immediately. */
+/** Stop recording (or no-op if not recording); flash commit runs on the main thread
+ * via vibro_capture_poll(). */
 bool vibro_capture_stop_reference(void);
+/** Main-loop poll: FFT + flash write for a deferred reference commit. */
+void vibro_capture_poll(void);
 bool vibro_capture_reference_ready(void);
+bool vibro_capture_reference_recording(void);
 size_t vibro_capture_reference_len(void);
 /** Load a previously-recorded slot as the live/active reference. */
 int vibro_capture_select_reference(uint8_t slot);
 /** Erase a slot; clears the live reference too if it was the active one. */
 int vibro_capture_delete_reference(uint8_t slot);
+/** Erase every reference slot and clear live reference RAM state. */
+int vibro_capture_clear_all_references(void);
 int8_t vibro_capture_active_reference_slot(void);
 /** Compact per-slot metadata (name/duration/rms/valid/active) as JSON. */
 int vibro_capture_list_references_json(char *buf, size_t len);

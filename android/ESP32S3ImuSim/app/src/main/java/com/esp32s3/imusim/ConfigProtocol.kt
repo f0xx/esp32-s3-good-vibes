@@ -8,6 +8,8 @@ object ConfigProtocol {
     val CHAR_CMD_UUID: UUID = UUID.fromString("4a6e0103-0000-1000-8000-00805f9b34fb")
     /** Read-only: compact JSON list of the 5 reference-profile slots. See vibro_ref_store.h. */
     val CHAR_REFLIST_UUID: UUID = UUID.fromString("4a6e0104-0000-1000-8000-00805f9b34fb")
+    /** Read-only: flat-floor mounting calibration status JSON. See floor_calib.h. */
+    val CHAR_FLOORCAL_UUID: UUID = UUID.fromString("4a6e0105-0000-1000-8000-00805f9b34fb")
 
     /** Must match packed `DeviceConfigV1` on the ESP32 sketch. */
     const val BLOB_SIZE = 188
@@ -31,6 +33,15 @@ object ConfigProtocol {
     const val CMD_VIBRO_REF_SELECT = 7
     /** Payload: opcode + slot — erase a slot (clears live reference if it was active). */
     const val CMD_VIBRO_REF_DELETE = 8
+    /** Erase all reference slots on device (recalibration wizard). */
+    const val CMD_VIBRO_REF_CLEAR_ALL = 9
+    /** Arm monitoring / end ref wizard — acrylic LED off (operational). */
+    const val CMD_VIBRO_ARM = 10
+    /** Payload: opcode + uint16 LE duration_ms (optional, bare opcode == default 3000ms).
+     * Device must be held still on a true-level reference for the whole window. */
+    const val CMD_FLOOR_CALIB_START = 11
+    /** Discard the stored flat-floor correction (back to identity). */
+    const val CMD_FLOOR_CALIB_CLEAR = 12
 }
 
 object OtaProtocol {

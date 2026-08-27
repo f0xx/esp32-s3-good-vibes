@@ -135,13 +135,8 @@ bool qmi8658_read(struct qmi8658_sample *out)
 
 	for (int attempt = 0; attempt < 4; attempt++) {
 		uint8_t status = 0;
-		bool ready = true;
 
-		if (reg_read(REG_STATUS0, &status, 1)) {
-			ready = (status & 0x03) != 0;
-		}
-
-		if (!ready) {
+		if (!reg_read(REG_STATUS0, &status, 1) || (status & 0x03) == 0) {
 			k_usleep(400);
 			continue;
 		}

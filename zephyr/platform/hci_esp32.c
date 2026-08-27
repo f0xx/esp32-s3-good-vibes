@@ -4,6 +4,14 @@
  * btController (ESP-IDF BTC task) must not call ANY Zephyr API. Copy raw H4
  * bytes into a lock-free SPSC ring (memcpy + atomics only); a Zephyr RX thread
  * parses and bt_recv(). TX uses atomic ready flag from BTC + polling.
+ *
+ * The RX wait loop and BTC callbacks live in IRAM. Zephyr already links
+ * libkernel (k_msleep) into IRAM; this driver's .flash.text used to run
+ * immediately after that return. On ESP32-S3 + octal PSRAM the flash/PSRAM
+ * MSPI is shared, so an instruction fetch of that memw/atomic_get can come
+ * back as garbage → EXCCAUSE 0 (illegal instruction) at a perfectly valid
+ * opcode. IRAM I-fetch does not use that bus. Literal pools must follow the
+ * function (-mtext-section-literals, applied at flash time).
  */
 
 #include <zephyr/bluetooth/hci.h>
@@ -14,6 +22,7 @@
 
 #include <zephyr/drivers/bluetooth.h>
 
+#include <esp_attr.h>
 #include <esp_bt.h>
 
 #define LOG_LEVEL CONFIG_BT_HCI_DRIVER_LOG_LEVEL
@@ -36,13 +45,13 @@ struct hci_raw_item {
 #define HCI_SEND_POLL_MS     1
 #define HCI_SEND_TIMEOUT_MS  2000
 
-static struct hci_raw_item hci_raw_ring[HCI_RAW_Q_DEPTH];
-static volatile uint32_t hci_ring_head_v;
-static volatile uint32_t hci_ring_tail_v;
-static volatile uint32_t hci_ring_drops_v;
-static K_THREAD_STACK_DEFINE(hci_rx_stack, 3584);
+static DRAM_ATTR struct hci_raw_item hci_raw_ring[HCI_RAW_Q_DEPTH];
+static DRAM_ATTR volatile uint32_t hci_ring_head_v;
+static DRAM_ATTR volatile uint32_t hci_ring_tail_v;
+static DRAM_ATTR volatile uint32_t hci_ring_drops_v;
+static K_THREAD_STACK_DEFINE(hci_rx_stack, CONFIG_BT_RX_STACK_SIZE);
 static struct k_thread hci_rx_thread;
-static atomic_t hci_rx_running;
+static DRAM_ATTR atomic_t hci_rx_running;
 
 static bool is_hci_event_discardable(const uint8_t *evt_data)
 {
@@ -260,12 +269,11 @@ static bool hci_rx_process_one(const struct device *dev)
 	return true;
 }
 
-static void hci_rx_thread_fn(void *p1, void *p2, void *p3)
+static void IRAM_ATTR hci_rx_thread_fn(void *p1, void *p2, void *p3)
 {
-	const struct device *dev = DEVICE_DT_GET(DT_DRV_INST(0));
+	const struct device *dev = p1;
 	uint32_t last_drops = 0;
 
-	ARG_UNUSED(p1);
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
@@ -283,7 +291,7 @@ static void hci_rx_thread_fn(void *p1, void *p2, void *p3)
 	}
 }
 
-static int hci_esp_host_rcv_pkt(uint8_t *data, uint16_t len)
+static int IRAM_ATTR hci_esp_host_rcv_pkt(uint8_t *data, uint16_t len)
 {
 	uint32_t tail;
 	uint32_t next;
@@ -309,7 +317,7 @@ static int hci_esp_host_rcv_pkt(uint8_t *data, uint16_t len)
 	return 0;
 }
 
-static void hci_esp_controller_rcv_pkt_ready(void)
+static void IRAM_ATTR hci_esp_controller_rcv_pkt_ready(void)
 {
 	/* btController — intentionally empty; TX polls esp_vhci_host_check_send_available(). */
 }
@@ -424,7 +432,7 @@ static int bt_esp32_open(const struct device *dev, bt_hci_recv_t recv)
 	__atomic_store_n(&hci_ring_drops_v, 0U, __ATOMIC_RELAXED);
 	atomic_set(&hci_rx_running, 1);
 	k_thread_create(&hci_rx_thread, hci_rx_stack, K_THREAD_STACK_SIZEOF(hci_rx_stack),
-			hci_rx_thread_fn, NULL, NULL, NULL,
+			hci_rx_thread_fn, (void *)dev, NULL, NULL,
 			K_PRIO_COOP(CONFIG_BT_RX_PRIO > 0 ? CONFIG_BT_RX_PRIO - 1 : CONFIG_BT_RX_PRIO),
 			0, K_NO_WAIT);
 	k_thread_name_set(&hci_rx_thread, "ESP VHCI RX");

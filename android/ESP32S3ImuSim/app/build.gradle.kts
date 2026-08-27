@@ -11,8 +11,8 @@ android {
         applicationId = "com.esp32s3.imusim"
         minSdk = 26
         targetSdk = 34
-        versionCode = 39
-        versionName = "1.15.0-connect-grace"
+        versionCode = 60
+        versionName = "1.30.2-delivery"
     }
 
     buildTypes {

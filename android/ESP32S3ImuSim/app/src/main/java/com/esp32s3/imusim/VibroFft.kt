@@ -5,6 +5,9 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 
 /** Phone-side magnitude FFT (Case C) — power-of-2 Cooley–Tukey, real input. */
+/**
+ * Radix-2 Cooley–Tukey FFT — algorithm matches firmware `vibro_fft.c` (esp-dsp hook on device).
+ */
 object VibroFft {
     data class Result(
         val magnitudes: FloatArray,

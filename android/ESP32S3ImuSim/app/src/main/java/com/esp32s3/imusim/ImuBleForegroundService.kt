@@ -32,6 +32,7 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
         const val ACTION_BLE_RELAY = "com.esp32s3.imusim.BLE_RELAY"
         const val ACTION_STOP_AUTOPILOT = "com.esp32s3.imusim.STOP_AUTOPILOT"
         const val ACTION_STOP_CONNECT_RELAY = "com.esp32s3.imusim.STOP_CONNECT_RELAY"
+        const val ACTION_CHECK_OTA = "com.esp32s3.imusim.CHECK_OTA"
         const val CHANNEL_ID = "imu_ble"
         const val NOTIFICATION_ID = 1
         private val CRASH_RELAY_DELAYS_MS = longArrayOf(3000L, 8000L, 18000L)
@@ -50,6 +51,8 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
         private const val FFT_MIN_SAMPLES = 32
         private const val FFT_COLLECT_TIMEOUT_MS = 30_000L
         private const val FFT_COLLECT_TICK_MS = 50L
+        private const val OTA_POLL_MS = 300_000L
+        private const val OTA_FIRST_DELAY_MS = 20_000L
     }
 
     private val callbacks = RemoteCallbackList<IImuBleCallback>()
@@ -61,6 +64,15 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
     private lateinit var session: ImuSessionStore
     private lateinit var verdictStore: VerdictStore
     private lateinit var offloadExporter: OffloadExporter
+    private lateinit var batteryBenchStore: BatteryBenchStore
+
+    private var benchSessionId: Long = 0L
+    private var benchStartedMs: Long = 0L
+    private var benchLabel: String? = null
+    private var benchLastSeq: Long = -1L
+    private var benchLastVoltage: Float? = null
+    private var benchLastTs: Long = 0L
+    private var benchUserActive: Boolean = false
 
     private var connected = false
     private var caps = 0
@@ -100,6 +112,7 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
     private var bleConnectGeneration = 0
     private var captionEpoch = 0
     private var lastTimeSyncRetryMs = 0L
+    private var lastTelemetryExportMs = 0L
     private var autoRefInProgress = false
     private var savedPollMsForBridge = 0
     private var clockCheckedThisSession = false
@@ -192,7 +205,7 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
                         session.saveLocalConfig(blob)
                         broadcastConfig(blob)
                         val doc = DeviceConfigJson.fromBlob(blob, "esp")
-                        ConfigCloudSync.upload(applicationContext, doc)
+                        reconcileConfigWithCloud(doc, blob)
                     } else {
                         broadcastBanner(StatusBannerLevel.ERROR, "Config read failed")
                     }
@@ -310,6 +323,35 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
             }
         }
 
+        override fun vibroRefClearAll() {
+            mainHandler.post {
+                bleClient.vibroRefClearAll { ok ->
+                    broadcastBanner(
+                        if (ok) StatusBannerLevel.OK else StatusBannerLevel.ERROR,
+                        if (ok) "All reference slots erased" else "Clear all failed",
+                    )
+                    if (ok) {
+                        bleClient.readVibroRefList { json ->
+                            if (json != null) {
+                                foreachCallback { it.onVibroRefList(json) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        override fun vibroArm() {
+            mainHandler.post {
+                bleClient.vibroArm { ok ->
+                    broadcastBanner(
+                        if (ok) StatusBannerLevel.OK else StatusBannerLevel.ERROR,
+                        if (ok) "Monitoring armed" else "Arm failed",
+                    )
+                }
+            }
+        }
+
         override fun requestVibroRefList() {
             mainHandler.post {
                 bleClient.readVibroRefList { json ->
@@ -343,6 +385,14 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
 
         override fun setImuHzOverride(hz: Int) {
             mainHandler.post { bleClient.setImuHzOverride(hz) }
+        }
+
+        override fun startBatteryBench(label: String?) {
+            mainHandler.post { startBatteryBenchInternal(label?.trim().orEmpty()) }
+        }
+
+        override fun stopBatteryBench() {
+            mainHandler.post { stopBatteryBenchInternal() }
         }
 
         override fun injectCrash(kind: String?) {
@@ -381,11 +431,66 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
                 }
             }
         }
+
+        override fun floorCalibStart(durationMs: Int) {
+            mainHandler.post {
+                bleClient.floorCalibStart(durationMs) { ok ->
+                    if (ok) {
+                        broadcastBanner(StatusBannerLevel.OK, "Floor calibration started — hold still")
+                        pollFloorCalUntilDone()
+                    } else {
+                        broadcastBanner(StatusBannerLevel.ERROR, "Floor calibration start failed (BLE busy?)")
+                    }
+                }
+            }
+        }
+
+        override fun floorCalibClear() {
+            mainHandler.post {
+                bleClient.floorCalibClear { ok ->
+                    broadcastBanner(
+                        if (ok) StatusBannerLevel.OK else StatusBannerLevel.ERROR,
+                        if (ok) "Floor calibration cleared" else "Floor calibration clear failed",
+                    )
+                    if (ok) {
+                        bleClient.readFloorCalStatus { json ->
+                            if (json != null) foreachCallback { it.onFloorCalStatus(json) }
+                        }
+                    }
+                }
+            }
+        }
+
+        override fun requestFloorCalStatus() {
+            mainHandler.post {
+                bleClient.readFloorCalStatus { json ->
+                    if (json != null) {
+                        foreachCallback { it.onFloorCalStatus(json) }
+                    } else {
+                        broadcastBanner(StatusBannerLevel.ERROR, "Floor calibration status read failed")
+                    }
+                }
+            }
+        }
+    }
+
+    /** Sampling window runs on-device over a few seconds; poll status until it reports done. */
+    private fun pollFloorCalUntilDone(attempt: Int = 0) {
+        mainHandler.postDelayed({
+            bleClient.readFloorCalStatus { json ->
+                if (json != null) foreachCallback { it.onFloorCalStatus(json) }
+                val stillSampling = json?.contains("\"sampling\":1") == true
+                if (stillSampling && attempt < 40) {
+                    pollFloorCalUntilDone(attempt + 1)
+                }
+            }
+        }, 400)
     }
 
     private val vibroBuffer = VibroSampleBuffer()
     private val rawSampling = RawSamplingSession()
     private lateinit var cloudUploader: CloudUploader
+    private lateinit var geoTracker: GeoTracker
     private var spectrumSeq = 1L
     private var fftCollectAttempt = 0
     private var fftSavedPollMs = 0
@@ -487,14 +592,25 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
         finishFftCapture(restorePoll = true)
     }
 
+    private val otaPollRunnable = object : Runnable {
+        override fun run() {
+            runOtaPoll(force = false)
+            mainHandler.postDelayed(this, OTA_POLL_MS)
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         session = ImuSessionStore(this)
         verdictStore = VerdictStore(this)
         offloadExporter = OffloadExporter(this)
+        batteryBenchStore = BatteryBenchStore(this)
         cloudUploader = CloudUploader(this)
+        geoTracker = GeoTracker(this, cloudUploader, ioExecutor)
+        geoTracker.start()
         bleClient = BleImuClient(applicationContext, this)
         createNotificationChannel()
+        mainHandler.postDelayed(otaPollRunnable, OTA_FIRST_DELAY_MS)
     }
 
     override fun onBind(intent: Intent?): IBinder = aidl
@@ -507,6 +623,7 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
             ACTION_BLE_RELAY -> startBleRelayMode()
             ACTION_STOP_AUTOPILOT -> stopAutopilotMode()
             ACTION_STOP_CONNECT_RELAY -> stopConnectRelayMode()
+            ACTION_CHECK_OTA -> runOtaPoll(force = true)
             else -> if (!connected && !autopilotActive && !bleRelayActive) {
                 startForeground(NOTIFICATION_ID, buildNotification())
                 stopForegroundIfIdle()
@@ -516,13 +633,28 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
     }
 
     override fun onDestroy() {
+        mainHandler.removeCallbacks(otaPollRunnable)
         bleClient.disconnect()
+        geoTracker.stop()
         ioExecutor.shutdownNow()
         callbacks.kill()
         super.onDestroy()
     }
 
-    // --- BleImuClient.Listener ---
+    private fun runOtaPoll(force: Boolean) {
+        ioExecutor.execute {
+            try {
+                OtaCoordinator(
+                    this,
+                    bleConnected = { connected },
+                    otaCapable = { caps == 0 || (caps and ImuProtocol.CAP_OTA) != 0 },
+                    liveFwCode = { lastDeviceStatus?.fwVersionCode ?: 0 },
+                ).poll(force)
+            } catch (e: Exception) {
+                Log.w(TAG, "ota poll: ${e.message}")
+            }
+        }
+    }
 
     override fun onStatus(text: String) {
         session.lastStatus = text
@@ -559,6 +691,7 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
 
     override fun onDeviceStatus(status: ImuProtocol.Status) {
         lastDeviceStatus = status
+        OtaSettings(applicationContext).noteFw(status.fwVersion.orEmpty(), status.fwVersionCode ?: 0)
         val synced = status.clockSynced == true
         if (lastClockSyncedUi != synced) {
             lastClockSyncedUi = synced
@@ -586,8 +719,23 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
         rawSampling.onStatus(status)
         WakeRelay.onStatus(bleClient, status)
         reportClockSyncStatus(status)
-        if (status.vibroVerdictLevel != null && status.seq != lastStoredVerdictSeq) {
-            lastStoredVerdictSeq = status.seq
+        status.wrssiDbm?.let { lastWrssi = it }
+        maybeRelayLinkRssi(status.seq)
+        val now = SystemClock.uptimeMillis()
+        if (now - lastTelemetryExportMs >= 30_000L &&
+            (status.chipTempC != null || status.cpuMhzApplied != null || status.spoolCapB != null)
+        ) {
+            lastTelemetryExportMs = now
+            ioExecutor.execute {
+                offloadExporter.exportTelemetry(status)
+                CloudUploadScheduler.enqueueNow(applicationContext)
+            }
+        }
+        if (status.vibroVerdictLevel != null &&
+            (status.pendingSessionSeq ?: 0L) != lastStoredVerdictSeq &&
+            (status.pendingSessionSeq ?: 0L) > 0L
+        ) {
+            lastStoredVerdictSeq = status.pendingSessionSeq ?: status.seq
             ioExecutor.execute {
                 verdictStore.record(status)
                 offloadExporter.exportVerdict(status)
@@ -628,10 +776,16 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
                 add("offload pending")
             }
         }
+        if (OffloadAckStore.highWater(applicationContext) >
+            maxOf(status.offloadAckSeq ?: 0L, lastLocallyAckedSeq)
+        ) {
+            scheduleFlushOffloadAcks(80)
+        }
         if (extras.isNotEmpty()) {
             throttleTelemetry(extras.joinToString(" "))
         }
         broadcastVibroCaptionIfChanged(formatVibroCaption(status))
+        handleBatteryBenchStatus(status)
     }
 
     private fun broadcastVibroCaptionIfChanged(caption: String) {
@@ -676,6 +830,7 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
         val wasConnected = this.connected
         this.connected = connected
         if (connected) {
+            mt200ScanSentThisSession = false
             connectFailureStreak = 0
             captionEpoch++
             mainHandler.removeCallbacks(reconnectWatchdogRunnable)
@@ -684,7 +839,10 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
             clockCheckedThisSession = false
             lastReportedClockCorrMs = -1L
             lastVibroCaption = null
-            bleClient.connectedDeviceAddress()?.let { session.lastBleAddress = it }
+            bleClient.connectedDeviceAddress()?.let { addr ->
+                session.lastBleAddress = addr
+                DeviceIdHelper.maybeSyncCloudDeviceId(CloudSettings(applicationContext), addr)
+            }
             if (userConnectedSession) {
                 enterRelayState(RelayFsmState.CONNECTED, "Connected — live IMU")
             } else if (bleRelayActive) {
@@ -713,6 +871,21 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
                 }, ImuProtocol.ESP_CONNECT_SETTLE_MS)
             }
             scheduleFlushOffloadAcks(ImuProtocol.ESP_CONNECT_SETTLE_MS)
+            mainHandler.postDelayed({
+                if (!this@ImuBleForegroundService.connected) return@postDelayed
+                bleClient.readBatteryBenchState { active, sid, seq ->
+                    if (active && sid > 0L) {
+                        benchSessionId = sid
+                        benchLastSeq = seq
+                        benchWasActive = true
+                        if (benchStartedMs == 0L) benchStartedMs = System.currentTimeMillis()
+                    }
+                }
+            }, ImuProtocol.ESP_CONNECT_SETTLE_MS + 400L)
+            mainHandler.postDelayed({
+                if (!this@ImuBleForegroundService.connected) return@postDelayed
+                maybeStartMt200Bridge()
+            }, ImuProtocol.ESP_CONNECT_SETTLE_MS + 1500L)
             if (bleRelayActive && !userConnectedSession) {
                 // Single connect authority: after ESP grace — crash drain then bridge/cloud.
                 Log.i(TAG, "Relay connected — crash drain after ${ImuProtocol.ESP_CONNECT_SETTLE_MS}ms settle")
@@ -739,6 +912,9 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
             offloadAckInFlight = false
             lastLocallyAckedSeq = 0L
             pendingTelemetry = null
+            lastEspRssi = ImuProtocol.RSSI_UNAVAIL
+            lastWrssi = ImuProtocol.RSSI_UNAVAIL
+            maybeRelayLinkRssi(0L)
             if (wasConnected) {
                 // An unexpected mid-session drop during bridge work (e.g. supervision timeout)
                 // never reaches finishBridgeSyncCycle() — clear it here too. pendingBridgeWork is
@@ -780,7 +956,13 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
     }
 
     override fun onBatch(batch: ImuProtocol.Batch) {
-        // Batches forwarded via onBatchJson.
+        if (batch.mode == ImuProtocol.MODE_RAW && batch.raw.isNotEmpty()) {
+            vibroBuffer.ingestRawBatch(batch)
+            rawSampling.onBatch(batch, vibroBuffer)?.let { hint ->
+                broadcastBanner(hint.level, hint.message)
+            }
+        }
+        broadcastBatch(ImuProtocol.batchToUiJson(batch))
     }
 
     override fun onBatchJson(json: String) {
@@ -794,7 +976,168 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
                 }
             }
         }
+        maybeRelayAhrs(json)
+        maybeRelayImuDeadReckon(json)
+        maybeRelayWearable(json)
         broadcastBatch(json)
+    }
+
+    private var lastAhrsRelayMs = 0L
+
+    /** Throttled relay of the "rot4" (int16 x10000 rotation matrix) DATA JSON field to the
+     *  backend's live AHRS endpoint for the web debug page — see CloudUploader.uploadAhrsSample.
+     *  onBatchJson fires at BLE-tick rate (~30-90 Hz); ~200ms is plenty for a debug viewer and
+     *  keeps this from hammering the network/battery. Best-effort: parse/network failures are
+     *  swallowed, never surfaced to the user or retried. */
+    private fun maybeRelayAhrs(json: String) {
+        if (!cloudUploader.isEnabledForAhrs()) return
+        val now = System.currentTimeMillis()
+        if (now - lastAhrsRelayMs < 200L) return
+        lastAhrsRelayMs = now
+        runCatching {
+            val root = org.json.JSONObject(json)
+            val rot4 = root.optJSONArray("rot4") ?: return
+            if (rot4.length() != 9) return
+            val rot = DoubleArray(9) { i -> rot4.optInt(i, 0) / 10000.0 }
+            val seq = root.optLong("s", 0L)
+            ioExecutor.execute {
+                runCatching { cloudUploader.uploadAhrsSample(seq, now, rot) }
+            }
+        }
+    }
+
+    private var lastImuDeadReckonMs = 0L
+
+    /** Throttled feed of "wdcm"/"yawd100" (firmware v143+) into GeoTracker's dead-reckoning —
+     *  see GeoTracker.onImuSample. ~1s cadence is plenty for a walking-pace demo trace. */
+    private fun maybeRelayImuDeadReckon(json: String) {
+        val now = System.currentTimeMillis()
+        if (now - lastImuDeadReckonMs < 1000L) return
+        runCatching {
+            val root = org.json.JSONObject(json)
+            if (!root.has("wdcm") || !root.has("yawd100")) return
+            lastImuDeadReckonMs = now
+            val walkCm = root.optInt("wdcm", 0)
+            val yawDeg = root.optInt("yawd100", 0) / 100.0
+            geoTracker.onImuSample(walkCm, yawDeg, now)
+        }
+    }
+
+    private var lastWearableRelayMs = 0L
+    private var lastWhr = -1
+    private var lastWsp = -1
+    private var lastWst = -1
+    private var lastWbat = -1
+    private var lastWdcm = -1
+    private var lastEspRssi = ImuProtocol.RSSI_UNAVAIL
+    private var lastWrssi = ImuProtocol.RSSI_UNAVAIL
+    private var lastUploadedEspRssi = Int.MIN_VALUE
+    private var lastUploadedWrssi = Int.MIN_VALUE
+    private var lastWearableSeq = 0L
+    private var mt200ScanSentThisSession = false
+
+    override fun onEspRssi(rssiDbm: Int) {
+        lastEspRssi = ImuProtocol.normalizeRssiDbm(rssiDbm)
+        maybeRelayLinkRssi(lastWearableSeq)
+    }
+
+    /** Throttled relay of firmware DATA piggyback fields (whr/wsp/wst/wbat/wok + wdcm) to
+     *  POST /v1/ingest/wearable. wok=0 means the ESP32 has never locked a watch sample;
+     *  IMU walk_cm still uploads so Grafana can compare against MT200 steps. RSSI rides
+     *  the same POST: phone-measured ESP hop, ESP-measured MT200 hop. */
+    private fun maybeRelayWearable(json: String) {
+        if (!cloudUploader.isEnabledForAhrs()) return
+        runCatching {
+            val root = org.json.JSONObject(json)
+            val wok = root.optInt("wok", 0)
+            val walkCm = if (root.has("wdcm")) root.optInt("wdcm", 0) else null
+            if (root.has("wrssi")) {
+                lastWrssi = ImuProtocol.normalizeRssiDbm(root.optInt("wrssi"))
+            }
+            lastWearableSeq = root.optLong("s", lastWearableSeq)
+            val hr = if (wok != 0) root.optInt("whr", 0).takeIf { it in 30..220 } else null
+            val spo2 = if (wok != 0) root.optInt("wsp", 0).takeIf { it in 70..100 } else null
+            val steps = if (wok != 0 && root.has("wst")) root.optInt("wst", 0) else null
+            val bat = if (wok != 0) root.optInt("wbat", 0).takeIf { it in 1..100 } else null
+            flushWearable(lastWearableSeq, hr, spo2, steps, bat, walkCm)
+        }
+    }
+
+    private fun maybeRelayLinkRssi(seq: Long) {
+        flushWearable(seq, null, null, null, null, null)
+    }
+
+    private fun flushWearable(
+        seq: Long,
+        hr: Int?,
+        spo2: Int?,
+        steps: Int?,
+        bat: Int?,
+        walkCm: Int?,
+    ) {
+        if (!cloudUploader.isEnabledForAhrs()) return
+        val now = System.currentTimeMillis()
+        val hrV = hr ?: -1
+        val spo2V = spo2 ?: -1
+        val stepsV = steps ?: -1
+        val batV = bat ?: -1
+        val walkV = walkCm ?: -1
+        val rssiChanged = lastEspRssi != lastUploadedEspRssi || lastWrssi != lastUploadedWrssi
+        val metricsChanged =
+            hrV != lastWhr || spo2V != lastWsp || stepsV != lastWst ||
+                batV != lastWbat || walkV != lastWdcm
+        val hasMetrics = hr != null || spo2 != null || steps != null || bat != null || walkCm != null
+        if (!hasMetrics && !rssiChanged && now - lastWearableRelayMs < 15_000L) return
+        if (hasMetrics && !metricsChanged && !rssiChanged && now - lastWearableRelayMs < 15_000L) {
+            return
+        }
+        if (now - lastWearableRelayMs < 2_000L) return
+        lastWearableRelayMs = now
+        if (hasMetrics) {
+            lastWhr = hrV
+            lastWsp = spo2V
+            lastWst = stepsV
+            lastWbat = batV
+            lastWdcm = walkV
+        }
+        lastUploadedEspRssi = lastEspRssi
+        lastUploadedWrssi = lastWrssi
+        val rssiEsp = lastEspRssi
+        val rssiMt200 = lastWrssi
+        Log.i(
+            TAG,
+            "Wearable relay hr=$hr spo2=$spo2 steps=$steps bat=$bat walkCm=$walkCm " +
+                "rssiEsp=$rssiEsp rssiMt200=$rssiMt200",
+        )
+        val sendHr = if (hasMetrics) hr else null
+        val sendSpo2 = if (hasMetrics) spo2 else null
+        val sendSteps = if (hasMetrics) steps else null
+        val sendBat = if (hasMetrics) bat else null
+        val sendWalk = if (hasMetrics) walkCm else null
+        ioExecutor.execute {
+            runCatching {
+                cloudUploader.uploadWearableSamples(
+                    seq,
+                    now,
+                    sendHr,
+                    sendSpo2,
+                    sendSteps,
+                    sendBat,
+                    sendWalk,
+                    rssiEsp = rssiEsp,
+                    rssiMt200 = rssiMt200,
+                )
+            }
+        }
+    }
+
+    private fun maybeStartMt200Bridge() {
+        if (mt200ScanSentThisSession) return
+        if (!bleClient.crashServiceAvailable) return
+        mt200ScanSentThisSession = true
+        bleClient.writeCrashCtrl("{\"op\":\"mt200_scan\"}") { ok ->
+            Log.i(TAG, "MT200 scan trigger ${if (ok) "ok" else "failed"}")
+        }
     }
 
     override fun onCaps(caps: Int) {
@@ -845,16 +1188,18 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
         mainHandler.postDelayed(r, delayMs)
     }
 
-    /** One queued GATT write per pending offload — stale SQLite seqs must not flood CMD. */
+    /** One GATT write: high-water seq the backend (or local queue if cloud off) has taken. */
     private fun flushOffloadAcks() {
         if (!connected || offloadAckInFlight) return
         val status = lastDeviceStatus ?: return
-        if ((status.offloadPending ?: 0) <= 0) return
-
         val lastAck = maxOf(status.offloadAckSeq ?: 0L, lastLocallyAckedSeq)
-        val seqToAck = status.pendingSessionSeq?.takeIf { it > lastAck }
-            ?: lastStoredVerdictSeq.takeIf { it > lastAck }
-            ?: return
+        val cloudHw = OffloadAckStore.highWater(applicationContext)
+        val seqToAck = when {
+            cloudHw > lastAck -> cloudHw
+            !CloudSettings(applicationContext).enabled ->
+                status.pendingSessionSeq?.takeIf { it > lastAck }
+            else -> null
+        } ?: return
 
         offloadAckInFlight = true
         bleClient.ackOffloadSeq(seqToAck) { ok ->
@@ -863,14 +1208,6 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
                 if (ok) {
                     lastLocallyAckedSeq = seqToAck
                     ioExecutor.execute { verdictStore.markAcked(seqToAck) }
-                    // Only chase another round if we already know (locally) there's a seq beyond
-                    // the one we just ACKed — otherwise wait for the next real trigger (new
-                    // verdict / STATUS poll) instead of blindly re-polling every 800ms.
-                    val moreKnownLocally = (lastDeviceStatus?.pendingSessionSeq ?: 0L) > seqToAck ||
-                        lastStoredVerdictSeq > seqToAck
-                    if (moreKnownLocally) {
-                        scheduleFlushOffloadAcks(800)
-                    }
                 }
             }
         }
@@ -955,8 +1292,15 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
     }
 
     private fun finishBleRelaySession(reason: String) {
-        if (connected && bleRelayActive && !userConnectedSession && !uiVisible) {
+        val keepWearable = connected && CloudSettings(applicationContext).enabled
+        if (connected && bleRelayActive && !userConnectedSession && !uiVisible && !keepWearable) {
             bleClient.disconnect()
+        }
+        if (keepWearable && !userConnectedSession && !uiVisible) {
+            bleClient.startWearableDataPoll()
+            enterRelayState(RelayFsmState.CONNECTED, "Connected — wearable relay")
+            Log.i(TAG, "Keeping BLE link for wearable relay ($reason)")
+            return
         }
         if (userConnectedSession || uiVisible) {
             if (connected) {
@@ -1150,6 +1494,7 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
             return
         }
         bleClient.fetchAllPendingCrashes { crashes ->
+            Log.i(TAG, "Crash drain: fetched ${crashes.size} pending crash(es)")
             if (crashes.isEmpty()) {
                 onDone()
                 return@fetchAllPendingCrashes
@@ -1159,6 +1504,11 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
                     offloadExporter.exportCrashJson(CrashFetcher.toOffloadJson(info))
                 }
                 val upload = cloudUploader.uploadPendingCrashes(crashes.size.coerceAtLeast(1))
+                Log.i(
+                    TAG,
+                    "Crash drain: upload ok=${upload.ok} accepted=${upload.accepted} " +
+                        "duplicates=${upload.duplicates} msg=${upload.message}",
+                )
                 mainHandler.post {
                     if (!connected) {
                         onDone()
@@ -1216,6 +1566,7 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
 
     private fun clearDeviceCrashSlots(crashes: List<CrashFetcher.CrashInfo>) {
         val slots = crashes.mapNotNull { it.slot.takeIf { s -> s >= 0 } }
+        Log.i(TAG, "Crash drain: clearing slots=$slots (from ${crashes.size} crash(es))")
         if (slots.isNotEmpty()) {
             bleClient.clearDeviceCrashSlots(slots)
         }
@@ -1576,12 +1927,35 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
         syncConfigThenBridgeSetup()
     }
 
+    /** Handshake config reconciliation — see ConfigCloudSync.reconcile() for the priority rule
+     *  (device wins unless the cloud is strictly newer). Called from both the manual
+     *  requestConfigSync() AIDL entrypoint and the periodic background bridge sync, i.e. every
+     *  point where the phone freshly reads the ESP's live config. Runs on ioExecutor (network). */
+    private fun reconcileConfigWithCloud(doc: DeviceConfigJson.Doc, blob: ByteArray) {
+        ioExecutor.execute {
+            when (val result = runCatching { ConfigCloudSync.reconcile(applicationContext, doc, blob) }.getOrNull()) {
+                is ConfigCloudSync.ReconcileResult.PushToDevice -> {
+                    bleClient.pushConfigToDevice(result.blob, true) { ok ->
+                        broadcastBanner(
+                            if (ok) StatusBannerLevel.OK else StatusBannerLevel.ERROR,
+                            if (ok) "Cloud config (rev ${result.cloudRevision}) applied to device"
+                            else "Cloud config push to device failed",
+                        )
+                    }
+                }
+                is ConfigCloudSync.ReconcileResult.UploadedToCloud, null -> Unit
+            }
+        }
+    }
+
     private fun syncConfigThenBridgeSetup() {
         ioExecutor.execute {
             bleClient.syncConfigFromDevice { blob ->
                 if (blob != null) {
                     session.saveLocalConfig(blob)
                     broadcastConfig(blob)
+                    val doc = DeviceConfigJson.fromBlob(blob, "esp")
+                    reconcileConfigWithCloud(doc, blob)
                 }
                 mainHandler.post {
                     if (!connected || !bridgeSyncActive) {
@@ -1784,6 +2158,170 @@ class ImuBleForegroundService : Service(), BleImuClient.Listener {
 
     private fun broadcastEspScreen(on: Boolean) {
         foreachCallback { it.onEspScreenState(on) }
+    }
+
+    private fun startBatteryBenchInternal(label: String) {
+        if (!connected) {
+            broadcastBanner(StatusBannerLevel.WARN, "Connect BLE first")
+            return
+        }
+        if (benchUserActive || lastDeviceStatus?.benchActive == true) {
+            broadcastBanner(StatusBannerLevel.WARN, "Battery bench already running")
+            return
+        }
+        benchLabel = label.ifBlank { null }
+        benchUserActive = true
+        benchStartedMs = System.currentTimeMillis()
+        benchLastSeq = -1L
+        benchLastVoltage = null
+        benchLastTs = 0L
+        bleClient.setBatteryBench(true) { ok ->
+            if (!ok) {
+                benchUserActive = false
+                benchStartedMs = 0L
+            } else {
+                broadcastBanner(
+                    StatusBannerLevel.OK,
+                    "Battery bench started — unplug USB for accurate discharge",
+                )
+            }
+        }
+    }
+
+    private fun stopBatteryBenchInternal() {
+        if (!connected) return
+        val prior = lastDeviceStatus
+        bleClient.setBatteryBench(false) { ok ->
+            benchUserActive = false
+            if (ok && prior != null && prior.benchSessionId != null) {
+                val stopSeq = (benchLastSeq + 1).coerceAtLeast(0L)
+                recordBenchSample(prior, sessionStopped = true, forceSeq = stopSeq)
+            }
+            ioExecutor.execute {
+                val upload = cloudUploader.uploadPendingBatteryBench(500)
+                mainHandler.post {
+                    if (upload.accepted > 0) {
+                        broadcastBanner(StatusBannerLevel.OK, "Bench: uploaded ${upload.accepted} samples")
+                    }
+                }
+            }
+        }
+    }
+
+    private var benchWasActive = false
+    private var lastBenchDcWarnMs = 0L
+
+    private fun handleBatteryBenchStatus(status: ImuProtocol.Status) {
+        val active = status.benchActive
+        val sid = status.benchSessionId ?: 0L
+        val seq = status.benchSampleSeq ?: -1L
+
+        if (active && sid > 0L && seq >= 0L && seq != benchLastSeq) {
+            recordBenchSample(status, sessionStopped = false)
+            benchLastSeq = seq
+            benchSessionId = sid
+            val now = System.currentTimeMillis()
+            benchLastVoltage = status.voltageV
+            benchLastTs = now
+            if (benchStartedMs == 0L) benchStartedMs = now
+        }
+
+        if (active && status.powerSource == ImuProtocol.POWER_DC_USB) {
+            val now = SystemClock.uptimeMillis()
+            if (now - lastBenchDcWarnMs > 30_000L) {
+                lastBenchDcWarnMs = now
+                broadcastBanner(StatusBannerLevel.WARN, "Bench on USB/DC — unplug for discharge measurement")
+            }
+        }
+
+        val elapsed = if (benchStartedMs > 0L) System.currentTimeMillis() - benchStartedMs else 0L
+        val dtMs = if (benchLastTs > 0L) System.currentTimeMillis() - benchLastTs else 0L
+        val estMa = BatteryBenchEstimator.estimateMa(status.voltageV, benchLastVoltage, dtMs) ?: 0f
+
+        if (active || benchUserActive || benchWasActive) {
+            broadcastBatteryBench(
+                active,
+                sid,
+                seq.coerceAtLeast(0L),
+                status.voltageV,
+                status.percent,
+                elapsed,
+                estMa,
+            )
+        }
+
+        if (benchWasActive && !active) {
+            benchUserActive = false
+            benchStartedMs = 0L
+            benchLastSeq = -1L
+            ioExecutor.execute {
+                val upload = cloudUploader.uploadPendingBatteryBench(500)
+                mainHandler.post {
+                    if (upload.accepted > 0) {
+                        broadcastBanner(StatusBannerLevel.OK, "Bench ended — uploaded ${upload.accepted} samples")
+                    }
+                }
+            }
+        }
+        benchWasActive = active
+    }
+
+    private fun recordBenchSample(
+        status: ImuProtocol.Status,
+        sessionStopped: Boolean,
+        forceSeq: Long? = null,
+    ) {
+        val sid = status.benchSessionId ?: benchSessionId
+        if (sid <= 0L) return
+        val seq = forceSeq ?: status.benchSampleSeq ?: benchLastSeq.takeIf { it >= 0L } ?: return
+        val now = System.currentTimeMillis()
+        val sample = BatteryBenchStore.Sample(
+            sessionId = sid,
+            seq = seq,
+            tsMs = now,
+            voltageV = status.voltageV,
+            pct = status.percent,
+            trendV = status.trendV,
+            src = status.powerSource,
+            cpuMhz = status.cpuMhzApplied,
+            imuHz = status.imuHzTarget,
+            renderHz = status.renderHzTarget,
+            chipTempC = status.chipTempC,
+            uptimeMs = status.benchUptimeMs,
+            sessionStartedMs = benchStartedMs.takeIf { it > 0L } ?: now,
+            sessionStopped = sessionStopped,
+            label = benchLabel,
+            profileSnapshot = benchProfileSnapshot(status),
+        )
+        ioExecutor.execute {
+            batteryBenchStore.append(sample)
+            CloudUploadScheduler.enqueueNow(applicationContext)
+        }
+    }
+
+    private fun benchProfileSnapshot(status: ImuProtocol.Status): org.json.JSONObject? {
+        val o = org.json.JSONObject()
+        var any = false
+        status.powerProfile?.let { o.put("power_profile", it); any = true }
+        status.cpuMhzApplied?.let { o.put("cpu_mhz", it); any = true }
+        status.imuHzTarget?.let { o.put("imu_hz", it); any = true }
+        status.renderHzTarget?.let { o.put("render_hz", it); any = true }
+        status.screenOn?.let { o.put("screen_on", it); any = true }
+        return if (any) o else null
+    }
+
+    private fun broadcastBatteryBench(
+        active: Boolean,
+        sessionId: Long,
+        sampleSeq: Long,
+        voltageV: Float,
+        pct: Int,
+        elapsedMs: Long,
+        estMa: Float,
+    ) {
+        foreachCallback {
+            it.onBatteryBench(active, sessionId, sampleSeq, voltageV, pct, elapsedMs, estMa)
+        }
     }
 
     /**

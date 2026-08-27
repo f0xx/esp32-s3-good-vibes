@@ -47,6 +47,9 @@ class MainActivity : AppCompatActivity() {
     private var lastCpuMhzOverride = 0
     private var lastImuHzOverride = 0
     private var drawFpsCap = 0
+    private var otaDialogShowing = false
+    private var acceptedFwVersion: String? = null
+    private var acceptedFwVersionCode: Int = 0
     private var lastDrawApplyUptimeMs = 0L
     private var blockPreConnectCaptions = false
     private var captionEpoch = 0
@@ -137,17 +140,21 @@ class MainActivity : AppCompatActivity() {
         wireControls()
         serviceController.startAndBind()
         handleCloudSetupIntent(intent)
+        handleOtaPromptIntent(intent)
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
         handleCloudSetupIntent(intent)
+        handleOtaPromptIntent(intent)
     }
 
     override fun onStart() {
         super.onStart()
         AppEventHub.onBanner = { level, message -> statusBanner.show(level, message) }
+        OtaOfferHub.onOffer = { offer -> showOtaPrompt(offer) }
+        OtaOfferHub.pending?.let { showOtaPrompt(it) }
         if (::serviceController.isInitialized) {
             serviceController.setUiVisible(true)
             serviceController.requestState()
@@ -156,6 +163,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStop() {
         AppEventHub.onBanner = null
+        OtaOfferHub.onOffer = null
         if (::serviceController.isInitialized) {
             serviceController.setUiVisible(false)
         }
@@ -219,11 +227,11 @@ class MainActivity : AppCompatActivity() {
         deviceMenuButton.setOnClickListener { showDeviceMenu() }
     }
 
-    private enum class VibroMenuItem { REF_PROFILES, HISTORY, FFT, MODE }
+    private enum class VibroMenuItem { REF_WIZARD, REF_PROFILES, HISTORY, FFT, MODE }
 
     private enum class DeviceMenuItem {
-        PROFILE, CONFIG_EDITOR, MIX, ERASE_NVS, CRASH_DEBUG, WIFI, SYNC, OTA, CLOUD, SCREEN,
-        PERFORMANCE, DRAW_FPS,
+        PROFILE, CONFIG_EDITOR, MIX, ERASE_NVS, CRASH_DEBUG, BATTERY_BENCH, FLOOR_CALIB, AHRS, WIFI, SYNC, OTA_CHECK, OTA, CLOUD,
+        SCREEN, PERFORMANCE, DRAW_FPS,
     }
 
     private fun showVibroMenu() {
@@ -232,6 +240,7 @@ class MainActivity : AppCompatActivity() {
             .setTitle(R.string.menu_vibro)
             .setItems(items.map { vibroMenuLabel(it) }.toTypedArray()) { _, which ->
                 when (items[which]) {
+                    VibroMenuItem.REF_WIZARD -> VibroRefWizardActivity.open(this)
                     VibroMenuItem.REF_PROFILES -> showVibroRefProfilesMenu()
                     VibroMenuItem.HISTORY -> showVerdictHistory()
                     VibroMenuItem.FFT -> {
@@ -265,6 +274,18 @@ class MainActivity : AppCompatActivity() {
                         confirmEraseNvs()
                     }
                     DeviceMenuItem.CRASH_DEBUG -> CrashDebugActivity.open(this)
+                    DeviceMenuItem.BATTERY_BENCH -> {
+                        if (!requireBleConnected { showDeviceMenu() }) return@setItems
+                        BatteryBenchActivity.open(this)
+                    }
+                    DeviceMenuItem.FLOOR_CALIB -> {
+                        if (!requireBleConnected { showDeviceMenu() }) return@setItems
+                        FloorCalibActivity.open(this)
+                    }
+                    DeviceMenuItem.AHRS -> {
+                        if (!requireBleConnected { showDeviceMenu() }) return@setItems
+                        AhrsActivity.open(this)
+                    }
                     DeviceMenuItem.WIFI -> {
                         if (!requireBleConnected { showDeviceMenu() }) return@setItems
                         startActivity(Intent(this, WifiWizardActivity::class.java))
@@ -275,6 +296,13 @@ class MainActivity : AppCompatActivity() {
                             return@setItems
                         }
                         imuService?.requestConfigSync()
+                    }
+                    DeviceMenuItem.OTA_CHECK -> {
+                        statusText.text = getString(R.string.ota_check_cloud)
+                        val i = Intent(this, ImuBleForegroundService::class.java).apply {
+                            action = ImuBleForegroundService.ACTION_CHECK_OTA
+                        }
+                        startForegroundService(i)
                     }
                     DeviceMenuItem.OTA -> {
                         if (!connected) {
@@ -294,6 +322,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun vibroMenuLabel(item: VibroMenuItem): String = when (item) {
+        VibroMenuItem.REF_WIZARD -> getString(R.string.vibro_ref_wizard_menu)
         VibroMenuItem.REF_PROFILES -> getString(R.string.vibro_ref_profiles)
         VibroMenuItem.HISTORY -> getString(R.string.vibro_history)
         VibroMenuItem.FFT -> getString(R.string.vibro_fft)
@@ -306,8 +335,12 @@ class MainActivity : AppCompatActivity() {
         DeviceMenuItem.MIX -> getString(R.string.vibro_mix_settings)
         DeviceMenuItem.ERASE_NVS -> getString(R.string.erase_nvs_menu)
         DeviceMenuItem.CRASH_DEBUG -> getString(R.string.crash_debug_menu)
+        DeviceMenuItem.BATTERY_BENCH -> getString(R.string.battery_bench_menu)
+        DeviceMenuItem.FLOOR_CALIB -> getString(R.string.floor_calib_menu)
+        DeviceMenuItem.AHRS -> getString(R.string.ahrs_menu)
         DeviceMenuItem.WIFI -> getString(R.string.wifi_wizard)
         DeviceMenuItem.SYNC -> "Sync cfg"
+        DeviceMenuItem.OTA_CHECK -> getString(R.string.ota_check_cloud)
         DeviceMenuItem.OTA -> getString(R.string.ota_file)
         DeviceMenuItem.CLOUD -> getString(R.string.cloud_settings)
         DeviceMenuItem.PERFORMANCE -> "CPU / IMU speed"
@@ -647,6 +680,13 @@ class MainActivity : AppCompatActivity() {
                     if (ok) StatusBannerLevel.OK else StatusBannerLevel.ERROR,
                     if (ok) "OK!" else "OTA failed: $message",
                 )
+                if (ok) {
+                    acceptedFwVersion?.let {
+                        OtaSettings(this@MainActivity).noteFw(it, acceptedFwVersionCode)
+                    }
+                }
+                acceptedFwVersion = null
+                acceptedFwVersionCode = 0
             }
         }
 
@@ -747,12 +787,17 @@ class MainActivity : AppCompatActivity() {
                 PreparedUi.Frame(power, buildComputedFrame(record, batch.screenW, batch.screenH))
             }
             ImuProtocol.MODE_SCENE -> {
-                val record = batch.scene.lastOrNull()
-                    ?: return PreparedUi.Waiting("Scene: waiting for frame…")
-                PreparedUi.Frame(
-                    power,
-                    SceneFrame.SceneDirect(record, batch.screenW, batch.screenH),
-                )
+                val computed = batch.computed.lastOrNull()
+                if (computed != null) {
+                    PreparedUi.Frame(power, buildComputedFrame(computed, batch.screenW, batch.screenH))
+                } else {
+                    val record = batch.scene.lastOrNull()
+                        ?: return PreparedUi.Waiting("Scene: waiting for frame…")
+                    PreparedUi.Frame(
+                        power,
+                        SceneFrame.SceneDirect(record, batch.screenW, batch.screenH),
+                    )
+                }
             }
             else -> PreparedUi.Waiting("Unknown mode ${batch.mode}")
         }
@@ -1199,6 +1244,74 @@ class MainActivity : AppCompatActivity() {
         setIntent(Intent(this, MainActivity::class.java))
     }
 
+    private fun handleOtaPromptIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra(OtaNotifier.EXTRA_OTA_PROMPT, false) != true) return
+        OtaOfferHub.pending?.let { showOtaPrompt(it) }
+    }
+
+    private fun showOtaPrompt(offer: OtaOffer) {
+        if (otaDialogShowing || isFinishing) return
+        otaDialogShowing = true
+        AlertDialog.Builder(this)
+            .setTitle(offer.title)
+            .setMessage(offer.body)
+            .setPositiveButton(R.string.ota_install) { _, _ ->
+                otaDialogShowing = false
+                acceptOta(offer)
+            }
+            .setNegativeButton(R.string.ota_later) { _, _ ->
+                otaDialogShowing = false
+                declineOta(offer)
+            }
+            .setOnCancelListener {
+                otaDialogShowing = false
+                declineOta(offer)
+            }
+            .show()
+    }
+
+    private fun declineOta(offer: OtaOffer) {
+        OtaOfferHub.clear()
+        val s = OtaSettings(this)
+        if (offer.kind == OtaOffer.Kind.APK) {
+            s.declinedApkVersionCode = offer.apkVersionCode
+        } else {
+            s.declinedFwVersionCode = offer.fwVersionCode
+        }
+        statusText.text = getString(R.string.ota_later)
+    }
+
+    private fun acceptOta(offer: OtaOffer) {
+        OtaOfferHub.clear()
+        when (offer.kind) {
+            OtaOffer.Kind.APK -> {
+                if (!ApkInstaller.canInstall(this)) {
+                    statusBanner.show(StatusBannerLevel.WARN, getString(R.string.ota_need_unknown_sources))
+                    ApkInstaller.openUnknownSourcesSettings(this)
+                    return
+                }
+                statusText.text = "Installing APK ${offer.versionLabel}…"
+                if (!ApkInstaller.install(this, offer.file)) {
+                    statusBanner.show(StatusBannerLevel.ERROR, "APK install failed")
+                }
+            }
+            OtaOffer.Kind.FW -> {
+                val svc = imuService
+                if (svc == null || !connected) {
+                    statusText.text = getString(R.string.connect_ble_first)
+                    return
+                }
+                acceptedFwVersion = offer.versionLabel
+                acceptedFwVersionCode = offer.fwVersionCode
+                statusText.text = "OTA uploading ${offer.file.length()} B…"
+                Thread {
+                    val bytes = offer.file.readBytes()
+                    runOnUiThread { svc.uploadFirmware(bytes) }
+                }.start()
+            }
+        }
+    }
+
     private fun reportCloudUploadResult(batch: CloudUploader.BatchResult?) {
         if (batch == null) {
             if (!cloudSettings.enabled) {
@@ -1212,8 +1325,13 @@ class MainActivity : AppCompatActivity() {
             .firstOrNull { !it.ok && it.message != "cloud disabled" }
         when {
             batch.totalAccepted > 0 -> {
-                statusBanner.show(StatusBannerLevel.OK, "OK! Uploaded ${batch.summary}")
+                statusBanner.show(StatusBannerLevel.OK, "Uploaded ${batch.summary}")
                 statusText.text = "Cloud upload: ${batch.summary}"
+            }
+            batch.verdicts.ok && batch.spectra.ok && batch.crashes.ok &&
+                batch.batteryBench.ok && batch.telemetry.ok -> {
+                statusBanner.show(StatusBannerLevel.OK, "Cloud synced — ${batch.summary}")
+                statusText.text = "Cloud: ${batch.summary}"
             }
             !cloudSettings.enabled -> {
                 statusBanner.show(StatusBannerLevel.WARN, "Cloud off — set API key first")

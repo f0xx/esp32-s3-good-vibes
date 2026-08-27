@@ -17,6 +17,7 @@
 #include "ble_crash_gatt.h"
 #include "ble_looper.h"
 #include "device_config.h"
+#include "battery_bench.h"
 #include "ble_imu_gatt.h"
 #include "ble_net_gatt.h"
 #include "ble_ota_gatt.h"
@@ -24,20 +25,25 @@
 #include "bist.h"
 #include "crash_debug.h"
 #include "crash_report.h"
+#include "fw_version.h"
 #include "display_panel.h"
 #include "imu_pipeline.h"
 #include "network_manager.h"
+#include "ota_ab.h"
 #include "panel_backlight.h"
 #include "panel_fb.h"
 #include "power_manager.h"
 #include "scene_live.h"
 #include "scene_zoom.h"
+#include "soft_reboot.h"
 #include "radio_scheduler.h"
 #include "stall_watchdog.h"
 #include "clock_sync.h"
 #include "vibro_capture.h"
 #include "vibro_schedule.h"
 #include "ws2812_gpio38.h"
+#include "vibro_led.h"
+#include "mt200_bridge.h"
 
 LOG_MODULE_REGISTER(handshake, LOG_LEVEL_INF);
 
@@ -53,6 +59,53 @@ static struct k_thread render_thread;
 static uint32_t last_hb_ms;
 static uint32_t hb_render_frames;
 static uint32_t render_next_ms;
+
+/*
+ * Render-thread stage marker — diagnostic only, added after repeated intermittent "render
+ * stall panic" (EXCCAUSE 63, always the same generic k_panic() PC — that's the *main* thread's
+ * panic call site, not where the render thread actually got stuck, so it tells us nothing on
+ * its own). Recorded by render_thread_fn before/after each of its blocking calls so the next
+ * occurrence's "render stalled" log line names the actual hung call and how long it's been
+ * stuck there, instead of just "frames==0 for 20s".
+ */
+enum render_stage {
+	RENDER_STAGE_IDLE = 0,
+	RENDER_STAGE_SYNC,
+	RENDER_STAGE_BACKLIGHT,
+	RENDER_STAGE_SNAPSHOT,
+	RENDER_STAGE_ZOOM,
+	RENDER_STAGE_DRAW,
+	RENDER_STAGE_SLEEP,
+};
+
+static volatile uint8_t g_render_stage;
+static volatile uint32_t g_render_stage_ms;
+
+static const char *render_stage_name(uint8_t stage)
+{
+	switch (stage) {
+	case RENDER_STAGE_SYNC:
+		return "power_manager_sync_render";
+	case RENDER_STAGE_BACKLIGHT:
+		return "panel_backlight_reapply";
+	case RENDER_STAGE_SNAPSHOT:
+		return "imu_pipeline_snapshot";
+	case RENDER_STAGE_ZOOM:
+		return "scene_zoom_tick";
+	case RENDER_STAGE_DRAW:
+		return "scene_live_draw";
+	case RENDER_STAGE_SLEEP:
+		return "k_msleep";
+	default:
+		return "idle";
+	}
+}
+
+static void render_stage_mark(enum render_stage stage)
+{
+	g_render_stage = (uint8_t)stage;
+	g_render_stage_ms = k_uptime_get_32();
+}
 
 static bool panel_hw_apply(bool on)
 {
@@ -105,15 +158,20 @@ static void render_thread_fn(void *p1, void *p2, void *p3)
 		const uint32_t period = power_manager_render_interval_ms();
 
 		stall_watchdog_feed_render();
+		render_stage_mark(RENDER_STAGE_SYNC);
 		power_manager_sync_render();
 
 		if (power_manager_tft_render_enabled()) {
 			struct imu_sample sample;
 
+			render_stage_mark(RENDER_STAGE_BACKLIGHT);
 			panel_backlight_reapply();
+			render_stage_mark(RENDER_STAGE_SNAPSHOT);
 			if (imu_pipeline_snapshot(&sample, NULL)) {
+				render_stage_mark(RENDER_STAGE_ZOOM);
 				scene_zoom_tick(&sample);
 			}
+			render_stage_mark(RENDER_STAGE_DRAW);
 			scene_live_draw(display_dev);
 			hb_render_frames++;
 			stall_watchdog_feed_render();
@@ -126,6 +184,7 @@ static void render_thread_fn(void *p1, void *p2, void *p3)
 
 		const int32_t sleep_ms = (int32_t)(render_next_ms - k_uptime_get_32());
 
+		render_stage_mark(RENDER_STAGE_SLEEP);
 		k_msleep(sleep_ms > 0 ? (uint32_t)sleep_ms : 1U);
 	}
 }
@@ -147,8 +206,12 @@ int main(void)
 	stall_watchdog_feed_main();
 	(void)settings_subsys_init();
 	device_config_init();
+	soft_reboot_init();
+	ota_ab_init();
 
 	crash_report_init();
+	ota_ab_on_boot();
+	soft_reboot_post_boot();
 	stall_watchdog_feed_main();
 
 	LOG_INF("stage: config load");
@@ -168,12 +231,13 @@ int main(void)
 	power_manager_set_display_busy_query(panel_display_busy);
 	power_manager_set_imu_reschedule_cb(imu_pipeline_reschedule);
 	power_manager_init();
+	battery_bench_init();
 	radio_scheduler_init(ble_imu_gatt_set_traffic_paused);
 
 	LOG_INF("stage: network manager");
 	network_manager_init();
 
-	LOG_INF("handshake v121 — screen-off idle IMU/CPU tiers");
+	LOG_INF("%s — MCUboot A/B OTA", FW_VERSION_NAME);
 
 	LOG_INF("stage: clock / NTP scheduler");
 	clock_sync_ntp_init();
@@ -192,6 +256,7 @@ int main(void)
 	bist_run();
 #endif
 	scene_live_init(display_dev);
+	vibro_led_init();
 	stall_watchdog_feed_main();
 
 	crash_report_persist_boot_crash();
@@ -199,6 +264,7 @@ int main(void)
 	LOG_INF("stage: BLE");
 	(void)ble_looper_init();
 	start_ble();
+	mt200_bridge_autostart();
 	stall_watchdog_feed_main();
 
 	power_manager_mark_ready();
@@ -214,9 +280,11 @@ int main(void)
 		const uint32_t now = k_uptime_get_32();
 
 		if (boot_button_take_toggle_request()) {
-			stall_watchdog_feed_main();
-			power_manager_toggle_mode();
-			stall_watchdog_feed_main();
+			if (!battery_bench_config_locked()) {
+				stall_watchdog_feed_main();
+				power_manager_toggle_mode();
+				stall_watchdog_feed_main();
+			}
 		}
 		boot_button_poll();
 		crash_debug_poll();
@@ -224,13 +292,22 @@ int main(void)
 		ble_looper_poll();
 		imu_pipeline_poll();
 		device_config_poll();
+		ota_ab_poll();
 		clock_sync_ntp_poll();
 		battery_monitor_tick();
+		if (battery_bench_safety_poll()) {
+			ble_imu_gatt_bench_sample();
+		}
 		chip_temp_tick();
 		power_manager_tick();
+		if (battery_bench_tick(now)) {
+			ble_imu_gatt_bench_sample();
+		}
 		network_manager_tick();
 		ble_net_gatt_tick();
 		vibro_capture_session_tick(now);
+		vibro_capture_poll();
+		vibro_led_poll();
 		{
 			const struct device_config_v1 *dcfg = device_config_runtime();
 
@@ -254,8 +331,14 @@ int main(void)
 			stall_watchdog_hb_window(hb_render_frames, screen_on, imu_ticks);
 
 			if (screen_on && hb_render_frames == 0U) {
-				LOG_WRN("render stalled (%ums) — nudge panel on render thread",
-					window);
+				const uint8_t stage = g_render_stage;
+				char spi_info[64];
+
+				(void)panel_fb_flush_stall_info(spi_info, sizeof(spi_info));
+				LOG_WRN("render stalled (%ums) — nudge panel on render thread "
+					"(stuck@%s for %ums) spi: %s",
+					window, render_stage_name(stage),
+					now - g_render_stage_ms, spi_info);
 				panel_backlight_reapply();
 				power_manager_request_panel_hw(true);
 			}
@@ -267,6 +350,7 @@ int main(void)
 
 			power_manager_log_telemetry(hb_render_frames, imu_ticks, window,
 						    panel_fb_last_flush_ms());
+			imu_pipeline_log_motion();
 			hb_render_frames = 0;
 			last_hb_ms = now;
 		}

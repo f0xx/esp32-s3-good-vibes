@@ -12,6 +12,7 @@ class OffloadExporter(private val context: Context) {
     private val verdictFile = File(dir, "verdicts.jsonl")
     private val spectrumFile = File(dir, "spectra.jsonl")
     private val crashFile = File(dir, "crashes.jsonl")
+    private val telemetryFile = File(dir, "telemetry.jsonl")
 
     fun exportVerdict(status: ImuProtocol.Status) {
         val level = status.vibroVerdictLevel
@@ -28,9 +29,31 @@ class OffloadExporter(private val context: Context) {
             put("voltage", status.voltageV)
             status.powerProfile?.let { put("power_profile", it) }
             status.chipTempC?.let { put("chip_temp_c", it) }
+            status.cpuMhzApplied?.let { put("cpu_mhz", it) }
+            status.apbMhz?.let { put("apb_mhz", it) }
+            status.spoolFreeB?.let { put("spool_free_b", it) }
+            status.spoolCapB?.let { put("spool_cap_b", it) }
+            status.spoolPending?.let { put("spool_pending", it) }
             putEdgeFeatures(status)
         }.toString() + "\n"
         FileOutputStream(verdictFile, true).use { it.write(line.toByteArray()) }
+    }
+
+    /** Periodic STATUS telemetry for Grafana (temp/cpu/apb/spool). */
+    fun exportTelemetry(status: ImuProtocol.Status) {
+        val ts = status.clockUnixSec?.takeIf { it > 0L }?.times(1000L) ?: System.currentTimeMillis()
+        val line = JSONObject().apply {
+            put("type", "telemetry")
+            put("ts_ms", ts)
+            status.chipTempC?.let { put("chip_temp_c", it) }
+            status.cpuMhzApplied?.let { put("cpu_mhz", it) }
+            status.apbMhz?.let { put("apb_mhz", it) }
+            status.spoolFreeB?.let { put("spool_free_b", it) }
+            status.spoolCapB?.let { put("spool_cap_b", it) }
+            status.spoolPending?.let { put("spool_pending", it) }
+            status.dramFreeKb?.let { put("dram_free_kb", it) }
+        }.toString() + "\n"
+        FileOutputStream(telemetryFile, true).use { it.write(line.toByteArray()) }
     }
 
     private fun JSONObject.putEdgeFeatures(status: ImuProtocol.Status) {
@@ -103,6 +126,27 @@ class OffloadExporter(private val context: Context) {
     }
 
     @Synchronized
+    fun drainPendingTelemetry(maxLines: Int): List<String> {
+        if (!telemetryFile.exists() || maxLines <= 0) return emptyList()
+        val all = telemetryFile.readLines().filter { it.isNotBlank() }
+        if (all.isEmpty()) return emptyList()
+        val take = all.take(maxLines)
+        rewriteTelemetry(all.drop(take.size))
+        return take
+    }
+
+    @Synchronized
+    fun restoreTelemetry(lines: List<String>) {
+        if (lines.isEmpty()) return
+        val existing = if (telemetryFile.exists()) {
+            telemetryFile.readLines().filter { it.isNotBlank() }
+        } else {
+            emptyList()
+        }
+        rewriteTelemetry(lines + existing)
+    }
+
+    @Synchronized
     fun drainPendingLines(maxLines: Int): List<String> {
         if (!verdictFile.exists() || maxLines <= 0) return emptyList()
         val all = verdictFile.readLines().filter { it.isNotBlank() }
@@ -166,6 +210,14 @@ class OffloadExporter(private val context: Context) {
             return
         }
         crashFile.writeText(lines.joinToString("\n", postfix = "\n"))
+    }
+
+    private fun rewriteTelemetry(lines: List<String>) {
+        if (lines.isEmpty()) {
+            telemetryFile.delete()
+            return
+        }
+        telemetryFile.writeText(lines.joinToString("\n", postfix = "\n"))
     }
 
     fun lineCount(): Int {

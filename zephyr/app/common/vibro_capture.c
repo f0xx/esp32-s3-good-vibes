@@ -6,16 +6,24 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/atomic.h>
 
 #include "device_config.h"
+#include "flash_safety.h"
 #include "vibro_features.h"
 #include "vibro_band_rms.h"
 #include "vibro_ref_store.h"
 #include "vibro_schedule.h"
 #include "clock_sync.h"
 #include "vibro_verdict_store.h"
+#include "stall_watchdog.h"
 
 LOG_MODULE_REGISTER(vibro_cap, LOG_LEVEL_INF);
+
+__weak void vibro_led_on_verdict(enum vibro_level level)
+{
+	ARG_UNUSED(level);
+}
 
 struct vibro_capture_state {
 	struct imu_sample ring[VIBRO_CAPTURE_MAX_SAMPLES];
@@ -53,6 +61,7 @@ struct vibro_capture_state {
 };
 
 static struct vibro_capture_state g_vib;
+static atomic_t g_ref_commit_pending;
 
 static float magnitude_g(const struct imu_sample *s)
 {
@@ -303,7 +312,8 @@ void vibro_capture_push(const struct imu_sample *sample)
 		}
 		if (g_vib.ref_len >= g_vib.ref_max_record_samples ||
 		    g_vib.ref_len >= VIBRO_REF_MAG_MAX) {
-			(void)vibro_capture_stop_reference();
+			g_vib.ref_recording = false;
+			atomic_set(&g_ref_commit_pending, 1);
 		}
 	}
 }
@@ -326,6 +336,47 @@ static float sample_hz_for_capture(void)
 	return hz;
 }
 
+static bool commit_reference_to_flash(void)
+{
+	struct vibro_ref_profile prof;
+
+	if (g_vib.ref_len < 16U) {
+		LOG_WRN("vibro reference commit: too short (len=%u), discarding",
+			(unsigned)g_vib.ref_len);
+		g_vib.ref_len = 0;
+		return false;
+	}
+
+	g_vib.ref_rms = sqrtf((float)(g_vib.ref_rms_accum / (double)g_vib.ref_len));
+	g_vib.ref_bands = vibro_band_rms_compute_series(g_vib.ref_len, sample_hz_for_capture(),
+							ref_mag_at, &g_vib);
+
+	memset(&prof, 0, sizeof(prof));
+	snprintf(prof.name, sizeof(prof.name), "%s", g_vib.ref_recording_name);
+	prof.created_unix = g_vib.ref_record_start_unix;
+	prof.updated_unix = prof.created_unix;
+	prof.duration_ms = k_uptime_get_32() - g_vib.ref_record_start_ms;
+	prof.sample_hz = sample_hz_for_capture();
+	prof.mag_len = g_vib.ref_len;
+	prof.rms = g_vib.ref_rms;
+	prof.peak = g_vib.ref_peak;
+	prof.band_valid = g_vib.ref_bands.valid;
+	memcpy(prof.band_rms, g_vib.ref_bands.bands, sizeof(prof.band_rms));
+	memcpy(prof.mag, g_vib.ref_mag, g_vib.ref_len * sizeof(float));
+
+	stall_watchdog_feed_main();
+	if (vibro_ref_store_write(g_vib.ref_recording_slot, &prof) != 0) {
+		LOG_ERR("vibro reference commit: flash write failed slot=%u",
+			g_vib.ref_recording_slot);
+		return false;
+	}
+	stall_watchdog_feed_main();
+	(void)vibro_ref_store_set_active(g_vib.ref_recording_slot);
+	LOG_INF("vibro reference stopped slot=%u len=%u dur=%ums", g_vib.ref_recording_slot,
+		(unsigned)g_vib.ref_len, prof.duration_ms);
+	return true;
+}
+
 bool vibro_capture_start_reference(uint8_t slot, const char *name)
 {
 	const float hz = sample_hz_for_capture();
@@ -334,6 +385,23 @@ bool vibro_capture_start_reference(uint8_t slot, const char *name)
 
 	if (slot >= VIBRO_REF_STORE_SLOTS) {
 		return false;
+	}
+
+	if (atomic_cas(&g_ref_commit_pending, 1, 0)) {
+		/* A previous stop's commit hasn't been flushed by vibro_capture_poll() yet
+		 * (still gated on app_flash_erase_safe()) and we're about to overwrite the
+		 * buffer it needs — this call runs on the BT RX thread (via ble_config_gatt.c),
+		 * so we can't block waiting for the safe window like the poll path does. If
+		 * it's currently safe, commit now (no different from what poll would have
+		 * done); if not, drop the stale pending profile rather than risk the same
+		 * live-BLE flash_area_erase() crash (see flash_safety.h) — losing an
+		 * already-superseded recording is far cheaper than a reboot. */
+		if (app_flash_erase_safe()) {
+			(void)commit_reference_to_flash();
+		} else {
+			LOG_WRN("vibro reference commit: dropped stale pending profile "
+				"(BLE not settled, new recording starting)");
+		}
 	}
 
 	g_vib.ref_len = 0;
@@ -359,8 +427,6 @@ bool vibro_capture_start_reference(uint8_t slot, const char *name)
 
 bool vibro_capture_stop_reference(void)
 {
-	struct vibro_ref_profile prof;
-
 	if (!g_vib.ref_recording) {
 		return g_vib.ref_len > 0;
 	}
@@ -373,37 +439,38 @@ bool vibro_capture_stop_reference(void)
 		return false;
 	}
 
-	g_vib.ref_rms = sqrtf((float)(g_vib.ref_rms_accum / (double)g_vib.ref_len));
-	g_vib.ref_bands = vibro_band_rms_compute_series(g_vib.ref_len, sample_hz_for_capture(),
-							ref_mag_at, &g_vib);
-
-	memset(&prof, 0, sizeof(prof));
-	snprintf(prof.name, sizeof(prof.name), "%s", g_vib.ref_recording_name);
-	prof.created_unix = g_vib.ref_record_start_unix;
-	prof.updated_unix = prof.created_unix;
-	prof.duration_ms = k_uptime_get_32() - g_vib.ref_record_start_ms;
-	prof.sample_hz = sample_hz_for_capture();
-	prof.mag_len = g_vib.ref_len;
-	prof.rms = g_vib.ref_rms;
-	prof.peak = g_vib.ref_peak;
-	prof.band_valid = g_vib.ref_bands.valid;
-	memcpy(prof.band_rms, g_vib.ref_bands.bands, sizeof(prof.band_rms));
-	memcpy(prof.mag, g_vib.ref_mag, g_vib.ref_len * sizeof(float));
-
-	if (vibro_ref_store_write(g_vib.ref_recording_slot, &prof) != 0) {
-		LOG_ERR("vibro reference stop: flash write failed slot=%u",
-			g_vib.ref_recording_slot);
-		return false;
-	}
-	(void)vibro_ref_store_set_active(g_vib.ref_recording_slot);
-	LOG_INF("vibro reference stopped slot=%u len=%u dur=%ums", g_vib.ref_recording_slot,
-		(unsigned)g_vib.ref_len, prof.duration_ms);
+	atomic_set(&g_ref_commit_pending, 1);
 	return true;
+}
+
+void vibro_capture_poll(void)
+{
+	vibro_ref_store_poll();
+
+	if (!atomic_get(&g_ref_commit_pending)) {
+		return;
+	}
+	/* Recording-stopped commit involves a flash_area_erase() (see vibro_ref_store_write())
+	 * — defer until BLE is idle instead of firing unconditionally, same hazard as every
+	 * other store (flash_safety.h). Keep the pending flag set so we retry next tick. */
+	if (!app_flash_erase_safe()) {
+		return;
+	}
+	if (!atomic_cas(&g_ref_commit_pending, 1, 0)) {
+		return;
+	}
+
+	(void)commit_reference_to_flash();
 }
 
 bool vibro_capture_reference_ready(void)
 {
 	return g_vib.ref_len > 0;
+}
+
+bool vibro_capture_reference_recording(void)
+{
+	return g_vib.ref_recording;
 }
 
 size_t vibro_capture_reference_len(void)
@@ -442,6 +509,23 @@ int vibro_capture_delete_reference(uint8_t slot)
 		g_vib.ref_peak = 0.0f;
 		memset(&g_vib.ref_bands, 0, sizeof(g_vib.ref_bands));
 	}
+	return err;
+}
+
+int vibro_capture_clear_all_references(void)
+{
+	if (g_vib.ref_recording) {
+		g_vib.ref_recording = false;
+		g_vib.ref_len = 0;
+		atomic_set(&g_ref_commit_pending, 0);
+	}
+	const int err = vibro_ref_store_clear_all();
+
+	g_vib.ref_len = 0U;
+	g_vib.ref_rms = 0.0f;
+	g_vib.ref_peak = 0.0f;
+	memset(g_vib.ref_mag, 0, sizeof(g_vib.ref_mag));
+	memset(&g_vib.ref_bands, 0, sizeof(g_vib.ref_bands));
 	return err;
 }
 
@@ -641,6 +725,7 @@ static void persist_verdict(uint32_t seq)
 	}
 
 	(void)vibro_verdict_store_append(seq, k_uptime_get_32(), &verdict, &edge, &bands);
+	vibro_led_on_verdict(verdict.level);
 }
 
 static void session_end_commit(void)
@@ -689,35 +774,26 @@ void vibro_capture_session_tick(uint32_t now_ms)
 
 void vibro_capture_on_status_seq(uint32_t seq, bool persist_flash)
 {
-	g_vib.last_verdict_seq = seq;
-	if (persist_flash && seq != g_vib.last_persist_seq) {
+	ARG_UNUSED(seq);
+	if (persist_flash) {
 		const uint32_t now = k_uptime_get_32();
 
 		if (g_vib.last_persist_ms == 0U ||
 		    (now - g_vib.last_persist_ms) >= VERDICT_FLASH_PERSIST_MIN_MS) {
+			const uint32_t vs = vibro_verdict_store_alloc_seq();
+
 			g_vib.last_persist_ms = now;
-			g_vib.last_persist_seq = seq;
-			persist_verdict(seq);
+			if (vs != 0U) {
+				g_vib.last_persist_seq = vs;
+				persist_verdict(vs);
+			}
 		}
 	}
-	if (seq > g_vib.last_ack_seq) {
-		g_vib.pending_count = vibro_verdict_store_pending_count();
-		if (g_vib.pending_count == 0U && persist_flash) {
-			g_vib.pending_count = 1U;
-		}
-	} else {
-		g_vib.pending_count = vibro_verdict_store_pending_count();
-	}
+	g_vib.pending_count = vibro_verdict_store_pending_count();
 }
 
 bool vibro_capture_ack_offload(uint32_t seq)
 {
-	if (seq <= g_vib.last_ack_seq) {
-		return true;
-	}
-	if (seq < g_vib.last_verdict_seq && g_vib.last_verdict_seq != 0) {
-		return false;
-	}
 	g_vib.last_ack_seq = seq;
 	g_vib.pending_count = vibro_verdict_store_pending_count();
 	(void)vibro_verdict_store_ack(seq);

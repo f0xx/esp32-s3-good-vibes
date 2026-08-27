@@ -84,7 +84,8 @@ struct device_config_v1 {
 	uint8_t reserved[17]; /*
 			       * [0]=mix_every [1]=mix_ratio [2]=dyn_short [3]=dyn_nested
 			       * [4..7]=local_revision u32 LE (bit31 = ESP-local namespace)
-			       * [8]=local_flags (bit0 = TFT user-off persists across reboot)
+			       * [8]=local_flags (bit0 = TFT user-off persists across reboot;
+			       *     bit2 = vibro pipeline armed / operational LED off)
 			       * [9]=cpu_mhz_override (0=auto/mode-derived, else explicit MHz —
 			       *     see power_manager.c apply_rates())
 			       * [10]=imu_hz_override (0=auto/mode-derived, else explicit Hz)
@@ -100,6 +101,8 @@ struct device_config_v1 {
 #define DEVICE_CONFIG_LOCAL_TFT_OFF  0x01U
 /** BOOT-tap cycled demo/staging operating mode (power_manager CPU/render/IMU tiers). */
 #define DEVICE_CONFIG_LOCAL_STAGING_MODE 0x02U
+/** Reference wizard complete / monitoring armed — acrylic LED off when no fault. */
+#define DEVICE_CONFIG_LOCAL_VIBRO_ARMED  0x04U
 
 enum device_config_apply_result {
 	DEVICE_CONFIG_APPLY_OK = 0,
@@ -114,6 +117,8 @@ bool device_config_load(struct device_config_v1 *cfg);
 bool device_config_save(const struct device_config_v1 *cfg);
 /** Immediate NVS write (boot/erase paths — not from BLE GATT). */
 bool device_config_save_sync(const struct device_config_v1 *cfg);
+/** Like save_sync but does not pulse the acrylic LED (routine screen toggle). */
+bool device_config_save_sync_quiet(const struct device_config_v1 *cfg);
 /** Erase Zephyr settings storage partition (fixes corrupt NVS). */
 bool device_config_storage_erase(void);
 bool device_config_apply_blob(const uint8_t *blob, size_t len);
@@ -126,6 +131,9 @@ uint32_t device_config_local_revision(const struct device_config_v1 *cfg);
 uint8_t device_config_local_flags(const struct device_config_v1 *cfg);
 void device_config_set_user_screen(bool on);
 bool device_config_user_screen_off(void);
+/** True after ref wizard Finish / CMD 10 — operational acrylic LED (off unless fault). */
+bool device_config_vibro_armed(void);
+void device_config_set_vibro_armed(bool armed);
 /** Demo (false) / staging (true) operating mode — persists across reboots, local only. */
 bool device_config_staging_mode(void);
 void device_config_set_staging_mode(bool staging);

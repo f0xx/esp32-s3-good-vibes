@@ -14,6 +14,11 @@
 
 LOG_MODULE_REGISTER(devcfg, LOG_LEVEL_INF);
 
+/** Optional hook after successful sync NVS write (handshake: acrylic green OK pulse). */
+__weak void devcfg_led_nvs_ok(void)
+{
+}
+
 #define SETTINGS_KEY "devcfg/blob"
 
 #if !FIXED_PARTITION_EXISTS(storage_partition)
@@ -24,7 +29,10 @@ LOG_MODULE_REGISTER(devcfg, LOG_LEVEL_INF);
 
 static struct device_config_v1 g_runtime;
 static atomic_t g_save_pending;
+static int64_t g_save_after_ms;
 static bool g_work_ready;
+
+#define DEVCFG_SAVE_DEBOUNCE_MS 1500
 
 static uint32_t calc_crc(const struct device_config_v1 *cfg);
 static void flush_save(void);
@@ -154,7 +162,13 @@ static void flush_save(void)
 
 void device_config_poll(void)
 {
-	if (!g_work_ready || !atomic_cas(&g_save_pending, 1, 0)) {
+	if (!g_work_ready || !atomic_get(&g_save_pending)) {
+		return;
+	}
+	if (k_uptime_get() < g_save_after_ms) {
+		return;
+	}
+	if (!atomic_cas(&g_save_pending, 1, 0)) {
 		return;
 	}
 
@@ -224,11 +238,24 @@ bool device_config_save(const struct device_config_v1 *cfg)
 		return false;
 	}
 
+	g_save_after_ms = k_uptime_get() + DEVCFG_SAVE_DEBOUNCE_MS;
 	(void)atomic_set(&g_save_pending, 1);
 	return true;
 }
 
+static bool device_config_save_sync_led(const struct device_config_v1 *cfg, bool pulse_led);
+
 bool device_config_save_sync(const struct device_config_v1 *cfg)
+{
+	return device_config_save_sync_led(cfg, true);
+}
+
+bool device_config_save_sync_quiet(const struct device_config_v1 *cfg)
+{
+	return device_config_save_sync_led(cfg, false);
+}
+
+static bool device_config_save_sync_led(const struct device_config_v1 *cfg, bool pulse_led)
 {
 	struct device_config_v1 tmp = *cfg;
 
@@ -245,6 +272,9 @@ bool device_config_save_sync(const struct device_config_v1 *cfg)
 		return false;
 	}
 	LOG_INF("devcfg sync-saved NVS rev=%u", tmp.profile_updated_unix);
+	if (pulse_led) {
+		devcfg_led_nvs_ok();
+	}
 	return true;
 }
 
@@ -301,7 +331,26 @@ void device_config_set_user_screen(bool on)
 		cfg.reserved[8] |= DEVICE_CONFIG_LOCAL_TFT_OFF;
 	}
 	bump_local_revision(&cfg);
-	(void)device_config_save(&cfg);
+	(void)device_config_save_sync_quiet(&cfg);
+}
+
+bool device_config_vibro_armed(void)
+{
+	return (device_config_local_flags(device_config_runtime()) &
+		DEVICE_CONFIG_LOCAL_VIBRO_ARMED) != 0U;
+}
+
+void device_config_set_vibro_armed(bool armed)
+{
+	struct device_config_v1 cfg = *device_config_runtime();
+
+	if (armed) {
+		cfg.reserved[8] |= DEVICE_CONFIG_LOCAL_VIBRO_ARMED;
+	} else {
+		cfg.reserved[8] &= (uint8_t)~DEVICE_CONFIG_LOCAL_VIBRO_ARMED;
+	}
+	bump_local_revision(&cfg);
+	(void)device_config_save_sync(&cfg);
 }
 
 bool device_config_staging_mode(void)

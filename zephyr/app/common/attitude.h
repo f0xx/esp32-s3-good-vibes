@@ -19,3 +19,5 @@ struct attitude_estimator {
 void attitude_reset(struct attitude_estimator *est);
 void attitude_update(struct attitude_estimator *est, const struct imu_sample *sample,
 		     float dt_sec);
+/** Closed-form ZYX (yaw*pitch*roll) matrix — same as attitude_update(). */
+void attitude_rotation_zyx(struct mat3 *out, float roll, float pitch, float yaw);

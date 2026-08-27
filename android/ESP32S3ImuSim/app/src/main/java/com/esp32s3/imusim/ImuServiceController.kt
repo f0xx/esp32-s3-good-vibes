@@ -34,6 +34,17 @@ class ImuServiceController(
         fun onEspScreenState(on: Boolean) {}
         fun onCaptionEpoch(epoch: Int) {}
         fun onClockState(synced: Boolean, tzMin: Int) {}
+        fun onBatteryBench(
+            active: Boolean,
+            sessionId: Long,
+            sampleSeq: Long,
+            voltageV: Float,
+            pct: Int,
+            elapsedMs: Long,
+            estMa: Float,
+        ) {}
+        /** Flat-floor mounting calibration status JSON — see floor_calib.h. */
+        fun onFloorCalStatus(json: String) {}
     }
 
     private var service: IImuBleService? = null
@@ -128,6 +139,22 @@ class ImuServiceController(
 
         override fun onClockState(synced: Boolean, tzMin: Int) {
             events.onClockState(synced, tzMin)
+        }
+
+        override fun onBatteryBench(
+            active: Boolean,
+            sessionId: Long,
+            sampleSeq: Long,
+            voltageV: Float,
+            pct: Int,
+            elapsedMs: Long,
+            estMa: Float,
+        ) {
+            events.onBatteryBench(active, sessionId, sampleSeq, voltageV, pct, elapsedMs, estMa)
+        }
+
+        override fun onFloorCalStatus(json: String) {
+            events.onFloorCalStatus(json)
         }
     }
 

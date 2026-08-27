@@ -6,8 +6,13 @@
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/logging/log.h>
 
+#include "battery_bench.h"
 #include "device_config.h"
+#include "flash_safety.h"
+#include "floor_calib.h"
 #include "imu_pipeline.h"
+#include "soft_reboot.h"
+#include "vibro_led.h"
 #include "vibro_capture.h"
 
 #include <zephyr/kernel.h>
@@ -27,19 +32,31 @@ LOG_MODULE_REGISTER(ble_cfg, LOG_LEVEL_INF);
  * duration/rms/valid + which one is active). See vibro_ref_store.h. */
 #define BT_UUID_CONFIG_REFLIST_VAL \
 	BT_UUID_128_ENCODE(0x4a6e0104, 0x0000, 0x1000, 0x8000, 0x00805f9b34fb)
+/** Read-only: flat-floor mounting calibration status JSON — see floor_calib.h. */
+#define BT_UUID_CONFIG_FLOORCAL_VAL \
+	BT_UUID_128_ENCODE(0x4a6e0105, 0x0000, 0x1000, 0x8000, 0x00805f9b34fb)
 
 static struct bt_uuid_128 cfg_svc_uuid = BT_UUID_INIT_128(BT_UUID_CONFIG_SVC_VAL);
 static struct bt_uuid_128 cfg_data_uuid = BT_UUID_INIT_128(BT_UUID_CONFIG_DATA_VAL);
 static struct bt_uuid_128 cfg_cmd_uuid = BT_UUID_INIT_128(BT_UUID_CONFIG_CMD_VAL);
 static struct bt_uuid_128 cfg_reflist_uuid = BT_UUID_INIT_128(BT_UUID_CONFIG_REFLIST_VAL);
+static struct bt_uuid_128 cfg_floorcal_uuid = BT_UUID_INIT_128(BT_UUID_CONFIG_FLOORCAL_VAL);
 
 static char g_reflist_json[640];
 static size_t g_reflist_len;
+static char g_floorcal_json[128];
+static size_t g_floorcal_len;
 
 static struct device_config_v1 g_cfg;
 
 static atomic_t g_erase_reboot_pending;
 static int64_t g_erase_reboot_deadline;
+/* Bounded wait for app_flash_erase_safe() before the factory-reset NVS erase — see
+ * flash_safety.h. This is a rare, deliberate action that already reboots right after, so
+ * unlike the other stores we don't need a full deferred-ram pattern: just give BLE a chance
+ * to go idle first, but don't block a user-requested factory reset forever if it doesn't
+ * (e.g. app never disconnects) — bail out and erase anyway once the cap is hit. */
+#define DEVCFG_ERASE_SAFE_WAIT_CAP_MS 5000
 
 static void erase_nvs_and_reboot_now(void)
 {
@@ -53,6 +70,7 @@ static void erase_nvs_and_reboot_now(void)
 	}
 	LOG_WRN("devcfg: sys_reboot after NVS erase");
 	k_msleep(100);
+	soft_reboot_schedule(SOFT_REBOOT_BOOT_BTN, soft_reboot_boot_partition(), 255U);
 	sys_reboot(SYS_REBOOT_COLD);
 }
 
@@ -79,6 +97,9 @@ static ssize_t write_data(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 
 	if (offset != 0 || len != sizeof(struct device_config_v1)) {
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+	}
+	if (battery_bench_config_locked()) {
+		return BT_GATT_ERR(BT_ATT_ERR_WRITE_NOT_PERMITTED);
 	}
 	const enum device_config_apply_result ar = device_config_apply_remote(buf);
 
@@ -113,6 +134,20 @@ static ssize_t read_reflist(struct bt_conn *conn, const struct bt_gatt_attr *att
 	return bt_gatt_attr_read(conn, attr, buf, len, offset, g_reflist_json, g_reflist_len);
 }
 
+static ssize_t read_floorcal(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
+			     uint16_t len, uint16_t offset)
+{
+	ARG_UNUSED(conn);
+	ARG_UNUSED(attr);
+
+	if (offset == 0U) {
+		const int n = floor_calib_status_json(g_floorcal_json, sizeof(g_floorcal_json));
+
+		g_floorcal_len = (n > 0) ? (size_t)n : 0U;
+	}
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, g_floorcal_json, g_floorcal_len);
+}
+
 static ssize_t write_cmd(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf,
 			 uint16_t len, uint16_t offset, uint8_t flags)
 {
@@ -122,6 +157,9 @@ static ssize_t write_cmd(struct bt_conn *conn, const struct bt_gatt_attr *attr, 
 
 	if (offset != 0 || len == 0) {
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+	}
+	if (battery_bench_config_locked()) {
+		return BT_GATT_ERR(BT_ATT_ERR_WRITE_NOT_PERMITTED);
 	}
 
 	const uint8_t *bytes = buf;
@@ -171,6 +209,15 @@ static ssize_t write_cmd(struct bt_conn *conn, const struct bt_gatt_attr *attr, 
 			LOG_INF("vibro reference delete slot=%u -> %d", bytes[1], err);
 		}
 		break;
+	case 9:
+		(void)vibro_capture_clear_all_references();
+		device_config_set_vibro_armed(false);
+		LOG_WRN("vibro reference: all slots cleared (CMD 9)");
+		break;
+	case 10:
+		device_config_set_vibro_armed(true);
+		LOG_INF("vibro monitoring armed (CMD 10) — acrylic LED operational");
+		break;
 	case 5:
 		if (len >= 5) {
 			const uint32_t seq = (uint32_t)bytes[1] | ((uint32_t)bytes[2] << 8) |
@@ -188,6 +235,19 @@ static ssize_t write_cmd(struct bt_conn *conn, const struct bt_gatt_attr *attr, 
 		g_erase_reboot_deadline = k_uptime_get() + 500;
 		atomic_set(&g_erase_reboot_pending, 1);
 		break;
+	case 11: {
+		/* Payload: [11][duration_ms lo][duration_ms hi] — duration optional
+		 * (bare [11] == FLOOR_CALIB_DEFAULT_DURATION_MS). Device must be held
+		 * still on a true-level reference for the whole window. */
+		const uint16_t duration_ms =
+			(len >= 3) ? (uint16_t)(bytes[1] | ((uint16_t)bytes[2] << 8)) : 0U;
+
+		floor_calib_start(duration_ms);
+		break;
+	}
+	case 12:
+		floor_calib_clear();
+		break;
 	default:
 		break;
 	}
@@ -201,7 +261,9 @@ BT_GATT_SERVICE_DEFINE(
 	BT_GATT_CHARACTERISTIC(&cfg_cmd_uuid.uuid, BT_GATT_CHRC_WRITE, BT_GATT_PERM_WRITE, NULL,
 			       write_cmd, NULL),
 	BT_GATT_CHARACTERISTIC(&cfg_reflist_uuid.uuid, BT_GATT_CHRC_READ, BT_GATT_PERM_READ,
-			       read_reflist, NULL, NULL), );
+			       read_reflist, NULL, NULL),
+	BT_GATT_CHARACTERISTIC(&cfg_floorcal_uuid.uuid, BT_GATT_CHRC_READ, BT_GATT_PERM_READ,
+			       read_floorcal, NULL, NULL), );
 
 int ble_config_gatt_init(void)
 {
@@ -219,6 +281,15 @@ void ble_config_gatt_poll(void)
 
 	if (k_uptime_get() < g_erase_reboot_deadline) {
 		return;
+	}
+
+	if (!app_flash_erase_safe() &&
+	    k_uptime_get() < g_erase_reboot_deadline + DEVCFG_ERASE_SAFE_WAIT_CAP_MS) {
+		return;
+	}
+	if (!app_flash_erase_safe()) {
+		LOG_WRN("devcfg erase: BLE still active after %dms wait cap — erasing anyway",
+			DEVCFG_ERASE_SAFE_WAIT_CAP_MS);
 	}
 
 	atomic_set(&g_erase_reboot_pending, 0);

@@ -19,7 +19,9 @@ struct scene_snapshot {
 	float walk_distance_m;
 };
 
+#ifndef SCENE_ZOOM_DEFAULT
 #define SCENE_ZOOM_DEFAULT 0.75f
+#endif
 
 struct scene_snapshot scene_snapshot_build(int screen_w, int screen_h, const float zoom[3],
 					 const struct mat3 *rot, const struct imu_sample *sample,

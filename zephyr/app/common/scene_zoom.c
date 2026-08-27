@@ -12,6 +12,9 @@ static float g_movement_factor;
 
 static float clamp_zoom(float v)
 {
+	if (!isfinite(v)) {
+		return SCENE_ZOOM_DEFAULT;
+	}
 	if (v < SCENE_ZOOM_MIN) {
 		return SCENE_ZOOM_MIN;
 	}
@@ -67,6 +70,9 @@ static float zoom_from_motion(float motion_factor)
 
 static float next_zoom_nonlinear(float current, float target)
 {
+	if (!isfinite(current)) {
+		return target;
+	}
 	if (current == target) {
 		return current;
 	}
@@ -95,6 +101,9 @@ void scene_zoom_tick(const struct imu_sample *sample)
 	const float k_rise = 0.40f;
 	const float k_fall = 0.10f;
 
+	if (!isfinite(g_movement_factor)) {
+		g_movement_factor = 0.0f;
+	}
 	if (instant > g_movement_factor) {
 		g_movement_factor += k_rise * (instant - g_movement_factor);
 	} else {

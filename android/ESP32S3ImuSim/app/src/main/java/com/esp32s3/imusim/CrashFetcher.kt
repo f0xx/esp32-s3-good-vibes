@@ -18,6 +18,8 @@ object CrashFetcher {
         val reset: Int,
         val uptimeMs: Long,
         val backtrace: List<Long>,
+        val softReboot: Boolean = false,
+        val softRebootReason: String = "",
         val detail: JSONObject?,
     )
 
@@ -74,7 +76,8 @@ object CrashFetcher {
     }
 
     private fun parseInfoObject(o: JSONObject): CrashInfo? {
-        if (o.optInt("pending", 0) == 0 && !o.has("pc")) {
+        val soft = o.optInt("soft", 0) != 0
+        if (o.optInt("pending", 0) == 0 && !o.has("pc") && !soft) {
             return null
         }
         val bt = mutableListOf<Long>()
@@ -83,6 +86,7 @@ object CrashFetcher {
                 bt.add(arr.optLong(i))
             }
         }
+        val srr = o.optString("srr", "")
         return CrashInfo(
             pending = true,
             slot = o.optInt("slot", -1),
@@ -96,9 +100,19 @@ object CrashFetcher {
             reset = o.optInt("reset"),
             uptimeMs = o.optLong("uptime"),
             backtrace = bt,
+            softReboot = soft,
+            softRebootReason = srr.ifBlank {
+                if (infoReasonIsSoft(o.optString("reason", ""))) {
+                    o.optString("reason", "").removePrefix("soft:")
+                } else {
+                    ""
+                }
+            },
             detail = o.optJSONObject("detail"),
         )
     }
+
+    private fun infoReasonIsSoft(reason: String): Boolean = reason.startsWith("soft:")
 
     fun toOffloadJson(info: CrashInfo): String {
         val bt = JSONArray()
@@ -116,7 +130,15 @@ object CrashFetcher {
             put("reset_reason", info.reset)
             put("uptime_ms", info.uptimeMs)
             put("backtrace", bt)
-            put("detail", info.detail ?: JSONObject().apply { put("dump_size", info.size) })
+            if (info.softReboot) {
+                put("soft_reboot_reason", info.softRebootReason.ifBlank { "unknown" })
+                put("is_fatal", false)
+            }
+            val detailObj = info.detail ?: JSONObject().apply { put("dump_size", info.size) }
+            if (info.softReboot && !detailObj.has("fatal")) {
+                detailObj.put("fatal", 0)
+            }
+            put("detail", detailObj)
         }.toString()
     }
 }
