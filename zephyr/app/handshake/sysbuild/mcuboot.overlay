@@ -1,4 +1,14 @@
+/*
+ * Board DTS sets zephyr,code-partition = &slot0_partition (0x10000) for the app.
+ * MCUboot itself must live in boot_partition @ 0x0 — otherwise `west flash` writes
+ * the bootloader image to 0x10000 (and never updates the real bootloader at 0x0),
+ * leaving an ancient ESP image header that still says 2MB while the chip is 16MB.
+ */
 / {
+	chosen {
+		zephyr,code-partition = &boot_partition;
+	};
+
 	buttons {
 		status = "disabled";
 	};

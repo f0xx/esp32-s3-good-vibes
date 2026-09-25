@@ -40,7 +40,8 @@
 		proxy_set_header X-Forwarded-Proto $scheme;
 		proxy_set_header X-Forwarded-Host  $host;
 		proxy_connect_timeout 30s;
-		proxy_read_timeout 120s;
-		proxy_send_timeout 120s;
-		client_max_body_size 4m;
+		proxy_read_timeout 300s;
+		proxy_send_timeout 300s;
+		# Desk zephyr.elf is ~9–12 MiB; cloud builds similar. 4m caused HTTP 413 on ELF upload.
+		client_max_body_size 32m;
 	}

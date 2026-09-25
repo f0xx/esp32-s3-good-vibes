@@ -3,8 +3,114 @@ mainmenu "Handshake application"
 source "Kconfig.zephyr"
 
 config APP_CRASH_DEBUG
-	bool "Debug crash injection + BIST (non-production)"
+	bool "Field debug extras (MT200, crash inject, BIST)"
 	default n
 	help
-	  Enables BLE-triggered fault injection and boot/on-demand BIST.
-	  Enable only via prj_crash.conf for development builds.
+	  Enables MT200 watch bridge, BLE crash inject, and BIST. Desk/debug
+	  builds merge prj_crash.conf; stable OTA merges prj_release.conf which
+	  also sets this so the watch path stays available without inject-heavy
+	  assert/sentinel options.
+
+config APP_STALL_WATCHDOG
+	bool "Soft main/render stall task watchdog"
+	depends on TASK_WDT
+	default y
+	help
+	  Arm Zephyr task_wdt channels for main + render. Desk hang-hunts often
+	  prefer this off (OpenOCD/GDB) — set n in prj_crash.conf. Stable OTA
+	  keeps it on via prj_release.conf.
+
+config APP_STACK_RA_CHECK
+	bool "Manual return-address canaries (STACK_RA_CHECK)"
+	default n
+	help
+	  Cheap smash detection: save __builtin_return_address(0) at entry and
+	  re-check mid-function (rkd.me.uk stack-corruption post). Desk only.
+
+config APP_FUNC_TRACE
+	bool "ERR-level enter/leave breadcrumbs (stall hunt)"
+	default n
+	help
+	  Emit LOG_ERR ">> func" / "<< func" at APP_ENTER/APP_LEAVE sites.
+	  Intended for desk crash-debug images — serial storm until a stall.
+
+config APP_PANEL_SPI_MHZ
+	int "Panel SPI clock reported in STATUS (MHz)"
+	default 20
+	help
+	  Must match the st7789v mipi-max-frequency actually built. Desk stays
+	  20 (GPIO-matrix spec). Release overlay raises the panel to 40 and
+	  sets this to 40 so Insights does not lie.
+
+config APP_WIFI_OTA
+	bool "WiFi CDN self-OTA (HTTPS)"
+	default n
+	depends on NET_TCP && DNS_RESOLVER && NET_SOCKETS_SOCKOPT_TLS
+	help
+	  When onboard WiFi is configured and linked, periodically pull the
+	  preferred CDN channel (stable/staging/dev) and stage firmware via
+	  flash_img + MCUboot A/B like BLE OTA. Off by default: enabling TLS
+	  blew past safe DRAM on ESP32-S3 (hangs). Channel sync still works.
+
+# --- Espressif heap / HAL debug (mirrors IDF components/heap + components/hal) ---
+# Zephyr's ESP port routes heap_caps → k_malloc (sys_heap), so IDF multi_heap
+# poisoning is not linked; these symbols still drive compile defs + doc, and we
+# pair them with CONFIG_SYS_HEAP_HARDENING_* which is what actually canaries
+# the allocator used by BT/WiFi/app.
+
+choice HEAP_CORRUPTION_DETECTION
+	prompt "Heap corruption detection (ESP-IDF style)"
+	default HEAP_POISONING_DISABLED
+	help
+	  Desk soak: prefer COMPREHENSIVE with SYS_HEAP_HARDENING_FULL.
+
+config HEAP_POISONING_DISABLED
+	bool "Basic (no poisoning)"
+config HEAP_POISONING_LIGHT
+	bool "Light impact"
+config HEAP_POISONING_COMPREHENSIVE
+	bool "Comprehensive"
+endchoice
+
+choice HEAP_TRACING_DEST
+	bool "Heap tracing (ESP-IDF style)"
+	default HEAP_TRACING_OFF
+
+config HEAP_TRACING_OFF
+	bool "Disabled"
+config HEAP_TRACING_STANDALONE
+	bool "Standalone"
+config HEAP_TRACING_TOHOST
+	bool "Host-based"
+endchoice
+
+config HEAP_TRACING
+	bool
+	default n if HEAP_TRACING_OFF
+	default y if !HEAP_TRACING_OFF
+
+config HEAP_TRACING_STACK_DEPTH
+	int "Heap tracing stack depth"
+	depends on HEAP_TRACING
+	range 0 32
+	default 8
+
+config HEAP_ABORT_WHEN_ALLOCATION_FAILS
+	bool "Abort if memory allocation fails"
+	default n
+
+choice HAL_DEFAULT_ASSERTION_LEVEL
+	bool "Default HAL assertion level"
+	default HAL_ASSERTION_EQUALS_SYSTEM
+	help
+	  From espressif components/hal/Kconfig.
+
+config HAL_ASSERTION_EQUALS_SYSTEM
+	bool "Same as system assertion level"
+config HAL_ASSERTION_DISABLE
+	bool "Disabled"
+config HAL_ASSERTION_SILENT
+	bool "Silent"
+config HAL_ASSERTION_ENABLE
+	bool "Enabled"
+endchoice

@@ -16,6 +16,7 @@
 #include "vibro_schedule.h"
 #include "clock_sync.h"
 #include "vibro_verdict_store.h"
+#include "stack_ra_check.h"
 #include "stall_watchdog.h"
 
 LOG_MODULE_REGISTER(vibro_cap, LOG_LEVEL_INF);
@@ -62,6 +63,7 @@ struct vibro_capture_state {
 
 static struct vibro_capture_state g_vib;
 static atomic_t g_ref_commit_pending;
+static atomic_t g_sensing_paused;
 
 static float magnitude_g(const struct imu_sample *s)
 {
@@ -78,8 +80,8 @@ static float pearson_corr(const float *a, const float *b, size_t n)
 	}
 
 	for (size_t i = 0; i < n; i++) {
-		ma += a[i];
-		mb += b[i];
+		ma += (double)a[i];
+		mb += (double)b[i];
 	}
 	ma /= (double)n;
 	mb /= (double)n;
@@ -89,8 +91,8 @@ static float pearson_corr(const float *a, const float *b, size_t n)
 	double db = 0.0;
 
 	for (size_t i = 0; i < n; i++) {
-		const double xa = a[i] - ma;
-		const double xb = b[i] - mb;
+		const double xa = (double)a[i] - ma;
+		const double xb = (double)b[i] - mb;
 
 		num += xa * xb;
 		da += xa * xa;
@@ -276,6 +278,7 @@ void vibro_capture_reset(void)
 
 void vibro_capture_push(const struct imu_sample *sample)
 {
+	STACK_RA_CHECK_SETUP;
 	const struct device_config_v1 *cfg;
 
 	if (sample == NULL) {
@@ -316,6 +319,7 @@ void vibro_capture_push(const struct imu_sample *sample)
 			atomic_set(&g_ref_commit_pending, 1);
 		}
 	}
+	STACK_RA_CHECK();
 }
 
 static float ref_mag_at(void *ctx, size_t index)
@@ -714,6 +718,17 @@ struct vibro_verdict vibro_capture_verdict(void)
 	return out;
 }
 
+void vibro_capture_set_sensing_paused(bool paused)
+{
+	atomic_set(&g_sensing_paused, paused ? 1 : 0);
+	LOG_INF("sensing_paused=%d", paused ? 1 : 0);
+}
+
+bool vibro_capture_sensing_paused(void)
+{
+	return atomic_get(&g_sensing_paused) != 0;
+}
+
 static void persist_verdict(uint32_t seq)
 {
 	const struct vibro_verdict verdict = vibro_capture_verdict();
@@ -721,6 +736,9 @@ static void persist_verdict(uint32_t seq)
 	const struct vibro_band_rms bands = vibro_capture_band_rms();
 
 	if (!verdict.valid) {
+		return;
+	}
+	if (vibro_capture_sensing_paused()) {
 		return;
 	}
 

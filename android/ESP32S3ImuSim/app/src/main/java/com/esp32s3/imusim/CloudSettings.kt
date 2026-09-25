@@ -5,7 +5,8 @@ import android.provider.Settings
 
 /** Phone-side cloud upload (Case C). ESP does not need to reach this URL. */
 class CloudSettings(context: Context) {
-    private val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    @Suppress("DEPRECATION")
+    private val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_MULTI_PROCESS)
 
     var baseUrl: String
         get() = prefs.getString(KEY_BASE_URL, DEFAULT_BASE_URL)?.trim()?.let { normalizeBaseUrl(it) }
@@ -26,6 +27,19 @@ class CloudSettings(context: Context) {
         get() = prefs.getString(KEY_GROUP_ID, "default") ?: "default"
         set(value) = prefs.edit().putString(KEY_GROUP_ID, value.trim()).apply()
 
+    /** CDN OTA channel: stable | staging | dev (maps to channel/{name}.json on cdn). */
+    var otaChannel: String
+        get() = prefs.getString(KEY_OTA_CHANNEL, "stable")?.trim()?.lowercase().orEmpty()
+            .ifEmpty { "stable" }
+        set(value) {
+            val norm = when (value.trim().lowercase()) {
+                "", "imu", "prod" -> "stable"
+                "staging", "dev", "stable" -> value.trim().lowercase()
+                else -> "stable"
+            }
+            prefs.edit().putString(KEY_OTA_CHANNEL, norm).apply()
+        }
+
     val enabled: Boolean
         get() = baseUrl.startsWith("http") && apiKey.isNotBlank()
 
@@ -44,7 +58,19 @@ class CloudSettings(context: Context) {
         private const val KEY_API_KEY = "api_key"
         private const val KEY_DEVICE_ID = "device_id"
         private const val KEY_GROUP_ID = "group_id"
+        private const val KEY_OTA_CHANNEL = "ota_channel"
         private const val KEY_PHONE_ID = "phone_id"
+        val OTA_CHANNELS = listOf("stable", "staging", "dev")
+        /** UI labels kept in parallel with [OTA_CHANNELS]. */
+        val OTA_CHANNEL_LABELS = listOf(
+            "stable — release (field)",
+            "staging — release candidate",
+            "dev — debug dumps (features)",
+        )
+        fun otaChannelLabel(channel: String): String {
+            val i = OTA_CHANNELS.indexOf(channel.lowercase())
+            return if (i >= 0) OTA_CHANNEL_LABELS[i] else channel
+        }
         const val DEFAULT_DEVICE_ID = ImuProtocol.DEVICE_NAME
         /** Public forwarder: Pi :8090 → artc0.intra.raptor.org:8080 */
         const val DEFAULT_BASE_URL = "https://apps.f0xx.org/app/good_vibes"

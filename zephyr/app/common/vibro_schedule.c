@@ -1,3 +1,4 @@
+#include <stddef.h>
 #include "vibro_schedule.h"
 
 static uint32_t hash32(uint32_t x)

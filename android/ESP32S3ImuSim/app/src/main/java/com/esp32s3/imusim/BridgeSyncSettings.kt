@@ -8,7 +8,8 @@ import java.util.concurrent.TimeUnit
  * ESP stays disconnected most of the time; phone connects briefly to drain buffers.
  */
 class BridgeSyncSettings(context: Context) {
-    private val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    @Suppress("DEPRECATION")
+    private val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_MULTI_PROCESS)
 
     enum class Mode(val id: String, val label: String) {
         MANUAL("manual", "Manual (live session only)"),

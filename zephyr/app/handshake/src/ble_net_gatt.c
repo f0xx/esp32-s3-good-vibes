@@ -15,6 +15,7 @@
 #include "ble_imu_gatt.h"
 #include "ble_net_gatt.h"
 #include "ble_net_protocol.h"
+#include "mt200_bridge.h"
 #include "net_profile_store.h"
 #include "network_manager.h"
 #include "radio_scheduler.h"
@@ -38,6 +39,21 @@ static struct bt_gatt_attr *g_profiles_attr;
 static struct bt_gatt_attr *g_status_attr;
 
 static int64_t g_scan_after_ms;
+static int64_t g_scan_giveup_ms;
+static int64_t g_scan_drop_settle_ms;
+static uint8_t g_scan_empty_retries;
+static uint8_t g_scan_start_retries;
+static bool g_wifi_held_adv;
+
+static void wifi_scan_release_ble_hold(void)
+{
+	if (!g_wifi_held_adv) {
+		return;
+	}
+	g_wifi_held_adv = false;
+	g_scan_drop_settle_ms = 0;
+	ble_imu_set_hold_adv(false);
+}
 
 #define NET_PUB_SCAN     BIT(0)
 #define NET_PUB_PROFILES BIT(1)
@@ -128,21 +144,43 @@ static void on_wifi_status(const char *state)
 	    (strcmp(state, "connected") == 0 || strcmp(state, "failed") == 0)) {
 		refresh_profiles();
 		net_schedule_publish(NET_PUB_PROFILES);
+		mt200_bridge_resume();
 	}
 }
 
 static void run_scheduled_scan(void)
 {
-	if (!network_manager_start_scan()) {
-		LOG_WRN("WiFi scan start failed");
-		refresh_scan();
-		refresh_status("scan_failed");
-		sync_ble_coex();
-	} else {
-		snprintf(g_scan_json, sizeof(g_scan_json), "{\"aps\":[],\"scanning\":1}");
-		refresh_status("scanning");
+	if (network_manager_scan_busy()) {
+		LOG_INF("WiFi scan already running — ignore duplicate start");
+		return;
 	}
 
+	mt200_bridge_pause();
+	if (network_manager_start_scan()) {
+		g_scan_start_retries = 0;
+		snprintf(g_scan_json, sizeof(g_scan_json), "{\"aps\":[],\"scanning\":1}");
+		refresh_status("scanning");
+		publish_scan();
+		publish_status();
+		sync_ble_coex();
+		return;
+	}
+
+	/* net_mgmt -EAGAIN / radio not ready: retry from the tick, do not resume
+	 * MT200 while we still intend to scan. */
+	if (k_uptime_get() < g_scan_giveup_ms && g_scan_start_retries < 6U) {
+		g_scan_start_retries++;
+		LOG_WRN("WiFi scan start failed — retry %u in 400ms", g_scan_start_retries);
+		g_scan_after_ms = k_uptime_get() + 400;
+		return;
+	}
+
+	LOG_WRN("WiFi scan start failed");
+	g_scan_start_retries = 0;
+	refresh_scan();
+	refresh_status("scan_failed");
+	network_manager_release_scan_radio();
+	wifi_scan_release_ble_hold();
 	publish_scan();
 	publish_status();
 	sync_ble_coex();
@@ -313,10 +351,25 @@ static ssize_t write_cmd(struct bt_conn *conn, const struct bt_gatt_attr *attr, 
 	}
 
 	if (strcmp(op, "scan") == 0) {
+		if (network_manager_scan_busy() || g_scan_after_ms > 0) {
+			LOG_INF("WiFi scan already scheduled/running — ignore duplicate op");
+			snprintf(g_scan_json, sizeof(g_scan_json), "{\"aps\":[],\"scanning\":1}");
+			refresh_status("scanning");
+			net_schedule_publish(NET_PUB_STATUS | NET_PUB_SCAN);
+			return len;
+		}
+		snprintf(g_scan_json, sizeof(g_scan_json), "{\"aps\":[],\"scanning\":1}");
 		refresh_status("scanning");
-		net_schedule_publish(NET_PUB_STATUS);
+		net_schedule_publish(NET_PUB_STATUS | NET_PUB_SCAN);
 		radio_scheduler_set_wifi_busy(true);
-		g_scan_after_ms = k_uptime_get() + 150;
+		mt200_bridge_pause();
+		g_scan_empty_retries = 0;
+		g_scan_start_retries = 0;
+		g_scan_drop_settle_ms = 0;
+		/* Soft coexist: stretch phone LE + pause MT200; never disconnect the phone. */
+		ble_imu_phone_stretch_for_wifi();
+		g_scan_after_ms = k_uptime_get() + 500;
+		g_scan_giveup_ms = k_uptime_get() + 2000;
 		return len;
 	}
 	if (strcmp(op, "profiles") == 0) {
@@ -330,6 +383,10 @@ static ssize_t write_cmd(struct bt_conn *conn, const struct bt_gatt_attr *attr, 
 		bool started = false;
 
 		radio_scheduler_set_wifi_busy(true);
+		mt200_bridge_pause();
+		/* Soft coexist — do NOT disconnect here (that aborted the CMD write
+		 * on the phone: "WiFi command write failed"). */
+		ble_imu_phone_stretch_for_wifi();
 		if (idx >= 0) {
 			refresh_status("connecting");
 			net_schedule_publish(NET_PUB_STATUS);
@@ -341,6 +398,7 @@ static ssize_t write_cmd(struct bt_conn *conn, const struct bt_gatt_attr *attr, 
 			if (!extract_json_string(json, "ssid", ssid, sizeof(ssid))) {
 				refresh_status("failed");
 				net_schedule_publish(NET_PUB_STATUS);
+				mt200_bridge_resume();
 				return len;
 			}
 			(void)extract_json_string(json, "pass", pass, sizeof(pass));
@@ -352,6 +410,7 @@ static ssize_t write_cmd(struct bt_conn *conn, const struct bt_gatt_attr *attr, 
 		if (!started) {
 			refresh_status("failed");
 			net_schedule_publish(NET_PUB_STATUS);
+			mt200_bridge_resume();
 		}
 		return len;
 	}
@@ -416,8 +475,22 @@ int ble_net_gatt_init(void)
 void ble_net_gatt_tick(void)
 {
 	static bool last_scanning;
+	static bool last_radio_busy;
 
 	if (g_scan_after_ms > 0 && k_uptime_get() >= g_scan_after_ms) {
+		const int64_t now = k_uptime_get();
+
+		if (!ble_imu_phone_conn_quiet_for_wifi()) {
+			if (now < g_scan_giveup_ms) {
+				ble_imu_phone_stretch_for_wifi();
+				g_scan_after_ms = now + 400;
+				return;
+			}
+			/* Phone refused a long interval — still scan with the link up.
+			 * Hard-dropping BLE broke the wizard (write failed / empty UI). */
+			LOG_WRN("WiFi scan: soft coexist — scanning with phone BLE still up "
+				"(interval not stretched)");
+		}
 		g_scan_after_ms = 0;
 		run_scheduled_scan();
 	}
@@ -427,12 +500,32 @@ void ble_net_gatt_tick(void)
 	const bool scanning = network_manager_scan_busy();
 
 	if (last_scanning && !scanning) {
-		refresh_scan();
-		refresh_status("scan_done");
-		publish_scan();
-		publish_status();
+		if (network_manager_ap_count() == 0U && g_scan_empty_retries < 2U) {
+			g_scan_empty_retries++;
+			network_manager_request_passive_scan();
+			LOG_INF("WiFi scan empty — passive retry %u (listen for 2.4 GHz beacons)",
+				g_scan_empty_retries);
+			g_scan_after_ms = k_uptime_get() + 500;
+		} else {
+			refresh_scan();
+			refresh_status("scan_done");
+			publish_scan();
+			publish_status();
+			network_manager_release_scan_radio();
+			wifi_scan_release_ble_hold();
+		}
 	}
 	last_scanning = scanning;
-	sync_ble_coex();
+	if (g_scan_after_ms == 0) {
+		sync_ble_coex();
+	}
+
+	const bool radio_busy = network_manager_radio_busy();
+
+	if (last_radio_busy && !radio_busy && g_scan_after_ms == 0) {
+		wifi_scan_release_ble_hold();
+		mt200_bridge_resume();
+	}
+	last_radio_busy = radio_busy;
 	net_flush_deferred_publish();
 }

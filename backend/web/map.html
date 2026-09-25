@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Good Vibes — GPS + IMU route</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    :root {
+      --bg: #0d1117;
+      --panel: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --ok: #3fb950;
+      --warn: #d29922;
+      --alert: #f85149;
+      --accent: #58a6ff;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); line-height: 1.45; }
+    header { padding: 1rem 1.25rem; border-bottom: 1px solid var(--border); background: var(--panel); }
+    header h1 { margin: 0; font-size: 1.25rem; font-weight: 600; }
+    header p { margin: 0.35rem 0 0; color: var(--muted); font-size: 0.9rem; }
+    header a { color: var(--accent); text-decoration: none; }
+    main { max-width: 1200px; margin: 0 auto; padding: 1rem 1.25rem 2rem; }
+    .grid { display: grid; gap: 1rem; grid-template-columns: 1fr 320px; }
+    @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; }
+    .card h2 { margin: 0 0 0.75rem; font-size: 1rem; }
+    label { display: block; font-size: 0.8rem; color: var(--muted); margin-bottom: 0.25rem; }
+    input, button {
+      font: inherit; border-radius: 6px; border: 1px solid var(--border);
+      background: var(--bg); color: var(--text); padding: 0.45rem 0.6rem;
+    }
+    input { width: 100%; }
+    button { cursor: pointer; background: #21262d; margin-top: 0.5rem; width: 100%; }
+    button:hover { border-color: var(--accent); }
+    .row { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: end; margin-bottom: 0.75rem; }
+    .row > * { flex: 1; min-width: 140px; }
+    #map { width: 100%; height: 560px; border-radius: 8px; background: #010409; }
+    .stat { display: flex; justify-content: space-between; padding: 0.25rem 0; border-bottom: 1px solid var(--border); font-size: 0.85rem; }
+    .stat span:first-child { color: var(--muted); }
+    .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.75rem; }
+    .badge.ok { background: rgba(63,185,80,0.15); color: var(--ok); }
+    .badge.warn { background: rgba(210,153,34,0.15); color: var(--warn); }
+    .badge.alert { background: rgba(248,81,73,0.15); color: var(--alert); }
+    .legend { font-size: 0.78rem; color: var(--muted); margin-top: 0.5rem; }
+    .legend span.gps { color: #3fb950; }
+    .legend span.imu { color: #f85149; }
+    .legend span.osrm { color: #a371f7; }
+    .layers { display: flex; flex-direction: column; gap: 0.45rem; }
+    .layer-toggle {
+      display: flex; align-items: center; gap: 0.65rem;
+      margin: 0; padding: 0.55rem 0.7rem;
+      border: 1px solid var(--border); border-radius: 8px;
+      background: var(--bg); cursor: pointer; color: var(--text); font-size: 0.9rem;
+    }
+    .layer-toggle input { width: auto; margin: 0; accent-color: var(--accent); }
+    .layer-toggle .swatch {
+      width: 14px; height: 14px; border-radius: 3px; flex-shrink: 0;
+    }
+    .layer-toggle .swatch.gps { background: #3fb950; }
+    .layer-toggle .swatch.imu { background: #f85149; }
+    .layer-toggle .hint { color: var(--muted); font-size: 0.75rem; margin-left: auto; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>GPS + IMU route comparison (preprod-demo)</h1>
+    <p>Toggle GPS (green) and IMU (red) layers independently; both on (default) overlays the two traces. IMU is dead-reckoned from the <strong>first GPS</strong> (START marker). Purple = optional OSRM. AHRS cube is on the <a href="ahrs">AHRS page</a>. <a href="./">&larr; back to dashboard</a></p>
+  </header>
+  <main>
+    <div class="grid">
+      <div class="card">
+        <div id="map"></div>
+        <p class="legend"><span class="gps">&#9632; GPS</span> &nbsp; <span class="imu">&#9632; IMU (red)</span> &nbsp; <span class="osrm">&#9632; OSRM (GPS endpoints)</span></p>
+      </div>
+      <div class="card">
+        <h2>Connection</h2>
+        <div class="row">
+          <div>
+            <label for="apiKey">API key (X-API-Key)</label>
+            <input id="apiKey" type="text" placeholder="dev-change-me" />
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label for="deviceId">Device ID</label>
+            <input id="deviceId" type="text" placeholder="e.g. e8f60a9251f0" />
+          </div>
+        </div>
+        <button type="button" id="startBtn">Start polling</button>
+        <button type="button" id="stopBtn">Stop</button>
+        <button type="button" id="clearBtn">Clear device route</button>
+        <h2 style="margin-top:1rem;">Layers</h2>
+        <div class="layers">
+          <label class="layer-toggle" for="layerGps">
+            <input type="checkbox" id="layerGps" checked />
+            <span class="swatch gps"></span>
+            GPS
+            <span class="hint">phone</span>
+          </label>
+          <label class="layer-toggle" for="layerImu">
+            <input type="checkbox" id="layerImu" checked />
+            <span class="swatch imu"></span>
+            IMU
+            <span class="hint">red · 1st GPS</span>
+          </label>
+        </div>
+        <h2 style="margin-top:1rem;">Live status</h2>
+        <div class="stat"><span>Link</span><span id="statLink" class="badge warn">idle</span></div>
+        <div class="stat"><span>GPS points</span><span id="statGpsN">0</span></div>
+        <div class="stat"><span>IMU points</span><span id="statImuN">0</span></div>
+        <div class="stat"><span>GPS path length</span><span id="statGpsDist">—</span></div>
+        <div class="stat"><span>IMU path length</span><span id="statImuDist">—</span></div>
+        <div class="stat"><span>OSRM route length</span><span id="statOsrmDist">—</span></div>
+        <p id="liveDevices" class="legend"></p>
+      </div>
+    </div>
+  </main>
+  <script id="demo-hints" type="application/json">__DEMO_HINTS_JSON__</script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const API = '/app/good_vibes/v1';
+    const $ = (id) => document.getElementById(id);
+    const DEMO = (() => {
+      try { return JSON.parse(document.getElementById('demo-hints').textContent || '{}'); }
+      catch { return {}; }
+    })();
+
+    function loadSettings() {
+      $('apiKey').value = localStorage.getItem('gv_api_key') || DEMO.api_key || '';
+      $('deviceId').value = localStorage.getItem('gv_device_id') || '';
+      $('layerGps').checked = localStorage.getItem('gv_layer_gps') !== '0';
+      $('layerImu').checked = localStorage.getItem('gv_layer_imu') !== '0';
+    }
+    function saveSettings() {
+      localStorage.setItem('gv_api_key', $('apiKey').value.trim());
+      localStorage.setItem('gv_device_id', $('deviceId').value.trim());
+      localStorage.setItem('gv_layer_gps', $('layerGps').checked ? '1' : '0');
+      localStorage.setItem('gv_layer_imu', $('layerImu').checked ? '1' : '0');
+    }
+
+    let leafletMap = null;
+    let gpsLine = { setLatLngs() {} };
+    let imuLine = { setLatLngs() {} };
+    let osrmLine = { setLatLngs() {} };
+    let originMarker = null;
+    let imuOriginMarker = null;
+    let framedOnce = false;
+    let leafletOk = false;
+    let lastGpsPoints = [];
+    let lastImuPoints = [];
+
+    function setLink(cls, text) {
+      const el = $('statLink');
+      el.className = 'badge ' + cls;
+      el.textContent = text;
+    }
+
+    function initLeaflet() {
+      if (typeof L === 'undefined') {
+        setLink('alert', 'map library failed to load');
+        return;
+      }
+      leafletMap = L.map('map').setView([0, 0], 2);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+      }).addTo(leafletMap);
+      gpsLine = L.polyline([], { color: '#3fb950', weight: 5, opacity: 0.95 }).addTo(leafletMap);
+      imuLine = L.polyline([], { color: '#f85149', weight: 4, dashArray: '8 5', opacity: 0.95 }).addTo(leafletMap);
+      osrmLine = L.polyline([], { color: '#a371f7', weight: 3, opacity: 0.7 }).addTo(leafletMap);
+      leafletOk = true;
+      applyLayers();
+    }
+
+    function gpsOn() { return $('layerGps').checked; }
+    function imuOn() { return $('layerImu').checked; }
+
+    function setOverlayVisible(layer, on) {
+      if (!leafletOk || !leafletMap || !layer || !layer.addTo) return;
+      const has = leafletMap.hasLayer(layer);
+      if (on && !has) layer.addTo(leafletMap);
+      if (!on && has) leafletMap.removeLayer(layer);
+    }
+
+    function applyLayers() {
+      setOverlayVisible(gpsLine, gpsOn());
+      setOverlayVisible(imuLine, imuOn());
+      setOverlayVisible(osrmLine, gpsOn());
+      if (originMarker) setOverlayVisible(originMarker, gpsOn() || imuOn());
+      if (imuOriginMarker) setOverlayVisible(imuOriginMarker, imuOn());
+    }
+
+    function haversineM(a, b) {
+      const R = 6371000;
+      const dLat = (b[0] - a[0]) * Math.PI / 180;
+      const dLon = (b[1] - a[1]) * Math.PI / 180;
+      const lat1 = a[0] * Math.PI / 180, lat2 = b[0] * Math.PI / 180;
+      const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+      return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+    }
+    function pathLengthM(points) {
+      let d = 0;
+      for (let i = 1; i < points.length; i++) d += haversineM(points[i - 1], points[i]);
+      return d;
+    }
+    function fmtM(m) {
+      if (m == null) return '—';
+      return m >= 1000 ? (m / 1000).toFixed(2) + ' km' : m.toFixed(0) + ' m';
+    }
+
+    async function describeEmpty(key, device) {
+      try {
+        const res = await fetch(`${API}/ahrs/${encodeURIComponent(device)}/latest`, {
+          headers: { 'X-API-Key': key },
+        });
+        if (res.ok) {
+          setLink('warn', 'AHRS live · waiting for GPS on phone');
+          return;
+        }
+      } catch { /* fall through */ }
+      setLink('warn', 'no GPS points yet');
+    }
+
+    async function syncDeviceFromLive(key, current) {
+      try {
+        const res = await fetch(`${API}/live`, { headers: { 'X-API-Key': key } });
+        if (!res.ok) return current;
+        const live = await res.json();
+        const ahrs = live.ahrs || [];
+        const geo = live.geo || [];
+        const ahrsIds = ahrs.map((x) => x.device_id);
+        const geoIds = geo.filter((x) => (x.gps_n || 0) > 0 || (x.imu_n || 0) > 0).map((x) => x.device_id);
+        const bits = [];
+        if (ahrsIds.length) bits.push('AHRS: ' + ahrsIds.join(', '));
+        if (geo.length) {
+          bits.push('geo: ' + geo.map((x) => `${x.device_id} (${x.gps_n} gps)`).join(', '));
+        }
+        $('liveDevices').textContent = bits.length ? bits.join(' · ') : 'no live AHRS/GPS in this backend process yet';
+        if (geoIds.includes(current) || ahrsIds.includes(current)) return current;
+        const pick = geoIds[0] || ahrsIds[0];
+        if (pick && pick !== current) {
+          $('deviceId').value = pick;
+          saveSettings();
+          return pick;
+        }
+      } catch (e) {
+        $('liveDevices').textContent = 'live list failed';
+      }
+      return current;
+    }
+
+    let lastOsrmKey = '';
+    async function maybeFetchOsrm(gpsPoints) {
+      if (gpsPoints.length < 2) return;
+      const start = gpsPoints[0], end = gpsPoints[gpsPoints.length - 1];
+      const key = `${start[0].toFixed(5)},${start[1].toFixed(5)}->${end[0].toFixed(5)},${end[1].toFixed(5)}`;
+      if (key === lastOsrmKey) return;
+      lastOsrmKey = key;
+      try {
+        const url = `https://router.project-osrm.org/route/v1/foot/${start[1]},${start[0]};${end[1]},${end[0]}?overview=full&geometries=geojson`;
+        const res = await fetch(url);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        const route = data.routes && data.routes[0];
+        if (!route) throw new Error('no route');
+        const coords = route.geometry.coordinates.map(([lon, lat]) => [lat, lon]);
+        osrmLine.setLatLngs(coords);
+        $('statOsrmDist').textContent = fmtM(route.distance);
+      } catch (e) {
+        // Best-effort only (public demo server, no SLA) — leave prior overlay/stat in place.
+      }
+    }
+
+    async function pollOnce() {
+      const key = $('apiKey').value.trim();
+      if (!key) { setLink('warn', 'need API key'); return; }
+      let device = $('deviceId').value.trim();
+      device = await syncDeviceFromLive(key, device);
+      if (!device) { setLink('warn', 'need device id (none live yet)'); return; }
+      try {
+        const res = await fetch(`${API}/geo/${encodeURIComponent(device)}/route`, {
+          headers: { 'X-API-Key': key },
+        });
+        if (!res.ok) { setLink('alert', 'HTTP ' + res.status); return; }
+        const route = await res.json();
+
+        const gpsPoints = (route.gps || []).map((p) => [p.lat, p.lon]);
+        const imuPoints = (route.imu || []).map((p) => [p.lat, p.lon]);
+        lastGpsPoints = gpsPoints;
+        lastImuPoints = imuPoints;
+        gpsLine.setLatLngs(gpsOn() ? gpsPoints : []);
+        imuLine.setLatLngs(imuOn() ? imuPoints : []);
+        applyLayers();
+        $('statGpsN').textContent = gpsPoints.length;
+        $('statImuN').textContent = imuPoints.length;
+        $('statGpsDist').textContent = fmtM(pathLengthM(gpsPoints));
+        $('statImuDist').textContent = fmtM(pathLengthM(imuPoints));
+
+        if (gpsPoints.length === 0 && imuPoints.length === 0) {
+          await describeEmpty(key, device);
+          return;
+        }
+        setLink('ok', 'live');
+
+        if (leafletOk && (gpsPoints.length > 0 || imuPoints.length > 0)) {
+          const origin = gpsPoints[0] || imuPoints[0];
+          if (origin) {
+            if (!originMarker) {
+              originMarker = L.marker(origin).bindPopup('START — first GPS').bindTooltip('START', {
+                permanent: true, direction: 'top', offset: [0, -8],
+              });
+            } else {
+              originMarker.setLatLng(origin);
+            }
+            if (!imuOriginMarker) {
+              imuOriginMarker = L.circleMarker(origin, {
+                radius: 6, color: '#f85149', fillColor: '#f85149', fillOpacity: 0.9, weight: 2,
+              }).bindPopup('IMU origin (first GPS)');
+            } else {
+              imuOriginMarker.setLatLng(origin);
+            }
+            applyLayers();
+          }
+          if (!framedOnce && leafletMap) {
+            const all = [];
+            if (gpsOn()) all.push(...gpsPoints);
+            if (imuOn()) all.push(...imuPoints);
+            if (all.length > 1) leafletMap.fitBounds(L.latLngBounds(all), { padding: [30, 30] });
+            else if (all.length === 1) leafletMap.setView(all[0], 17);
+            framedOnce = true;
+          }
+          if (gpsOn()) maybeFetchOsrm(gpsPoints);
+        }
+      } catch (e) {
+        setLink('alert', 'fetch failed');
+      }
+    }
+
+    let pollTimer = null;
+    function startPolling() {
+      saveSettings();
+      framedOnce = false;
+      $('startBtn').textContent = 'Polling…';
+      setLink('warn', 'polling…');
+      if (pollTimer) return;
+      pollOnce();
+      pollTimer = setInterval(pollOnce, 2000);
+    }
+    $('startBtn').addEventListener('click', startPolling);
+    $('stopBtn').addEventListener('click', () => {
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+      $('startBtn').textContent = 'Start polling';
+      setLink('warn', 'stopped');
+    });
+    $('clearBtn').addEventListener('click', async () => {
+      const key = $('apiKey').value.trim();
+      const device = $('deviceId').value.trim();
+      if (!key || !device) return;
+      await fetch(`${API}/geo/${encodeURIComponent(device)}/route`, {
+        method: 'DELETE',
+        headers: { 'X-API-Key': key },
+      });
+      gpsLine.setLatLngs([]);
+      imuLine.setLatLngs([]);
+      osrmLine.setLatLngs([]);
+      lastGpsPoints = [];
+      lastImuPoints = [];
+      lastOsrmKey = '';
+      framedOnce = false;
+      if (originMarker && leafletMap) { leafletMap.removeLayer(originMarker); originMarker = null; }
+      if (imuOriginMarker && leafletMap) { leafletMap.removeLayer(imuOriginMarker); imuOriginMarker = null; }
+      $('statGpsN').textContent = '0';
+      $('statImuN').textContent = '0';
+      $('statGpsDist').textContent = '—';
+      $('statImuDist').textContent = '—';
+      $('statOsrmDist').textContent = '—';
+    });
+
+    $('layerGps').addEventListener('change', () => {
+      saveSettings();
+      gpsLine.setLatLngs(gpsOn() ? lastGpsPoints : []);
+      applyLayers();
+    });
+    $('layerImu').addEventListener('change', () => {
+      saveSettings();
+      imuLine.setLatLngs(imuOn() ? lastImuPoints : []);
+      applyLayers();
+    });
+
+    loadSettings();
+    try { initLeaflet(); } catch (e) { setLink('alert', 'map init failed'); }
+    if ($('apiKey').value.trim()) {
+      startPolling();
+    }
+  </script>
+</body>
+</html>

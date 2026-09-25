@@ -6,6 +6,7 @@
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -15,6 +16,9 @@
 
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
 
     <application
         android:name=".ImuApplication"
@@ -26,9 +30,12 @@
         android:theme="@style/Theme.ESP32S3ImuSim">
         <activity
             android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
             android:exported="true"
             android:launchMode="singleTop"
-            android:screenOrientation="fullSensor">
+            android:screenOrientation="fullSensor"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -58,10 +65,16 @@
 
         <activity
             android:name=".WifiWizardActivity"
-            android:exported="false"
+            android:exported="true"
             android:label="@string/wifi_wizard"
+            android:launchMode="singleTop"
             android:parentActivityName=".MainActivity"
-            android:screenOrientation="fullSensor" />
+            android:screenOrientation="fullSensor">
+            <intent-filter>
+                <action android:name="com.esp32s3.imusim.WIFI_SCAN" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
 
         <activity
             android:name=".CrashDebugActivity"
@@ -85,6 +98,13 @@
             android:screenOrientation="fullSensor" />
 
         <activity
+            android:name=".RepairWizardActivity"
+            android:exported="false"
+            android:label="@string/repair_wizard_title"
+            android:parentActivityName=".MainActivity"
+            android:screenOrientation="fullSensor" />
+
+        <activity
             android:name=".FloorCalibActivity"
             android:exported="false"
             android:label="@string/floor_calib_title"
@@ -102,18 +122,40 @@
             android:name=".OtaInstallActivity"
             android:exported="false"
             android:excludeFromRecents="true"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
+        <activity
+            android:name=".PermissionGateActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- Own process so swiping the UI away does not take the BLE session with it. -->
         <service
             android:name=".ImuBleForegroundService"
             android:exported="false"
-            android:foregroundServiceType="connectedDevice" />
+            android:foregroundServiceType="connectedDevice"
+            android:process=":imu"
+            android:stopWithTask="false" />
 
         <receiver
+            android:name=".ServiceRestartReceiver"
+            android:exported="false" />
+
+        <!-- exported=true: system delivers BOOT_COMPLETED / MY_PACKAGE_REPLACED;
+             exported=false blocked post-OTA UI relaunch on BL6000Pro (API 30). -->
+        <receiver
             android:name=".BootReceiver"
-            android:exported="false">
+            android:exported="true"
+            android:directBootAware="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>

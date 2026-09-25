@@ -1,0 +1,19 @@
+{
+  "schema": "imu.ota.v1",
+  "published_at_ms": 1787835723117,
+  "apk": {
+    "versionCode": 60,
+    "versionName": "1.30.2-delivery",
+    "sha256": "7667f8ca4b425305a9452595e0e4541d8e060766a333db884a073ea81b5c7932",
+    "size": 6465982,
+    "url": "artifacts/apk"
+  },
+  "fw": {
+    "versionCode": 160,
+    "version": "handshake v160",
+    "sha256": "0cc6fac69ee09c985cb25d4f8ec86d9b9a9ca5ccadc6619105d33fe9a6098349",
+    "size": 521106,
+    "url": "artifacts/fw",
+    "min_apk_versionCode": 60
+  }
+}

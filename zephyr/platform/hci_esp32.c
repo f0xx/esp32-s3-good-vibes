@@ -53,7 +53,7 @@ static K_THREAD_STACK_DEFINE(hci_rx_stack, CONFIG_BT_RX_STACK_SIZE);
 static struct k_thread hci_rx_thread;
 static DRAM_ATTR atomic_t hci_rx_running;
 
-static bool is_hci_event_discardable(const uint8_t *evt_data)
+static bool IRAM_ATTR is_hci_event_discardable(const uint8_t *evt_data)
 {
 	uint8_t evt_type = evt_data[0];
 
@@ -78,7 +78,7 @@ static bool is_hci_event_discardable(const uint8_t *evt_data)
 	}
 }
 
-static struct net_buf *bt_esp_evt_recv(uint8_t *data, size_t remaining)
+static struct net_buf * IRAM_ATTR bt_esp_evt_recv(uint8_t *data, size_t remaining)
 {
 	bool discardable = false;
 	struct bt_hci_evt_hdr hdr;
@@ -126,7 +126,7 @@ static struct net_buf *bt_esp_evt_recv(uint8_t *data, size_t remaining)
 	return buf;
 }
 
-static struct net_buf *bt_esp_acl_recv(uint8_t *data, size_t remaining)
+static struct net_buf * IRAM_ATTR bt_esp_acl_recv(uint8_t *data, size_t remaining)
 {
 	struct bt_hci_acl_hdr hdr;
 	struct net_buf *buf;
@@ -168,7 +168,7 @@ static struct net_buf *bt_esp_acl_recv(uint8_t *data, size_t remaining)
 	return buf;
 }
 
-static struct net_buf *bt_esp_iso_recv(uint8_t *data, size_t remaining)
+static struct net_buf * IRAM_ATTR bt_esp_iso_recv(uint8_t *data, size_t remaining)
 {
 	struct bt_hci_iso_hdr hdr;
 	struct net_buf *buf;
@@ -210,7 +210,7 @@ static struct net_buf *bt_esp_iso_recv(uint8_t *data, size_t remaining)
 	return buf;
 }
 
-static struct net_buf *hci_raw_to_net_buf(const struct hci_raw_item *item)
+static struct net_buf * IRAM_ATTR hci_raw_to_net_buf(const struct hci_raw_item *item)
 {
 	uint8_t *data = item->data;
 	size_t remaining = item->len;
@@ -244,11 +244,13 @@ static struct net_buf *hci_raw_to_net_buf(const struct hci_raw_item *item)
 	return buf;
 }
 
-static bool hci_rx_process_one(const struct device *dev)
+static bool IRAM_ATTR hci_rx_process_one(const struct device *dev)
 {
 	struct bt_esp32_data *hci = dev->data;
+	__asm__ volatile("memw");
 	const uint32_t head = __atomic_load_n(&hci_ring_head_v, __ATOMIC_RELAXED);
 	const uint32_t tail = __atomic_load_n(&hci_ring_tail_v, __ATOMIC_ACQUIRE);
+	__asm__ volatile("memw");
 	struct net_buf *buf;
 
 	if (head == tail) {
@@ -256,9 +258,14 @@ static bool hci_rx_process_one(const struct device *dev)
 	}
 
 	buf = hci_raw_to_net_buf(&hci_raw_ring[head]);
+	__asm__ volatile("memw");
 	__atomic_store_n(&hci_ring_head_v, (head + 1U) % HCI_RAW_Q_DEPTH, __ATOMIC_RELEASE);
+	__asm__ volatile("memw");
 
-	if (buf == NULL || hci->recv == NULL) {
+	if (buf == NULL) {
+		return true;
+	}
+	if (hci->recv == NULL) {
 		net_buf_unref(buf);
 		return true;
 	}
@@ -278,7 +285,9 @@ static void IRAM_ATTR hci_rx_thread_fn(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p3);
 
 	while (atomic_get(&hci_rx_running) != 0) {
+		__asm__ volatile("memw");
 		const uint32_t drops = __atomic_load_n(&hci_ring_drops_v, __ATOMIC_RELAXED);
+		__asm__ volatile("memw");
 
 		if (drops != last_drops) {
 			LOG_WRN("HCI raw ring full — dropped %u packets", drops - last_drops);
@@ -302,17 +311,23 @@ static int IRAM_ATTR hci_esp_host_rcv_pkt(uint8_t *data, uint16_t len)
 		return -1;
 	}
 
+	__asm__ volatile("memw");
 	tail = __atomic_load_n(&hci_ring_tail_v, __ATOMIC_RELAXED);
 	next = (tail + 1U) % HCI_RAW_Q_DEPTH;
 	head = __atomic_load_n(&hci_ring_head_v, __ATOMIC_ACQUIRE);
+	__asm__ volatile("memw");
 	if (next == head) {
+		__asm__ volatile("memw");
 		__atomic_fetch_add(&hci_ring_drops_v, 1U, __ATOMIC_RELAXED);
+		__asm__ volatile("memw");
 		return 0;
 	}
 
 	memcpy(hci_raw_ring[tail].data, data, len);
 	hci_raw_ring[tail].len = len;
+	__asm__ volatile("memw");
 	__atomic_store_n(&hci_ring_tail_v, next, __ATOMIC_RELEASE);
+	__asm__ volatile("memw");
 
 	return 0;
 }

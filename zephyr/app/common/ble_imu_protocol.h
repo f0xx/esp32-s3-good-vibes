@@ -13,15 +13,18 @@
 
 #define BLE_IMU_DEVICE_NAME "ESP32S3 IMU sim"
 
+/* Wire protocol version — same four-part pattern as Android Cast proto, independent of app/fw OTA. */
+#define BLE_IMU_PROTO_VERSION_STRING "00.01.00.0001"
+
 #define BLE_IMU_DEFAULT_POLL_MS 33
 #define BLE_IMU_POLL_MS_MIN     33
 #define BLE_IMU_POLL_MS_MAX     2000
 
 #define BLE_IMU_ATT_PAYLOAD_MAX 512
 /** STATUS is read-only (long-read); separate from NOTIFY batch cap. */
-#define BLE_IMU_STATUS_JSON_MAX 800
+#define BLE_IMU_STATUS_JSON_MAX 1536
 
-#define BLE_IMU_HEADER_RESERVE    160
+#define BLE_IMU_HEADER_RESERVE    240
 #define BLE_IMU_COMMIT_BYTES      (BLE_IMU_ATT_PAYLOAD_MAX - BLE_IMU_HEADER_RESERVE)
 
 /* 128-bit UUID base (Zephyr BT_UUID_128_ENCODE format) */
@@ -74,8 +77,10 @@ enum ble_imu_mode {
  *
  *  0 IMU            1 TFT           2 BLE_CONFIG     3 CHIP_TEMP
  *  4 VIBRO          5 WIFI          6 OTA            7 CRASH_DEBUG
- *  8 MT200 bridge   9 RSSI wrssi
- * 10–31 reserved (TIME/BENCH/SCENE/compact are UUID-discoverable) */
+ *  8 MT200 bridge   9 RSSI wrssi    10 TIME          11 BENCH
+ * 12–31 reserved. Compile-in bits only — announced on CHAR_CAPS (4a6e0008)
+ * and STATUS JSON `feat` (uint32). WiFi STA is bit 5 (CONFIG_WIFI).
+ */
 enum ble_imu_cap {
 	BLE_CAP_IMU = 1u << 0,
 	BLE_CAP_TFT = 1u << 1,
@@ -87,12 +92,14 @@ enum ble_imu_cap {
 	BLE_CAP_CRASH_DEBUG = 1u << 7,
 	BLE_CAP_MT200 = 1u << 8,
 	BLE_CAP_RSSI = 1u << 9,
+	BLE_CAP_TIME = 1u << 10,
+	BLE_CAP_BENCH = 1u << 11,
 };
 
 static inline uint32_t ble_imu_zephyr_caps(void)
 {
 	uint32_t caps = BLE_CAP_IMU | BLE_CAP_TFT | BLE_CAP_BLE_CONFIG | BLE_CAP_CHIP_TEMP |
-			BLE_CAP_VIBRO | BLE_CAP_OTA | BLE_CAP_RSSI;
+			BLE_CAP_VIBRO | BLE_CAP_OTA | BLE_CAP_RSSI | BLE_CAP_TIME | BLE_CAP_BENCH;
 
 #if IS_ENABLED(CONFIG_WIFI)
 	caps |= BLE_CAP_WIFI;

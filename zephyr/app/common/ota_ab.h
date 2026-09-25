@@ -12,8 +12,11 @@ void ota_ab_init(void);
 /** Call early after settings init — handles mcuboot test/revert/retry state. */
 void ota_ab_on_boot(void);
 
-/** Call from main loop — confirm test image after stable uptime. */
+/** Call from main loop — confirm test image after stable uptime or phone BLE. */
 void ota_ab_poll(void);
+
+/** Phone GATT is up — confirm the test image on the next poll (proof of life). */
+void ota_ab_note_phone_up(void);
 
 /** After BLE OTA flash complete: request test boot to inactive slot and reboot. */
 int ota_ab_finish_and_reboot(struct flash_img_context *ctx);

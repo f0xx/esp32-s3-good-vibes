@@ -4,11 +4,14 @@
 
 #include "crash_report.h"
 
+#include <errno.h>
 #include <esp_system.h>
 #include <stdio.h>
 #include <string.h>
 
+#if defined(CONFIG_DEBUG_COREDUMP)
 #include <zephyr/debug/coredump.h>
+#endif
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/byteorder.h>
@@ -16,6 +19,7 @@
 
 #include "crash_ring_store.h"
 #include "crash_rtc_capture.h"
+#include "crash_alive.h"
 #include "fw_version.h"
 #include "power_manager.h"
 
@@ -27,7 +31,9 @@ static uint8_t g_reset_code;
 static struct crash_report_info g_pending;
 static bool g_has_pending;
 static int8_t g_active_slot = -1;
+#if defined(CONFIG_DEBUG_COREDUMP) && defined(CONFIG_DEBUG_COREDUMP_BACKEND_FLASH_PARTITION)
 static uint8_t g_dump_buf[CRASH_PARSE_BUF];
+#endif
 static bool g_boot_crash_deferred;
 static esp_reset_reason_t g_boot_reset_reason;
 
@@ -56,6 +62,10 @@ static const char *reset_reason_str(esp_reset_reason_t reason)
 		return "sdio";
 	case ESP_RST_UNKNOWN:
 		return "unknown";
+	case ESP_RST_USB:
+		return "usb";
+	case ESP_RST_JTAG:
+		return "jtag";
 	default:
 		return "other";
 	}
@@ -89,6 +99,7 @@ static bool reset_suggests_crash(esp_reset_reason_t reason)
 	}
 }
 
+#if defined(CONFIG_DEBUG_COREDUMP) && defined(CONFIG_DEBUG_COREDUMP_BACKEND_FLASH_PARTITION)
 static bool parse_arch_pc(const uint8_t *buf, size_t len, struct crash_report_info *out)
 {
 	for (size_t i = 0; i + 24U < len; i++) {
@@ -110,6 +121,7 @@ static bool parse_arch_pc(const uint8_t *buf, size_t len, struct crash_report_in
 
 	return false;
 }
+#endif
 
 static void fill_pending_from_reset(struct crash_report_info *out, esp_reset_reason_t reason)
 {
@@ -181,10 +193,30 @@ static void enrich_from_rtc_capture(struct crash_report_info *info)
 		return;
 	}
 
+	if (cap.pc != 0U) {
+		info->pc = cap.pc;
+	}
 	info->exccause = cap.exccause;
 	info->excvaddr = cap.excvaddr;
-	LOG_WRN("crash detail recovered from RTC capture: reason=%u exccause=%u excvaddr=0x%08x "
-		"thread=%s", cap.reason, cap.exccause, cap.excvaddr, cap.thread_name);
+	if (cap.reason == CRASH_RTC_REASON_TASK_WDT) {
+		info->reason = "task_wdt";
+	}
+	if (cap.thread_name[0] != '\0') {
+		snprintf(info->thread_name, sizeof(info->thread_name), "%s", cap.thread_name);
+	}
+	if (cap.bt_count > 0U) {
+		info->backtrace_count = MIN(cap.bt_count, CRASH_REPORT_BACKTRACE_MAX);
+		for (uint8_t i = 0; i < info->backtrace_count; i++) {
+			info->backtrace[i] = cap.backtrace[i];
+		}
+	} else if (info->pc != 0U && info->backtrace_count == 0U) {
+		info->backtrace[0] = info->pc;
+		info->backtrace_count = 1U;
+	}
+	LOG_WRN("crash detail recovered from RTC capture: reason=%u pc=0x%08x exccause=%u "
+		"excvaddr=0x%08x thread=%s bt=%u",
+		cap.reason, cap.pc, cap.exccause, cap.excvaddr, cap.thread_name,
+		(unsigned)cap.bt_count);
 }
 
 static void persist_boot_crash(esp_reset_reason_t reason)
@@ -195,32 +227,19 @@ static void persist_boot_crash(esp_reset_reason_t reason)
 
 	if (scan_stored_coredump(&info)) {
 		has_info = true;
-	} else if (reset_suggests_crash(reason)) {
+	} else if (reset_suggests_crash(reason) || crash_rtc_capture_pending()) {
 		fill_pending_from_reset(&info, reason);
+		if (!reset_suggests_crash(reason)) {
+			info.reason = "fatal";
+		}
 		has_info = true;
 	}
 
 	if (!has_info) {
-		/* Even if the reset reason alone didn't look crash-worthy, an RTC capture
-		 * existing means a Zephyr fatal error definitely happened right before this
-		 * boot — don't drop that on the floor just because esp_reset_reason() came
-		 * back with something reset_suggests_crash() doesn't recognize. */
-		struct crash_rtc_capture cap;
-
-		if (crash_rtc_capture_consume(&cap)) {
-			fill_pending_from_reset(&info, reason);
-			info.exccause = cap.exccause;
-			info.excvaddr = cap.excvaddr;
-			has_info = true;
-			LOG_WRN("crash detail recovered from RTC capture (reset reason was not "
-				"self-evidently a crash): exccause=%u excvaddr=0x%08x thread=%s",
-				cap.exccause, cap.excvaddr, cap.thread_name);
-		} else {
-			return;
-		}
-	} else {
-		enrich_from_rtc_capture(&info);
+		return;
 	}
+
+	enrich_from_rtc_capture(&info);
 
 	power_manager_telemetry_snapshot(&tel);
 	const int slot = crash_ring_append(&info, &tel);
@@ -285,16 +304,44 @@ void crash_report_init(void)
 
 	LOG_INF("last chip reset: %s (%u)", reset_reason_str(reason), (unsigned)reason);
 
-	if (reset_suggests_crash(reason)) {
+	if (reset_suggests_crash(reason) || crash_rtc_capture_pending()) {
 		g_boot_crash_deferred = true;
 		g_boot_reset_reason = reason;
+	} else if (crash_alive_dirty()) {
+		const uint32_t last_up = crash_alive_last_uptime_ms();
+		const uint32_t ticks = crash_alive_last_timer_ticks();
+		const uint8_t rstage = crash_alive_last_render_stage();
+		char step[16];
+		const bool wdt_family =
+			(reason == ESP_RST_INT_WDT || reason == ESP_RST_TASK_WDT ||
+			 reason == ESP_RST_WDT);
+		/* ESP_RST_USB is an enum value (not a #define) — reason 11 on S3. */
+		const bool usb_after_run = (reason == ESP_RST_USB) && (last_up >= 15000U);
+
+		crash_alive_last_step(step, sizeof(step));
+		crash_alive_consume();
+		if (wdt_family || usb_after_run) {
+			LOG_WRN("silent hang suspected (alive dirty, last_up=%u, ticks=%u, "
+				"step=%s, render=%u, reset=%s) — soft ring",
+				last_up, ticks, step[0] != '\0' ? step : "?", (unsigned)rstage,
+				reset_reason_str(reason));
+			crash_report_append_soft("silent_hang", (uint8_t)reason, 0, 0, NULL);
+		} else {
+			LOG_INF("alive dirty ignored (reset=%s last_up=%u)", reset_reason_str(reason),
+				last_up);
+		}
 	} else if (reset_is_voluntary(reason)) {
 		LOG_INF("reset is voluntary — crash ring not updated (empty is expected)");
 		if (reason == ESP_RST_UNKNOWN) {
 			LOG_INF("reset unknown often means USB/UART reset, not a firmware fault");
 		}
+		crash_alive_consume();
+	} else if (reason == ESP_RST_USB) {
+		LOG_INF("USB reset — crash ring not updated (RTC empty is expected after desk flash)");
+		crash_alive_consume();
 	} else {
 		LOG_WRN("reset reason not classified as crash — ring unchanged");
+		crash_alive_consume();
 	}
 
 	if (crash_ring_pending_count() > 0U) {
@@ -337,14 +384,14 @@ uint32_t crash_report_dump_size(void)
 
 int crash_report_dump_read(off_t offset, uint8_t *buf, size_t len)
 {
-	struct coredump_cmd_copy_arg copy_arg;
-
 #if !defined(CONFIG_DEBUG_COREDUMP) || !defined(CONFIG_DEBUG_COREDUMP_BACKEND_FLASH_PARTITION)
 	ARG_UNUSED(offset);
 	ARG_UNUSED(buf);
 	ARG_UNUSED(len);
 	return -ENOTSUP;
 #else
+	struct coredump_cmd_copy_arg copy_arg;
+
 	if (!g_has_pending || buf == NULL || len == 0U) {
 		return -EINVAL;
 	}

@@ -17,6 +17,7 @@
 #include <zephyr/sys/crc.h>
 
 #include "crash_report.h"
+#include "crash_alive.h"
 
 LOG_MODULE_REGISTER(soft_rb, LOG_LEVEL_INF);
 
@@ -80,28 +81,41 @@ static bool pending_valid(const struct soft_reboot_pending *p)
 	       p->kind != SOFT_REBOOT_NONE;
 }
 
-#if FIXED_PARTITION_EXISTS(slot0_partition)
-#define SLOT0_AREA FIXED_PARTITION_ID(slot0_partition)
+#if PARTITION_EXISTS(slot0_partition)
+#define SLOT0_AREA PARTITION_ID(slot0_partition)
 #else
 #define SLOT0_AREA 0
 #endif
 
-#if FIXED_PARTITION_EXISTS(slot1_partition)
-#define SLOT1_AREA FIXED_PARTITION_ID(slot1_partition)
+#if PARTITION_EXISTS(slot1_partition)
+#define SLOT1_AREA PARTITION_ID(slot1_partition)
 #else
 #define SLOT1_AREA 1
 #endif
 
+#if defined(CONFIG_BOOTLOADER_MCUBOOT) && PARTITION_EXISTS(slot0_partition)
+static int g_cached_swap = -1;
+#endif
+
 uint8_t soft_reboot_boot_partition(void)
 {
-#if defined(CONFIG_BOOTLOADER_MCUBOOT) && FIXED_PARTITION_EXISTS(slot0_partition)
-	const int swap = mcuboot_swap_type();
+#if defined(CONFIG_BOOTLOADER_MCUBOOT) && PARTITION_EXISTS(slot0_partition)
+	if (g_cached_swap < 0) {
+		g_cached_swap = mcuboot_swap_type();
+	}
 
-	if (swap == BOOT_SWAP_TYPE_TEST || swap == BOOT_SWAP_TYPE_PERM) {
+	if (g_cached_swap == BOOT_SWAP_TYPE_TEST || g_cached_swap == BOOT_SWAP_TYPE_PERM) {
 		return 1U;
 	}
 #endif
 	return 0U;
+}
+
+void soft_reboot_invalidate_boot_cache(void)
+{
+#if defined(CONFIG_BOOTLOADER_MCUBOOT) && PARTITION_EXISTS(slot0_partition)
+	g_cached_swap = -1;
+#endif
 }
 
 const char *soft_reboot_partition_label(uint8_t part)
@@ -152,6 +166,7 @@ void soft_reboot_schedule_ota(enum soft_reboot_kind kind, uint8_t boot_part, uin
 			soft_reboot_kind_str(kind), soft_reboot_partition_label(boot_part),
 			soft_reboot_partition_label(target_part));
 	}
+	crash_alive_mark_clean_shutdown();
 }
 
 void soft_reboot_init(void)

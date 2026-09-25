@@ -5,7 +5,8 @@ import android.os.Bundle
 
 /** Persists UI/session prefs owned by the BLE service (survives rotation & process relaunch). */
 class ImuSessionStore(context: Context) {
-    private val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    @Suppress("DEPRECATION")
+    private val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_MULTI_PROCESS)
 
     var pollMs: Int
         get() = prefs.getInt(KEY_POLL_MS, ImuProtocol.DEFAULT_POLL_MS)

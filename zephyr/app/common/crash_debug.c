@@ -16,7 +16,10 @@ static char g_inject_kind[16];
 
 static void stack_overflow_fn(void)
 {
-	stack_overflow_fn();
+	/* Intentional crash inject — defeat -Winfinite-recursion. */
+	void (*volatile recurse)(void) = stack_overflow_fn;
+
+	recurse();
 }
 
 static void trigger_badptr_read(void)

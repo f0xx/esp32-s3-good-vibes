@@ -21,6 +21,8 @@ object CrashFetcher {
         val softReboot: Boolean = false,
         val softRebootReason: String = "",
         val detail: JSONObject?,
+        val threadName: String = "",
+        val pcx: String = "",
     )
 
     fun isListJson(json: String): Boolean =
@@ -109,6 +111,8 @@ object CrashFetcher {
                 }
             },
             detail = o.optJSONObject("detail"),
+            threadName = o.optString("th").ifBlank { o.optString("thread") },
+            pcx = o.optString("pcx", ""),
         )
     }
 
@@ -123,9 +127,12 @@ object CrashFetcher {
             put("slot", info.slot)
             put("reason", info.reason)
             put("pc", info.pc)
+            if (info.pcx.isNotBlank()) {
+                put("pcx", info.pcx)
+            }
             put("exccause", info.exccause)
             put("excvaddr", info.excvaddr)
-            put("thread_name", "fault")
+            put("thread_name", info.threadName)
             put("fw_version", info.fw)
             put("reset_reason", info.reset)
             put("uptime_ms", info.uptimeMs)

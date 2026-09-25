@@ -1,13 +1,16 @@
+#include <stddef.h>
 #include "radio_scheduler.h"
 
 #include <zephyr/logging/log.h>
 
 #include "network_manager.h"
+#include "renderer.h"
 
 LOG_MODULE_REGISTER(radio_sched, LOG_LEVEL_INF);
 
 static bool g_wifi_busy;
 static bool g_capture_prep;
+static bool g_panel_hold; /* exclusive radio epoch — panel SPI paused */
 static radio_ble_pause_fn g_ble_pause;
 
 static void apply_pause(void)
@@ -24,6 +27,7 @@ void radio_scheduler_init(radio_ble_pause_fn pause_fn)
 	g_ble_pause = pause_fn;
 	g_wifi_busy = false;
 	g_capture_prep = false;
+	g_panel_hold = false;
 }
 
 void radio_scheduler_set_wifi_busy(bool busy)
@@ -75,5 +79,34 @@ const char *radio_scheduler_mode_str(void)
 	if (g_capture_prep) {
 		return "prep";
 	}
+	if (g_panel_hold) {
+		return "mt200";
+	}
 	return "ble";
+}
+
+void radio_scheduler_panel_hold(bool hold)
+{
+	if (g_panel_hold == hold) {
+		return;
+	}
+	g_panel_hold = hold;
+	LOG_INF("panel SPI %s (radio epoch)", hold ? "HELD" : "released");
+	if (!hold) {
+		/* Epoch end — allow panel recovery after soft SPI trip. */
+		renderer_spi_clear_trip();
+	}
+}
+
+bool radio_scheduler_panel_spi_allowed(void)
+{
+	/*
+	 * Exclusive epochs only: WiFi / capture-prep / MT200 central session.
+	 * Phone peripheral link must NOT freeze the cube (v306: frames starved
+	 * whenever the app was connected).
+	 */
+	if (g_wifi_busy || g_capture_prep || g_panel_hold) {
+		return false;
+	}
+	return true;
 }

@@ -3,7 +3,10 @@
     "list": [
       {
         "builtIn": 1,
-        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
         "enable": true,
         "hide": true,
         "iconColor": "rgba(0, 211, 255, 1)",
@@ -20,51 +23,107 @@
   "liveNow": false,
   "panels": [
     {
-      "datasource": { "type": "postgres", "uid": "imu-pg" },
+      "datasource": {
+        "type": "postgres",
+        "uid": "imu-pg"
+      },
       "fieldConfig": {
         "defaults": {
           "mappings": [
-            { "options": { "0": { "color": "green", "index": 0, "text": "OK" } }, "type": "value" },
-            { "options": { "1": { "color": "yellow", "index": 1, "text": "WARN" } }, "type": "value" },
-            { "options": { "2": { "color": "red", "index": 2, "text": "ALERT" } }, "type": "value" }
+            {
+              "options": {
+                "0": {
+                  "color": "green",
+                  "index": 0,
+                  "text": "OK"
+                }
+              },
+              "type": "value"
+            },
+            {
+              "options": {
+                "1": {
+                  "color": "yellow",
+                  "index": 1,
+                  "text": "WARN"
+                }
+              },
+              "type": "value"
+            },
+            {
+              "options": {
+                "2": {
+                  "color": "red",
+                  "index": 2,
+                  "text": "ALERT"
+                }
+              },
+              "type": "value"
+            }
           ],
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 1 },
-              { "color": "red", "value": 2 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 2
+              }
             ]
           }
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
       "id": 1,
       "options": {
         "colorMode": "background",
         "graphMode": "none",
         "justifyMode": "auto",
         "orientation": "auto",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
         "textMode": "auto"
       },
       "pluginVersion": "11.5.2",
       "targets": [
         {
-          "datasource": { "type": "postgres", "uid": "imu-pg" },
+          "datasource": {
+            "type": "postgres",
+            "uid": "imu-pg"
+          },
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT level AS \"Level\"\nFROM verdicts\nWHERE device_id = '$device'\n  AND ts_ms >= $__from\n  AND ts_ms <= $__to\nORDER BY ts_ms DESC\nLIMIT 1",
+          "rawSql": "SELECT level AS \"Level\"\nFROM verdicts\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND ts_ms >= $__from\n  AND ts_ms <= $__to\nORDER BY ts_ms DESC\nLIMIT 1",
           "refId": "A"
         }
       ],
-      "title": "Latest level",
+      "title": "Latest candidate (vd)",
       "type": "stat"
     },
     {
-      "datasource": { "type": "postgres", "uid": "imu-pg" },
+      "datasource": {
+        "type": "postgres",
+        "uid": "imu-pg"
+      },
       "fieldConfig": {
         "defaults": {
           "decimals": 4,
@@ -72,23 +131,37 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
       "id": 2,
       "options": {
         "colorMode": "value",
         "graphMode": "area",
         "justifyMode": "auto",
         "orientation": "auto",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
         "textMode": "auto"
       },
       "targets": [
         {
-          "datasource": { "type": "postgres", "uid": "imu-pg" },
+          "datasource": {
+            "type": "postgres",
+            "uid": "imu-pg"
+          },
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT rms AS \"RMS (g)\"\nFROM verdicts\nWHERE device_id = '$device'\n  AND ts_ms >= $__from\n  AND ts_ms <= $__to\nORDER BY ts_ms DESC\nLIMIT 1",
+          "rawSql": "SELECT rms AS \"RMS (g)\"\nFROM verdicts\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND ts_ms >= $__from\n  AND ts_ms <= $__to\nORDER BY ts_ms DESC\nLIMIT 1",
           "refId": "A"
         }
       ],
@@ -96,28 +169,48 @@
       "type": "stat"
     },
     {
-      "datasource": { "type": "postgres", "uid": "imu-pg" },
+      "datasource": {
+        "type": "postgres",
+        "uid": "imu-pg"
+      },
       "fieldConfig": {
-        "defaults": { "decimals": 2, "unit": "volt" },
+        "defaults": {
+          "decimals": 2,
+          "unit": "volt"
+        },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
       "id": 3,
       "options": {
         "colorMode": "value",
         "graphMode": "none",
         "justifyMode": "auto",
         "orientation": "auto",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
         "textMode": "auto"
       },
       "targets": [
         {
-          "datasource": { "type": "postgres", "uid": "imu-pg" },
+          "datasource": {
+            "type": "postgres",
+            "uid": "imu-pg"
+          },
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT voltage AS \"Voltage\"\nFROM verdicts\nWHERE device_id = '$device'\n  AND ts_ms >= $__from\n  AND ts_ms <= $__to\nORDER BY ts_ms DESC\nLIMIT 1",
+          "rawSql": "SELECT voltage AS \"Voltage\"\nFROM verdicts\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND ts_ms >= $__from\n  AND ts_ms <= $__to\nORDER BY ts_ms DESC\nLIMIT 1",
           "refId": "A"
         }
       ],
@@ -125,28 +218,49 @@
       "type": "stat"
     },
     {
-      "datasource": { "type": "postgres", "uid": "imu-pg" },
+      "datasource": {
+        "type": "postgres",
+        "uid": "imu-pg"
+      },
       "fieldConfig": {
-        "defaults": { "max": 100, "min": 0, "unit": "percent" },
+        "defaults": {
+          "max": 100,
+          "min": 0,
+          "unit": "percent"
+        },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
       "id": 4,
       "options": {
         "colorMode": "value",
         "graphMode": "none",
         "justifyMode": "auto",
         "orientation": "auto",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
         "textMode": "auto"
       },
       "targets": [
         {
-          "datasource": { "type": "postgres", "uid": "imu-pg" },
+          "datasource": {
+            "type": "postgres",
+            "uid": "imu-pg"
+          },
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT pct AS \"Battery %\"\nFROM verdicts\nWHERE device_id = '$device'\n  AND ts_ms >= $__from\n  AND ts_ms <= $__to\nORDER BY ts_ms DESC\nLIMIT 1",
+          "rawSql": "SELECT pct AS \"Battery %\"\nFROM verdicts\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND ts_ms >= $__from\n  AND ts_ms <= $__to\nORDER BY ts_ms DESC\nLIMIT 1",
           "refId": "A"
         }
       ],
@@ -154,10 +268,15 @@
       "type": "stat"
     },
     {
-      "datasource": { "type": "postgres", "uid": "imu-pg" },
+      "datasource": {
+        "type": "postgres",
+        "uid": "imu-pg"
+      },
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "axisBorderShow": false,
             "axisCenteredZero": false,
@@ -168,44 +287,77 @@
             "drawStyle": "line",
             "fillOpacity": 12,
             "gradientMode": "none",
-            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
             "insertNulls": false,
             "lineInterpolation": "smooth",
             "lineWidth": 2,
             "pointSize": 4,
-            "scaleDistribution": { "type": "linear" },
+            "scaleDistribution": {
+              "type": "linear"
+            },
             "showPoints": "auto",
             "spanNulls": false,
-            "stacking": { "group": "A", "mode": "none" },
-            "thresholdsStyle": { "mode": "off" }
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
           },
           "decimals": 4,
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
       "id": 5,
       "options": {
-        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
-          "datasource": { "type": "postgres", "uid": "imu-pg" },
+          "datasource": {
+            "type": "postgres",
+            "uid": "imu-pg"
+          },
           "editorMode": "code",
           "format": "time_series",
           "rawQuery": true,
-          "rawSql": "SELECT\n  ts_ms AS time,\n  rms AS \"RMS (g)\"\nFROM verdicts\nWHERE device_id = '$device'\n  AND ts_ms >= $__from\n  AND ts_ms <= $__to\nORDER BY ts_ms",
+          "rawSql": "SELECT\n  ts_ms AS time,\n  rms AS \"RMS (g)\"\nFROM verdicts\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND ts_ms >= $__from\n  AND ts_ms <= $__to\nORDER BY ts_ms",
           "refId": "A"
         },
         {
-          "datasource": { "type": "postgres", "uid": "imu-pg" },
+          "datasource": {
+            "type": "postgres",
+            "uid": "imu-pg"
+          },
           "editorMode": "code",
           "format": "time_series",
           "hide": false,
           "rawQuery": true,
-          "rawSql": "SELECT\n  ts_ms AS time,\n  peak AS \"Peak (g)\"\nFROM verdicts\nWHERE device_id = '$device'\n  AND ts_ms >= $__from\n  AND ts_ms <= $__to\nORDER BY ts_ms",
+          "rawSql": "SELECT\n  ts_ms AS time,\n  peak AS \"Peak (g)\"\nFROM verdicts\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND ts_ms >= $__from\n  AND ts_ms <= $__to\nORDER BY ts_ms",
           "refId": "B"
         }
       ],
@@ -213,10 +365,15 @@
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "postgres", "uid": "imu-pg" },
+      "datasource": {
+        "type": "postgres",
+        "uid": "imu-pg"
+      },
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "axisBorderShow": false,
             "axisCenteredZero": false,
@@ -227,16 +384,27 @@
             "drawStyle": "line",
             "fillOpacity": 8,
             "gradientMode": "none",
-            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
             "insertNulls": false,
             "lineInterpolation": "smooth",
             "lineWidth": 2,
             "pointSize": 4,
-            "scaleDistribution": { "type": "linear" },
+            "scaleDistribution": {
+              "type": "linear"
+            },
             "showPoints": "auto",
             "spanNulls": false,
-            "stacking": { "group": "A", "mode": "none" },
-            "thresholdsStyle": { "mode": "off" }
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
           },
           "decimals": 3,
           "max": 1,
@@ -245,27 +413,49 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
       "id": 6,
       "options": {
-        "legend": { "calcs": ["mean", "min"], "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "calcs": [
+            "mean",
+            "min"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
-          "datasource": { "type": "postgres", "uid": "imu-pg" },
+          "datasource": {
+            "type": "postgres",
+            "uid": "imu-pg"
+          },
           "editorMode": "code",
           "format": "time_series",
           "rawQuery": true,
-          "rawSql": "SELECT\n  ts_ms AS time,\n  corr AS \"Correlation\"\nFROM verdicts\nWHERE device_id = '$device'\n  AND ts_ms >= $__from\n  AND ts_ms <= $__to\nORDER BY ts_ms",
+          "rawSql": "SELECT\n  ts_ms AS time,\n  corr AS \"Correlation\"\nFROM verdicts\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND ts_ms >= $__from\n  AND ts_ms <= $__to\nORDER BY ts_ms",
           "refId": "A"
         },
         {
-          "datasource": { "type": "postgres", "uid": "imu-pg" },
+          "datasource": {
+            "type": "postgres",
+            "uid": "imu-pg"
+          },
           "editorMode": "code",
           "format": "time_series",
           "rawQuery": true,
-          "rawSql": "SELECT\n  ts_ms AS time,\n  rms_delta AS \"RMS delta\"\nFROM verdicts\nWHERE device_id = '$device'\n  AND ts_ms >= $__from\n  AND ts_ms <= $__to\nORDER BY ts_ms",
+          "rawSql": "SELECT\n  ts_ms AS time,\n  rms_delta AS \"RMS delta\"\nFROM verdicts\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND ts_ms >= $__from\n  AND ts_ms <= $__to\nORDER BY ts_ms",
           "refId": "B"
         }
       ],
@@ -273,10 +463,15 @@
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "postgres", "uid": "imu-pg" },
+      "datasource": {
+        "type": "postgres",
+        "uid": "imu-pg"
+      },
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "axisBorderShow": false,
             "axisCenteredZero": false,
@@ -287,63 +482,130 @@
             "drawStyle": "line",
             "fillOpacity": 8,
             "gradientMode": "none",
-            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
             "insertNulls": false,
             "lineInterpolation": "smooth",
             "lineWidth": 2,
             "pointSize": 4,
-            "scaleDistribution": { "type": "linear" },
+            "scaleDistribution": {
+              "type": "linear"
+            },
             "showPoints": "auto",
             "spanNulls": false,
-            "stacking": { "group": "A", "mode": "none" },
-            "thresholdsStyle": { "mode": "off" }
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
           },
           "decimals": 2
         },
         "overrides": [
           {
-            "matcher": { "id": "byName", "options": "Battery %" },
-            "properties": [{ "id": "unit", "value": "percent" }, { "id": "max", "value": 100 }, { "id": "min", "value": 0 }]
+            "matcher": {
+              "id": "byName",
+              "options": "Battery %"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              },
+              {
+                "id": "max",
+                "value": 100
+              },
+              {
+                "id": "min",
+                "value": 0
+              }
+            ]
           },
           {
-            "matcher": { "id": "byName", "options": "Voltage (V)" },
-            "properties": [{ "id": "unit", "value": "volt" }]
+            "matcher": {
+              "id": "byName",
+              "options": "Voltage (V)"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "volt"
+              }
+            ]
           },
           {
-            "matcher": { "id": "byName", "options": "Chip temp (°C)" },
-            "properties": [{ "id": "unit", "value": "celsius" }]
+            "matcher": {
+              "id": "byName",
+              "options": "Chip temp (\u00b0C)"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "celsius"
+              }
+            ]
           }
         ]
       },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 12 },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 12
+      },
       "id": 7,
       "options": {
-        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
-          "datasource": { "type": "postgres", "uid": "imu-pg" },
+          "datasource": {
+            "type": "postgres",
+            "uid": "imu-pg"
+          },
           "editorMode": "code",
           "format": "time_series",
           "rawQuery": true,
-          "rawSql": "SELECT ts_ms AS time, voltage AS \"Voltage (V)\"\nFROM verdicts\nWHERE device_id = '$device'\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
+          "rawSql": "SELECT ts_ms AS time, voltage AS \"Voltage (V)\"\nFROM verdicts\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
           "refId": "A"
         },
         {
-          "datasource": { "type": "postgres", "uid": "imu-pg" },
+          "datasource": {
+            "type": "postgres",
+            "uid": "imu-pg"
+          },
           "editorMode": "code",
           "format": "time_series",
           "rawQuery": true,
-          "rawSql": "SELECT ts_ms AS time, pct AS \"Battery %\"\nFROM verdicts\nWHERE device_id = '$device'\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
+          "rawSql": "SELECT ts_ms AS time, pct AS \"Battery %\"\nFROM verdicts\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
           "refId": "B"
         },
         {
-          "datasource": { "type": "postgres", "uid": "imu-pg" },
+          "datasource": {
+            "type": "postgres",
+            "uid": "imu-pg"
+          },
           "editorMode": "code",
           "format": "time_series",
           "rawQuery": true,
-          "rawSql": "SELECT ts_ms AS time, chip_temp_c AS \"Chip temp (°C)\"\nFROM verdicts\nWHERE device_id = '$device'\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
+          "rawSql": "SELECT ts_ms AS time, chip_temp_c AS \"Chip temp (\u00b0C)\"\nFROM verdicts\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
           "refId": "C"
         }
       ],
@@ -351,10 +613,15 @@
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "postgres", "uid": "imu-pg" },
+      "datasource": {
+        "type": "postgres",
+        "uid": "imu-pg"
+      },
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "axisBorderShow": false,
             "axisCenteredZero": false,
@@ -365,24 +632,775 @@
             "drawStyle": "line",
             "fillOpacity": 0,
             "gradientMode": "none",
-            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
             "insertNulls": false,
             "lineInterpolation": "stepAfter",
             "lineWidth": 2,
             "pointSize": 4,
-            "scaleDistribution": { "type": "linear" },
+            "scaleDistribution": {
+              "type": "linear"
+            },
             "showPoints": "never",
             "spanNulls": false,
-            "stacking": { "group": "A", "mode": "none" },
-            "thresholdsStyle": { "mode": "line+area" }
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "line+area"
+            }
           },
           "mappings": [
-            { "options": { "0": { "color": "green", "index": 0, "text": "OK" } }, "type": "value" },
-            { "options": { "1": { "color": "yellow", "index": 1, "text": "WARN" } }, "type": "value" },
-            { "options": { "2": { "color": "red", "index": 2, "text": "ALERT" } }, "type": "value" }
+            {
+              "options": {
+                "0": {
+                  "color": "green",
+                  "index": 0,
+                  "text": "OK"
+                }
+              },
+              "type": "value"
+            },
+            {
+              "options": {
+                "1": {
+                  "color": "yellow",
+                  "index": 1,
+                  "text": "WARN"
+                }
+              },
+              "type": "value"
+            },
+            {
+              "options": {
+                "2": {
+                  "color": "red",
+                  "index": 2,
+                  "text": "ALERT"
+                }
+              },
+              "type": "value"
+            }
           ],
           "max": 2,
           "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 2
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 20
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "imu-pg"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts_ms AS time, level AS \"Level\"\nFROM verdicts\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
+          "refId": "A"
+        }
+      ],
+      "title": "Candidate level vd (0=OK, 1=WARN, 2=ALERT) — not operator page",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "imu-pg"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 3,
+          "max": 1,
+          "min": -1
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 26
+      },
+      "id": 10,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "min"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "imu-pg"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts_ms AS time,\n  (raw_json::json->>'band_corr')::double precision AS \"Band corr\"\nFROM verdicts\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND raw_json IS NOT NULL AND raw_json <> ''\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "imu-pg"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts_ms AS time,\n  (raw_json::json->>'band_delta_max')::double precision AS \"Band delta max\"\nFROM verdicts\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND raw_json IS NOT NULL AND raw_json <> ''\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
+          "refId": "B"
+        }
+      ],
+      "title": "Band reference compare",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "imu-pg"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 3
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 26
+      },
+      "id": 11,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "imu-pg"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts_ms AS time,\n  (raw_json::json->>'edge_crest')::double precision AS \"Crest\"\nFROM verdicts\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND raw_json IS NOT NULL AND raw_json <> ''\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "imu-pg"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts_ms AS time,\n  (raw_json::json->>'edge_zcr_hz')::double precision AS \"ZCR (Hz)\"\nFROM verdicts\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND raw_json IS NOT NULL AND raw_json <> ''\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "imu-pg"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts_ms AS time,\n  (raw_json::json->>'edge_hf_ratio')::double precision AS \"HF ratio\"\nFROM verdicts\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND raw_json IS NOT NULL AND raw_json <> ''\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
+          "refId": "C"
+        }
+      ],
+      "title": "Edge features (crest / ZCR / HF)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "imu-pg"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "level"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "options": {
+                      "0": {
+                        "color": "green",
+                        "index": 0,
+                        "text": "OK"
+                      }
+                    },
+                    "type": "value"
+                  },
+                  {
+                    "options": {
+                      "1": {
+                        "color": "yellow",
+                        "index": 1,
+                        "text": "WARN"
+                      }
+                    },
+                    "type": "value"
+                  },
+                  {
+                    "options": {
+                      "2": {
+                        "color": "red",
+                        "index": 2,
+                        "text": "ALERT"
+                      }
+                    },
+                    "type": "value"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 36
+      },
+      "id": 9,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true,
+        "sortBy": [
+          {
+            "desc": true,
+            "displayName": "ts_ms"
+          }
+        ]
+      },
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "imu-pg"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  ts_ms,\n  device_id,\n  group_id,\n  seq,\n  level,\n  rms,\n  peak,\n  corr,\n  rms_delta,\n  pct,\n  voltage,\n  chip_temp_c,\n  CASE WHEN raw_json IS NOT NULL AND raw_json <> '' THEN (raw_json::json->>'band_corr')::double precision END AS band_corr,\n  CASE WHEN raw_json IS NOT NULL AND raw_json <> '' THEN (raw_json::json->>'band_delta_max')::double precision END AS band_delta_max,\n  CASE WHEN raw_json IS NOT NULL AND raw_json <> '' THEN (raw_json::json->>'edge_crest')::double precision END AS edge_crest,\n  CASE WHEN raw_json IS NOT NULL AND raw_json <> '' THEN (raw_json::json->>'edge_zcr_hz')::double precision END AS edge_zcr_hz,\n  CASE WHEN raw_json IS NOT NULL AND raw_json <> '' THEN (raw_json::json->>'edge_hf_ratio')::double precision END AS edge_hf_ratio\nFROM verdicts\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND ('${group:raw}' = 'All' OR group_id = '${group:raw}')\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms DESC\nLIMIT 200",
+          "refId": "A"
+        }
+      ],
+      "title": "Recent verdicts",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "imu-pg"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "celsius"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "CPU MHz"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "APB MHz"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "blue",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 46
+      },
+      "id": 20,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "imu-pg"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts_ms AS time, chip_temp_c AS \"Chip temp \u00b0C\"\nFROM (\n  SELECT ts_ms, chip_temp_c FROM verdicts\n  WHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}') AND chip_temp_c IS NOT NULL\n    AND ts_ms >= $__from AND ts_ms <= $__to\n  UNION ALL\n  SELECT ts_ms, chip_temp_c FROM device_telemetry\n  WHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}') AND chip_temp_c IS NOT NULL\n    AND ts_ms >= $__from AND ts_ms <= $__to\n) u\nORDER BY ts_ms",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "imu-pg"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts_ms AS time, cpu_mhz AS \"CPU MHz\"\nFROM (\n  SELECT ts_ms, cpu_mhz FROM verdicts\n  WHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}') AND cpu_mhz IS NOT NULL\n    AND ts_ms >= $__from AND ts_ms <= $__to\n  UNION ALL\n  SELECT ts_ms, cpu_mhz FROM device_telemetry\n  WHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}') AND cpu_mhz IS NOT NULL\n    AND ts_ms >= $__from AND ts_ms <= $__to\n) u\nORDER BY ts_ms",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "imu-pg"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts_ms AS time, apb_mhz AS \"APB MHz\"\nFROM (\n  SELECT ts_ms, apb_mhz FROM verdicts\n  WHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}') AND apb_mhz IS NOT NULL\n    AND ts_ms >= $__from AND ts_ms <= $__to\n  UNION ALL\n  SELECT ts_ms, apb_mhz FROM device_telemetry\n  WHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}') AND apb_mhz IS NOT NULL\n    AND ts_ms >= $__from AND ts_ms <= $__to\n) u\nORDER BY ts_ms",
+          "refId": "C"
+        }
+      ],
+      "title": "Temp / CPU / APB correlation",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "imu-pg"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "deckbytes"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Records uploaded"
+            },
+            "properties": [
+              {
+                "id": "custom.drawStyle",
+                "value": "bars"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Avg batch size (B)"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "unit",
+                "value": "bytes"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "purple",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 54
+      },
+      "id": 21,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "imu-pg"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts_ms AS time, spool_free_b AS \"Spool free (B)\"\nFROM device_telemetry\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND spool_free_b IS NOT NULL\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "imu-pg"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts_ms AS time, records AS \"Records uploaded\"\nFROM cloud_ingest_batches\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND kind IN ('verdict', 'telemetry')\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "imu-pg"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts_ms AS time,\n  CASE WHEN records > 0 THEN bytes::float / records ELSE NULL END AS \"Avg batch size (B)\"\nFROM cloud_ingest_batches\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
+          "refId": "C"
+        }
+      ],
+      "title": "Spool free vs cloud offload batches",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "imu-pg" },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 15 },
+              { "color": "red", "value": 60 }
+            ]
+          },
+          "unit": "m"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 62 },
+      "id": 30,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT (EXTRACT(EPOCH FROM now())*1000 - last_esp_ms) / 60000.0 AS \"Minutes silent\"\nFROM devices\nWHERE last_esp_ms > 0\n  AND ('${device:raw}' = 'All' OR device_id = '${device:raw}')\nORDER BY last_esp_ms ASC\nLIMIT 1",
+          "refId": "A"
+        }
+      ],
+      "title": "ESP silent (minutes since last telemetry/verdict)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "imu-pg" },
+      "gridPos": { "h": 6, "w": 16, "x": 8, "y": 62 },
+      "id": 31,
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "targets": [
+        {
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT device_id,\n  to_timestamp(silent_from_ms/1000.0) AS silent_from,\n  to_timestamp(silent_until_ms/1000.0) AS silent_until,\n  ROUND(gap_ms/3600000.0, 2) AS hours\nFROM presence_gaps\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND silent_until_ms >= $__from AND silent_from_ms <= $__to\nORDER BY silent_until_ms DESC\nLIMIT 50",
+          "refId": "A"
+        }
+      ],
+      "title": "Device silent gaps (≥1h ingest; not necessarily battery-out)",
+      "type": "table"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "imu-pg" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 68 },
+      "id": 32,
+      "options": { "showHeader": true, "cellHeight": "sm" },
+      "targets": [
+        {
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT device_id, kind,\n  to_timestamp(ts_ms/1000.0) AS created,\n  to_timestamp(recv_ms/1000.0) AS delivered,\n  (recv_ms - ts_ms) AS lag_ms,\n  records, bytes\nFROM cloud_ingest_batches\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms DESC\nLIMIT 5000",
+          "refId": "A"
+        }
+      ],
+      "title": "Ingest batches (Inspect → Download CSV; delivered empty on historical rows)",
+      "type": "table"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "imu-pg" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "options": { "0": { "color": "green", "text": "OK" } }, "type": "value" },
+            { "options": { "1": { "color": "yellow", "text": "WARN" } }, "type": "value" },
+            { "options": { "2": { "color": "red", "text": "ALARM" } }, "type": "value" }
+          ],
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -394,236 +1412,110 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 20 },
-      "id": 8,
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 74 },
+      "id": 40,
       "options": {
-        "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "single", "sort": "none" }
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
       },
       "targets": [
         {
-          "datasource": { "type": "postgres", "uid": "imu-pg" },
-          "editorMode": "code",
-          "format": "time_series",
-          "rawQuery": true,
-          "rawSql": "SELECT ts_ms AS time, level AS \"Level\"\nFROM verdicts\nWHERE device_id = '$device'\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
-          "refId": "A"
-        }
-      ],
-      "title": "Verdict level (0=OK, 1=WARN, 2=ALERT)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "imu-pg" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 8,
-            "gradientMode": "none",
-            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
-            "insertNulls": false,
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "pointSize": 4,
-            "scaleDistribution": { "type": "linear" },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": { "group": "A", "mode": "none" },
-            "thresholdsStyle": { "mode": "off" }
-          },
-          "decimals": 3,
-          "max": 1,
-          "min": -1
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 26 },
-      "id": 10,
-      "options": {
-        "legend": { "calcs": ["mean", "min"], "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "imu-pg" },
-          "editorMode": "code",
-          "format": "time_series",
-          "rawQuery": true,
-          "rawSql": "SELECT ts_ms AS time,\n  (raw_json::json->>'band_corr')::double precision AS \"Band corr\"\nFROM verdicts\nWHERE device_id = '$device'\n  AND raw_json IS NOT NULL AND raw_json <> ''\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
-          "refId": "A"
-        },
-        {
-          "datasource": { "type": "postgres", "uid": "imu-pg" },
-          "editorMode": "code",
-          "format": "time_series",
-          "rawQuery": true,
-          "rawSql": "SELECT ts_ms AS time,\n  (raw_json::json->>'band_delta_max')::double precision AS \"Band delta max\"\nFROM verdicts\nWHERE device_id = '$device'\n  AND raw_json IS NOT NULL AND raw_json <> ''\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
-          "refId": "B"
-        }
-      ],
-      "title": "Band reference compare",
-      "type": "timeseries"
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "imu-pg" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 8,
-            "gradientMode": "none",
-            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
-            "insertNulls": false,
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "pointSize": 4,
-            "scaleDistribution": { "type": "linear" },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": { "group": "A", "mode": "none" },
-            "thresholdsStyle": { "mode": "off" }
-          },
-          "decimals": 3
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 26 },
-      "id": 11,
-      "options": {
-        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "imu-pg" },
-          "editorMode": "code",
-          "format": "time_series",
-          "rawQuery": true,
-          "rawSql": "SELECT ts_ms AS time,\n  (raw_json::json->>'edge_crest')::double precision AS \"Crest\"\nFROM verdicts\nWHERE device_id = '$device'\n  AND raw_json IS NOT NULL AND raw_json <> ''\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
-          "refId": "A"
-        },
-        {
-          "datasource": { "type": "postgres", "uid": "imu-pg" },
-          "editorMode": "code",
-          "format": "time_series",
-          "rawQuery": true,
-          "rawSql": "SELECT ts_ms AS time,\n  (raw_json::json->>'edge_zcr_hz')::double precision AS \"ZCR (Hz)\"\nFROM verdicts\nWHERE device_id = '$device'\n  AND raw_json IS NOT NULL AND raw_json <> ''\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
-          "refId": "B"
-        },
-        {
-          "datasource": { "type": "postgres", "uid": "imu-pg" },
-          "editorMode": "code",
-          "format": "time_series",
-          "rawQuery": true,
-          "rawSql": "SELECT ts_ms AS time,\n  (raw_json::json->>'edge_hf_ratio')::double precision AS \"HF ratio\"\nFROM verdicts\nWHERE device_id = '$device'\n  AND raw_json IS NOT NULL AND raw_json <> ''\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
-          "refId": "C"
-        }
-      ],
-      "title": "Edge features (crest / ZCR / HF)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "imu-pg" },
-      "fieldConfig": {
-        "defaults": {
-          "custom": { "align": "auto", "cellOptions": { "type": "auto" }, "inspect": false },
-          "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "level" },
-            "properties": [
-              {
-                "id": "mappings",
-                "value": [
-                  { "options": { "0": { "color": "green", "index": 0, "text": "OK" } }, "type": "value" },
-                  { "options": { "1": { "color": "yellow", "index": 1, "text": "WARN" } }, "type": "value" },
-                  { "options": { "2": { "color": "red", "index": 2, "text": "ALERT" } }, "type": "value" }
-                ]
-              }
-            ]
-          }
-        ]
-      },
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 36 },
-      "id": 9,
-      "options": {
-        "cellHeight": "sm",
-        "footer": { "countRows": false, "fields": "", "reducer": ["sum"], "show": false },
-        "showHeader": true,
-        "sortBy": [{ "desc": true, "displayName": "ts_ms" }]
-      },
-      "pluginVersion": "11.5.2",
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "imu-pg" },
-          "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  ts_ms,\n  device_id,\n  group_id,\n  seq,\n  level,\n  rms,\n  peak,\n  corr,\n  rms_delta,\n  pct,\n  voltage,\n  chip_temp_c,\n  CASE WHEN raw_json IS NOT NULL AND raw_json <> '' THEN (raw_json::json->>'band_corr')::double precision END AS band_corr,\n  CASE WHEN raw_json IS NOT NULL AND raw_json <> '' THEN (raw_json::json->>'band_delta_max')::double precision END AS band_delta_max,\n  CASE WHEN raw_json IS NOT NULL AND raw_json <> '' THEN (raw_json::json->>'edge_crest')::double precision END AS edge_crest,\n  CASE WHEN raw_json IS NOT NULL AND raw_json <> '' THEN (raw_json::json->>'edge_zcr_hz')::double precision END AS edge_zcr_hz,\n  CASE WHEN raw_json IS NOT NULL AND raw_json <> '' THEN (raw_json::json->>'edge_hf_ratio')::double precision END AS edge_hf_ratio\nFROM verdicts\nWHERE device_id = '$device'\n  AND ('${group:raw}' = 'All' OR group_id = '${group:raw}')\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms DESC\nLIMIT 200",
+          "rawSql": "SELECT operator_level AS \"Operator\"\nFROM operator_status\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\nORDER BY updated_ms DESC\nLIMIT 1",
           "refId": "A"
         }
       ],
-      "title": "Recent verdicts",
+      "title": "Operator level (page mechanic on ALARM)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "imu-pg" },
+      "gridPos": { "h": 6, "w": 16, "x": 8, "y": 74 },
+      "id": 41,
+      "options": { "showHeader": true, "cellHeight": "sm" },
+      "targets": [
+        {
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT r.id, m.machine_key, r.started_ms, r.ended_ms, r.fta_leaf, r.parts_changed, r.new_ref_required\nFROM repair_events r\nJOIN machines m ON m.id = r.machine_id\nWHERE r.started_ms <= $__to AND COALESCE(r.ended_ms, EXTRACT(EPOCH FROM now())*1000) >= $__from\nORDER BY r.started_ms DESC\nLIMIT 50",
+          "refId": "A"
+        }
+      ],
+      "title": "Repair windows (excluded from operator trend)",
       "type": "table"
     }
   ],
   "refresh": "30s",
   "schemaVersion": 39,
-  "tags": ["imu", "verdicts", "esp32"],
+  "tags": [
+    "imu",
+    "verdicts",
+    "esp32"
+  ],
   "templating": {
     "list": [
       {
-        "current": {},
-        "datasource": { "type": "postgres", "uid": "imu-pg" },
-        "definition": "SELECT DISTINCT device_id FROM verdicts ORDER BY 1",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "All"
+        },
+        "datasource": {
+          "type": "postgres",
+          "uid": "imu-pg"
+        },
+        "definition": "SELECT DISTINCT device_id FROM (SELECT device_id FROM verdicts UNION SELECT device_id FROM device_telemetry UNION SELECT device_id FROM crashes UNION SELECT device_id FROM battery_bench_sessions) d ORDER BY 1",
         "hide": 0,
-        "includeAll": false,
+        "includeAll": true,
         "label": "Device",
         "multi": false,
         "name": "device",
         "options": [],
-        "query": "SELECT DISTINCT device_id FROM verdicts ORDER BY 1",
-        "refresh": 2,
+        "query": "SELECT DISTINCT device_id FROM (SELECT device_id FROM verdicts UNION SELECT device_id FROM device_telemetry UNION SELECT device_id FROM crashes UNION SELECT device_id FROM battery_bench_sessions) d ORDER BY 1",
+        "refresh": 1,
         "regex": "",
         "skipUrlSync": false,
         "sort": 1,
-        "type": "query"
+        "type": "query",
+        "allValue": "All"
       },
       {
-        "current": { "selected": true, "text": "All", "value": "All" },
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "All"
+        },
         "hide": 0,
         "includeAll": true,
         "label": "Group",
         "multi": false,
         "name": "group",
-        "options": [{ "selected": true, "text": "All", "value": "All" }],
+        "options": [
+          {
+            "selected": true,
+            "text": "All",
+            "value": "All"
+          }
+        ],
         "query": "SELECT DISTINCT group_id FROM verdicts WHERE group_id IS NOT NULL ORDER BY 1",
         "refresh": 2,
         "skipUrlSync": false,
         "type": "query",
-        "datasource": { "type": "postgres", "uid": "imu-pg" },
+        "datasource": {
+          "type": "postgres",
+          "uid": "imu-pg"
+        },
         "definition": "SELECT DISTINCT group_id FROM verdicts WHERE group_id IS NOT NULL ORDER BY 1"
       }
     ]
   },
-  "time": { "from": "now-7d", "to": "now" },
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
   "timepicker": {},
   "timezone": "browser",
   "title": "ESP32 IMU Verdicts",

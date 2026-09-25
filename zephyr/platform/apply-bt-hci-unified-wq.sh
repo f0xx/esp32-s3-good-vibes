@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 # Move Zephyr HCI TX + conn tx-complete work off sysworkq onto the BT RX workqueue.
+#
+# OBSOLETE on Zephyr 4.4+: in-tree already uses tx_notify_workqueue_get /
+# bt_tx_processor_workq. flash-zephyr.sh / ci-west-build.sh default
+# APPLY_BT_HCI_WQ_PATCH=0. Only set =1 on Zephyr 3.7-era trees.
 set -euo pipefail
 
 ZEPHYR_ROOT="${1:?usage: apply-bt-hci-unified-wq.sh ZEPHYR_ROOT}"
@@ -14,6 +18,14 @@ if grep -q "$marker" "$HCI_CORE_H" && \
    grep -q 'bt_hci_wq_submit(&conn->tx_complete_work)' "$HCI_CORE_C" && \
    grep -q 'bt_hci_wq_submit(&chan->rx_work)' "$L2CAP_C"; then
 	echo "BT HCI unified workqueue patch already applied"
+	exit 0
+fi
+
+# Zephyr 4.4+ moved TX complete off sysworkq (tx_notify_workqueue_get /
+# bt_tx_processor_workq). Our 3.7 patch sites no longer exist.
+if grep -q 'tx_notify_workqueue_get' "$CONN_C" && \
+   grep -q 'bt_tx_processor_workq' "$HCI_CORE_C"; then
+	echo "BT HCI unified workqueue: skipped (Zephyr 4.4+ in-tree TX WQ)"
 	exit 0
 fi
 

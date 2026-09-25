@@ -1,5 +1,11 @@
 # Waveshare ESP32-S3-LCD-1.47B
+#
+# Zephyr 4.x adds HEAP_MEM_POOL_ADD_SIZE_ESP_{WIFI,BT} (≈50K+25K). Do not
+# also reserve a full WiFi+BT board floor here or the system heap balloons
+# past dram0_0_seg (seen: overflow ≈13 KiB with BOARD=65535).
 
-config BOARD_ESP32S3_LCD_147B
-	select SOC_ESP32S3_PROCPU if BOARD_ESP32S3_LCD_147B_ESP32S3_PROCPU
-	select SOC_ESP32S3_APPCPU if BOARD_ESP32S3_LCD_147B_ESP32S3_APPCPU
+config HEAP_MEM_POOL_ADD_SIZE_BOARD
+	int
+	default 8192 if BOARD_ESP32S3_LCD_147B_ESP32S3_PROCPU && (WIFI || BT)
+	default 4096 if BOARD_ESP32S3_LCD_147B_ESP32S3_PROCPU
+	default 256 if BOARD_ESP32S3_LCD_147B_ESP32S3_APPCPU

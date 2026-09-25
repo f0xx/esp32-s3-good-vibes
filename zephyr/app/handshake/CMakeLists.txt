@@ -4,11 +4,27 @@ project(waveshare_handshake)
 
 target_include_directories(app PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
-  ${CMAKE_CURRENT_SOURCE_DIR}/../common
 )
 
-get_filename_component(APP_ROOT ${CMAKE_CURRENT_SOURCE_DIR} REALPATH)
-set(COMMON_DIR ${APP_ROOT}/../common)
+# Prefer space-free west links. CMake REALPATHs the handshake symlink, so a
+# relative ../waveshare-common misses. Spaces in the repo path break the
+# Xtensa assembler .file directive.
+set(_link_common "")
+if(DEFINED ENV{ZEPHYR_PROJECT} AND EXISTS "$ENV{ZEPHYR_PROJECT}/waveshare-common/fw_version.h")
+  set(_link_common "$ENV{ZEPHYR_PROJECT}/waveshare-common")
+elseif(DEFINED ENV{HOME} AND EXISTS "$ENV{HOME}/zephyrproject/waveshare-common/fw_version.h")
+  set(_link_common "$ENV{HOME}/zephyrproject/waveshare-common")
+endif()
+if(_link_common)
+  set(COMMON_DIR "${_link_common}")
+else()
+  get_filename_component(APP_ROOT ${CMAKE_CURRENT_SOURCE_DIR} REALPATH)
+  set(COMMON_DIR ${APP_ROOT}/../common)
+endif()
+
+target_include_directories(app PRIVATE ${COMMON_DIR})
+
+message(STATUS "handshake COMMON_DIR=${COMMON_DIR}")
 
 target_sources(app PRIVATE
   src/main.c
@@ -23,8 +39,9 @@ target_sources(app PRIVATE
   src/imu_pipeline.c
   src/panel_draw.c
   src/panel_font_glcd.c
-  src/panel_fb.c
+  ${COMMON_DIR}/renderer.c
   src/mt200_bridge.c
+  src/mt200_sample_queue.c
   src/qmi8658.c
   src/scene_live.c
   src/ws2812_gpio38.c
@@ -39,10 +56,13 @@ target_sources(app PRIVATE
   ${COMMON_DIR}/bist.c
   ${COMMON_DIR}/crash_debug.c
   ${COMMON_DIR}/crash_report.c
+  ${COMMON_DIR}/crash_alive.c
   ${COMMON_DIR}/crash_ring_store.c
   ${COMMON_DIR}/crash_rtc_capture.c
   ${COMMON_DIR}/device_config.c
   ${COMMON_DIR}/ota_ab.c
+  ${COMMON_DIR}/ota_channel.c
+  ${COMMON_DIR}/ota_wifi.c
   ${COMMON_DIR}/soft_reboot.c
   ${COMMON_DIR}/device_profile.c
   ${COMMON_DIR}/flash_safety.c
@@ -69,3 +89,13 @@ target_sources(app PRIVATE
 )
 
 target_link_libraries(app PRIVATE m)
+
+# Espressif heap Kconfig → compile defs (heap_caps_zephyr still uses k_malloc;
+# SYS_HEAP_HARDENING_* does the real canary work. These defs keep IDF headers
+# and any multi_heap paths consistent when present).
+if(CONFIG_HEAP_POISONING_LIGHT OR CONFIG_HEAP_POISONING_COMPREHENSIVE)
+  zephyr_compile_definitions(MULTI_HEAP_POISONING=1)
+endif()
+if(CONFIG_HEAP_POISONING_COMPREHENSIVE)
+  zephyr_compile_definitions(MULTI_HEAP_POISONING_SLOW=1)
+endif()

@@ -55,6 +55,18 @@
                 android:textColor="#CCCCCC"
                 android:textSize="15sp" />
 
+            <TextView
+                android:id="@+id/ahrsGps"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:fontFamily="monospace"
+                android:lineSpacingExtra="3dp"
+                android:paddingTop="8dp"
+                android:paddingBottom="12dp"
+                android:text="@string/ahrs_gps_idle"
+                android:textColor="#81D4FA"
+                android:textSize="13sp" />
+
         </LinearLayout>
     </androidx.core.widget.NestedScrollView>
 </LinearLayout>

@@ -10,6 +10,7 @@
 #include "panel_backlight.h"
 #include "clock_sync.h"
 #include "power_manager.h"
+#include "stall_watchdog.h"
 
 LOG_MODULE_REGISTER(net_mgr, LOG_LEVEL_INF);
 
@@ -35,6 +36,7 @@ static uint8_t g_ap_count;
 static bool g_scanning;
 static bool g_connected;
 static char g_conn_ssid[33];
+static int8_t g_conn_rssi = -127;
 static int8_t g_conn_idx = -1;
 
 static enum {
@@ -49,8 +51,17 @@ static char g_pending_pass[65];
 static network_wifi_status_fn g_wifi_status_cb;
 static uint32_t g_connect_started_ms;
 static int64_t g_connect_after_ms;
+static int64_t g_wifi_settle_until_ms;
+static bool g_scan_passive;
+
+int __attribute__((weak)) esp32_wifi_radio_release(void)
+{
+	LOG_WRN("WiFi radio_release missing (driver patch not applied)");
+	return -ENOTSUP;
+}
 
 static void run_pending_connect(void);
+static void ensure_wifi_up(void);
 
 static void notify_wifi_status(const char *state)
 {
@@ -64,6 +75,9 @@ static int wifi_connect_req(const char *ssid, const char *pass);
 static void run_pending_connect(void)
 {
 	power_manager_reapply_backlight_if_screen_on();
+	/* Bring the MAC up only after BLE drop settle — starting it in
+	 * connect_* raced phone teardown and starved net buffers. */
+	ensure_wifi_up();
 	g_connect_started_ms = k_uptime_get_32();
 
 	if (g_pending == PENDING_CONNECT_IDX) {
@@ -133,9 +147,10 @@ static void store_ap(const struct wifi_scan_result *res)
 	ap->ssid[res->ssid_length] = '\0';
 	ap->rssi = res->rssi;
 	ap->sec = (res->security == WIFI_SECURITY_TYPE_NONE) ? 0U : 1U;
+	LOG_INF("WiFi AP \"%s\" rssi=%d sec=%u", ap->ssid, ap->rssi, ap->sec);
 }
 
-static void event_handler(struct net_mgmt_event_callback *cb, unsigned int mgmt_event,
+static void event_handler(struct net_mgmt_event_callback *cb, uint64_t mgmt_event,
 			  struct net_if *iface)
 {
 	ARG_UNUSED(cb);
@@ -155,21 +170,30 @@ static void event_handler(struct net_mgmt_event_callback *cb, unsigned int mgmt_
 		if (st->status == WIFI_STATUS_CONN_SUCCESS) {
 			g_connected = true;
 			g_connect_started_ms = 0;
+			g_conn_rssi = -127;
+			for (uint8_t i = 0; i < g_ap_count; i++) {
+				if (strcmp(g_aps[i].ssid, g_conn_ssid) == 0) {
+					g_conn_rssi = g_aps[i].rssi;
+					break;
+				}
+			}
 			if (g_conn_idx >= 0) {
 				net_profile_store_mark_ok((uint8_t)g_conn_idx);
 			}
 			power_manager_reapply_backlight_if_screen_on();
-			LOG_INF("WiFi connected (%s)", g_conn_ssid);
+			LOG_INF("WiFi connected (%s) rssi=%d", g_conn_ssid, (int)g_conn_rssi);
 			notify_wifi_status("connected");
 			clock_sync_ntp_on_wifi_connected();
 		} else {
 			g_connected = false;
+			g_conn_rssi = -127;
 			g_connect_started_ms = 0;
 			LOG_WRN("WiFi connect failed (%d)", st->status);
 			notify_wifi_status("failed");
 		}
 	} else if (mgmt_event == NET_EVENT_WIFI_DISCONNECT_RESULT) {
 		g_connected = false;
+		g_conn_rssi = -127;
 	}
 }
 
@@ -194,6 +218,8 @@ static int wifi_connect_req(const char *ssid, const char *pass)
 	params.timeout = 15000;
 
 	snprintf(g_conn_ssid, sizeof(g_conn_ssid), "%s", ssid);
+	LOG_INF("WiFi connect req ssid=\"%s\" sec=%s", ssid,
+		params.security == WIFI_SECURITY_TYPE_NONE ? "open" : "psk");
 	return net_mgmt(NET_REQUEST_WIFI_CONNECT, wifi_iface, &params, sizeof(params));
 }
 
@@ -244,32 +270,61 @@ void network_manager_tick(void)
 	}
 
 	if (g_connect_started_ms != 0U && !g_connected &&
-	    (k_uptime_get_32() - g_connect_started_ms) >= 20000U) {
+	    (k_uptime_get_32() - g_connect_started_ms) >= 25000U) {
 		g_connect_started_ms = 0;
 		LOG_WRN("WiFi connect timeout");
 		notify_wifi_status("failed");
+		/* Free the MAC so BLE can recover; next connect will restart it. */
+		(void)esp32_wifi_radio_release();
+		g_wifi_settle_until_ms = k_uptime_get() + 1500;
 	}
 }
 
 bool network_manager_start_scan(void)
 {
-	if (wifi_iface == NULL || g_scanning) {
+	/* Duplicate start while a scan is already running used to return false, which
+	 * made ble_net resume MT200 on top of an in-flight WiFi scan and starve the
+	 * main task WDT. Treat "already scanning" as success. */
+	if (g_scanning) {
+		return true;
+	}
+
+	const bool passive = g_scan_passive;
+
+	g_scan_passive = false;
+	if (wifi_iface == NULL) {
 		return false;
 	}
 
 	ensure_wifi_up();
 	g_ap_count = 0;
 	g_scanning = true;
+
 	struct wifi_scan_params params = { 0 };
 
-	params.scan_type = WIFI_SCAN_TYPE_ACTIVE;
-	params.bands = BIT(WIFI_FREQ_BAND_2_4_GHZ);
-	const int err = net_mgmt(NET_REQUEST_WIFI_SCAN, wifi_iface, &params, sizeof(params));
+	/* Do not set bands/dwell: an empty band_chan list with bands=2.4 GHz
+	 * made some driver paths scan zero channels. Active uses IDF defaults
+	 * (Arduino WiFi.scanNetworks). */
+	params.scan_type = passive ? WIFI_SCAN_TYPE_PASSIVE : WIFI_SCAN_TYPE_ACTIVE;
 
-	if (err != 0) {
-		g_scanning = false;
+	/* Single attempt — do not k_sleep on the main loop (MAIN_WDT_MS is 15 s).
+	 * Callers retry via g_scan_after_ms. */
+	stall_watchdog_feed_main();
+	const int err = net_mgmt(NET_REQUEST_WIFI_SCAN, wifi_iface, &params, sizeof(params));
+	stall_watchdog_feed_main();
+	if (err == 0) {
+		LOG_INF("WiFi scan started (%s, 2.4 GHz)", passive ? "passive listen" : "active probe");
+		return true;
 	}
-	return err == 0;
+
+	LOG_WRN("WiFi scan request failed (%d)", err);
+	g_scanning = false;
+	return false;
+}
+
+void network_manager_request_passive_scan(void)
+{
+	g_scan_passive = true;
 }
 
 bool network_manager_connect_index(uint8_t idx)
@@ -278,10 +333,10 @@ bool network_manager_connect_index(uint8_t idx)
 		return false;
 	}
 
-	ensure_wifi_up();
 	g_pending_idx = idx;
 	g_pending = PENDING_CONNECT_IDX;
-	g_connect_after_ms = k_uptime_get() + 200;
+	/* Soft coexist settle — stretch LE, then assoc (no phone disconnect). */
+	g_connect_after_ms = k_uptime_get() + 400;
 	return true;
 }
 
@@ -291,11 +346,10 @@ bool network_manager_connect_creds(const char *ssid, const char *pass)
 		return false;
 	}
 
-	ensure_wifi_up();
 	snprintf(g_pending_ssid, sizeof(g_pending_ssid), "%s", ssid);
 	snprintf(g_pending_pass, sizeof(g_pending_pass), "%s", pass ? pass : "");
 	g_pending = PENDING_CONNECT_CREDS;
-	g_connect_after_ms = k_uptime_get() + 200;
+	g_connect_after_ms = k_uptime_get() + 400;
 	return true;
 }
 
@@ -319,8 +373,9 @@ void network_manager_build_scan_json(char *dst, size_t dst_len)
 			      (idx >= 0 && idx == active) ? 1U : 0U);
 	}
 	if (o > 0) {
-		snprintf(dst + o, dst_len - (size_t)o, "],\"n_profiles\":%u,\"last_ok\":%d%s}",
-			 net_profile_store_count(), (int)active, g_scanning ? ",\"scanning\":1" : "");
+		snprintf(dst + o, dst_len - (size_t)o,
+			 "],\"n_profiles\":%u,\"last_ok\":%d,\"scanning\":%u}",
+			 net_profile_store_count(), (int)active, g_scanning ? 1U : 0U);
 	}
 }
 
@@ -368,14 +423,62 @@ bool network_manager_scan_busy(void)
 	return g_scanning;
 }
 
+uint8_t network_manager_ap_count(void)
+{
+	return g_ap_count;
+}
+
 bool network_manager_radio_busy(void)
 {
-	return g_scanning || g_connect_started_ms != 0U;
+	/* Include g_pending: connect is scheduled 200ms out; without this,
+	 * radio_scheduler_sync() briefly clears wifi-busy and BLE restores
+	 * mid-handshake (see "restore after WiFi" then net-buffer OOM). */
+	if (g_scanning || g_pending != PENDING_NONE || g_connect_started_ms != 0U) {
+		return true;
+	}
+	if (g_wifi_settle_until_ms > 0 && k_uptime_get() < g_wifi_settle_until_ms) {
+		return true;
+	}
+	return false;
+}
+
+void network_manager_release_scan_radio(void)
+{
+	if (g_scanning || g_pending != PENDING_NONE || g_connected ||
+	    g_connect_started_ms != 0U) {
+		return;
+	}
+
+	(void)esp32_wifi_radio_release();
+	g_wifi_settle_until_ms = k_uptime_get() + 2500;
 }
 
 bool network_manager_portal_active(void)
 {
 	return false;
+}
+
+bool network_manager_link_up(void)
+{
+	return g_connected;
+}
+
+int8_t network_manager_wifi_rssi(void)
+{
+	return g_connected ? g_conn_rssi : (int8_t)-127;
+}
+
+size_t network_manager_wifi_ssid(char *dst, size_t dst_len)
+{
+	if (dst == NULL || dst_len == 0U) {
+		return 0U;
+	}
+	if (!g_connected || g_conn_ssid[0] == '\0') {
+		dst[0] = '\0';
+		return 0U;
+	}
+	snprintf(dst, dst_len, "%s", g_conn_ssid);
+	return strlen(dst);
 }
 
 #else /* !CONFIG_WIFI */
@@ -402,6 +505,10 @@ void network_manager_tick(void)
 bool network_manager_start_scan(void)
 {
 	return false;
+}
+
+void network_manager_request_passive_scan(void)
+{
 }
 
 bool network_manager_connect_index(uint8_t idx)
@@ -459,14 +566,41 @@ bool network_manager_scan_busy(void)
 	return false;
 }
 
+uint8_t network_manager_ap_count(void)
+{
+	return 0;
+}
+
 bool network_manager_radio_busy(void)
 {
 	return false;
 }
 
+void network_manager_release_scan_radio(void)
+{
+}
+
 bool network_manager_portal_active(void)
 {
 	return false;
+}
+
+bool network_manager_link_up(void)
+{
+	return false;
+}
+
+int8_t network_manager_wifi_rssi(void)
+{
+	return -127;
+}
+
+size_t network_manager_wifi_ssid(char *dst, size_t dst_len)
+{
+	if (dst != NULL && dst_len > 0U) {
+		dst[0] = '\0';
+	}
+	return 0U;
 }
 
 #endif /* CONFIG_WIFI */

@@ -30,10 +30,11 @@ class CloudUploader(private val context: Context) {
         val crashes: Result,
         val batteryBench: Result = Result(true, "no bench pending", 0),
         val telemetry: Result = Result(true, "no telemetry pending", 0),
+        val geo: Result = Result(true, "no geo pending", 0),
     ) {
         val totalAccepted: Int
             get() = verdicts.accepted + spectra.accepted + crashes.accepted + batteryBench.accepted +
-                telemetry.accepted
+                telemetry.accepted + geo.accepted
 
         val summary: String
             get() = buildList {
@@ -41,13 +42,15 @@ class CloudUploader(private val context: Context) {
                 if (spectra.accepted > 0) add("${spectra.accepted} spectra")
                 if (crashes.accepted > 0) add("${crashes.accepted} crashes")
                 if (batteryBench.accepted > 0) add("${batteryBench.accepted} bench samples")
+                if (geo.accepted > 0) add("${geo.accepted} geo")
             }.joinToString(", ").ifEmpty {
                 when {
                     verdicts.message.contains("nothing", ignoreCase = true) &&
                         spectra.message.contains("no spectra", ignoreCase = true) &&
                         crashes.message.contains("no crashes", ignoreCase = true) &&
                         batteryBench.message.contains("no bench", ignoreCase = true) &&
-                        telemetry.message.contains("no telemetry", ignoreCase = true) -> "up to date"
+                        telemetry.message.contains("no telemetry", ignoreCase = true) &&
+                        geo.message.contains("no geo", ignoreCase = true) -> "up to date"
                     else -> "no new records"
                 }
             }
@@ -61,10 +64,53 @@ class CloudUploader(private val context: Context) {
             crashes = uploadPendingCrashes(10),
             batteryBench = uploadPendingBatteryBench(500),
             telemetry = telemetry,
+            geo = uploadPendingGeo(80),
         )
     }
 
+    fun pendingGeoCount(): Int = offload.pendingGeoCount()
+
     fun localHistoryCount(): Int = verdictStore.count()
+
+    fun uploadPendingGeo(maxLines: Int = 80): Result {
+        if (!settings.enabled) {
+            return Result(false, "cloud disabled")
+        }
+        val lines = offload.drainPendingGeo(maxLines)
+        if (lines.isEmpty()) {
+            return Result(true, "no geo pending", 0)
+        }
+        var accepted = 0
+        var idx = 0
+        try {
+            while (idx < lines.size) {
+                val row = JSONObject(lines[idx])
+                val result = postJson(
+                    "${settings.baseUrl}/v1/ingest/geo",
+                    JSONObject().apply {
+                        put("device_id", settings.deviceId)
+                        put("kind", row.getString("kind"))
+                        put("unix_ms", row.getLong("unix_ms"))
+                        put("lat", row.getDouble("lat"))
+                        put("lon", row.getDouble("lon"))
+                        if (row.has("accuracy_m") && !row.isNull("accuracy_m")) {
+                            put("accuracy_m", row.getDouble("accuracy_m"))
+                        }
+                    }.toString(),
+                )
+                if (!result.ok) {
+                    offload.restoreGeo(lines.drop(idx))
+                    return Result(false, result.message, accepted)
+                }
+                accepted++
+                idx++
+            }
+            return Result(true, "uploaded $accepted", accepted)
+        } catch (e: Exception) {
+            offload.restoreGeo(lines.drop(idx))
+            return Result(false, e.message ?: "geo flush failed", accepted)
+        }
+    }
 
     /** Cheap pre-check so callers on a hot path (BLE notify callback) can skip work entirely
      *  when cloud upload isn't configured, without needing to know about CloudSettings. */
@@ -181,6 +227,9 @@ class CloudUploader(private val context: Context) {
                 JSONObject().apply {
                     put("type", "telemetry")
                     put("ts_ms", row.optLong("ts_ms"))
+                    row.optInt("pct").takeIf { row.has("pct") }?.let { put("pct", it) }
+                    row.optDouble("voltage").takeIf { row.has("voltage") }?.let { put("voltage", it) }
+                    row.optInt("power_source").takeIf { row.has("power_source") }?.let { put("power_source", it) }
                     row.optDouble("chip_temp_c").takeIf { row.has("chip_temp_c") }?.let { put("chip_temp_c", it) }
                     row.optInt("cpu_mhz").takeIf { row.has("cpu_mhz") }?.let { put("cpu_mhz", it) }
                     row.optInt("apb_mhz").takeIf { row.has("apb_mhz") }?.let { put("apb_mhz", it) }
@@ -188,6 +237,23 @@ class CloudUploader(private val context: Context) {
                     row.optInt("spool_cap_b").takeIf { row.has("spool_cap_b") }?.let { put("spool_cap_b", it) }
                     row.optInt("spool_pending").takeIf { row.has("spool_pending") }?.let { put("spool_pending", it) }
                     row.optInt("dram_free_kb").takeIf { row.has("dram_free_kb") }?.let { put("dram_free_kb", it) }
+                    row.optString("fw_version").takeIf { row.has("fw_version") && it.isNotBlank() }
+                        ?.let { put("fw_version", it) }
+                    row.optInt("fwc").takeIf { row.has("fwc") && it > 0 }?.let { put("fwc", it) }
+                    row.optInt("spi_mhz").takeIf { row.has("spi_mhz") }?.let { put("spi_mhz", it) }
+                    row.optInt("i2c_khz").takeIf { row.has("i2c_khz") }?.let { put("i2c_khz", it) }
+                    row.optInt("ble_rx_kb").takeIf { row.has("ble_rx_kb") }?.let { put("ble_rx_kb", it) }
+                    row.optInt("ble_tx_kb").takeIf { row.has("ble_tx_kb") }?.let { put("ble_tx_kb", it) }
+                    row.optLong("ble_rx_b").takeIf { row.has("ble_rx_b") }?.let { put("ble_rx_b", it) }
+                    row.optLong("ble_tx_b").takeIf { row.has("ble_tx_b") }?.let { put("ble_tx_b", it) }
+                    row.optInt("ble_rx_bps").takeIf { row.has("ble_rx_bps") }?.let { put("ble_rx_bps", it) }
+                    row.optInt("ble_tx_bps").takeIf { row.has("ble_tx_bps") }?.let { put("ble_tx_bps", it) }
+                    row.optInt("display_on").takeIf { row.has("display_on") }?.let { put("display_on", it) }
+                    row.optInt("wifi_on").takeIf { row.has("wifi_on") }?.let { put("wifi_on", it) }
+                    row.optInt("wifi_rssi").takeIf { row.has("wifi_rssi") }?.let { put("wifi_rssi", it) }
+                    row.optInt("wifi_ap").takeIf { row.has("wifi_ap") }?.let { put("wifi_ap", it) }
+                    row.optString("wifi_ssid").takeIf { row.has("wifi_ssid") && it.isNotBlank() }
+                        ?.let { put("wifi_ssid", it) }
                 },
             )
         }
@@ -302,6 +368,25 @@ class CloudUploader(private val context: Context) {
         if (lines.isEmpty()) {
             return Result(true, "no crashes pending", 0)
         }
+        return postCrashLines(lines)
+    }
+
+    /** Upload crashes already fetched over BLE — avoids racing CloudUploadScheduler
+     * draining the offload file between export and upload (which previously returned
+     * "no crashes pending" / 0 accepted while the ESP slots were still cleared on a
+     * later duplicate path). */
+    fun uploadCrashInfos(crashes: List<CrashFetcher.CrashInfo>): Result {
+        if (!settings.enabled) {
+            return Result(false, "cloud disabled")
+        }
+        if (crashes.isEmpty()) {
+            return Result(true, "no crashes pending", 0)
+        }
+        val lines = crashes.map { CrashFetcher.toOffloadJson(it) }
+        return postCrashLines(lines, restoreOnFail = false)
+    }
+
+    private fun postCrashLines(lines: List<String>, restoreOnFail: Boolean = true): Result {
         val records = JSONArray()
         for (line in lines) {
             val row = JSONObject(line)
@@ -342,11 +427,13 @@ class CloudUploader(private val context: Context) {
         val result = try {
             postJson("${settings.baseUrl}/v1/ingest/crashes", body)
         } catch (e: Exception) {
-            offload.restoreCrashes(lines)
+            if (restoreOnFail) offload.restoreCrashes(lines)
             return Result(false, e.message ?: "crash upload failed")
         }
-        if (!result.ok) {
+        if (!result.ok && restoreOnFail) {
             offload.restoreCrashes(lines)
+        } else if (result.ok && result.accepted > 0) {
+            reportIngestBatch("crash", result.accepted, body.length)
         }
         return result
     }
@@ -460,6 +547,8 @@ class CloudUploader(private val context: Context) {
         walkCm: Int? = null,
         rssiEsp: Int? = null,
         rssiMt200: Int? = null,
+        kcalX10: Int? = null,
+        distanceMm: Int? = null,
     ): Result {
         if (!settings.enabled) {
             return Result(false, "cloud disabled")
@@ -481,6 +570,8 @@ class CloudUploader(private val context: Context) {
         if (spo2 != null) add("spo2", spo2)
         if (steps != null) add("steps", steps)
         if (batteryPct != null) add("battery_pct", batteryPct)
+        if (kcalX10 != null) add("kcal_x10", kcalX10)
+        if (distanceMm != null) add("distance_mm", distanceMm)
         if (walkCm != null) add("walk_cm", walkCm, source = "esp32")
         if (rssiEsp != null) add("rssi_esp", rssiEsp, source = "phone")
         if (rssiMt200 != null) add("rssi_mt200", rssiMt200, source = "esp32")
@@ -519,12 +610,16 @@ class CloudUploader(private val context: Context) {
         }
     }
 
-    /** GPS anchor / IMU dead-reckoning point relay (Phase 3 — see GeoTracker). Same best-effort,
-     *  no-retry philosophy as uploadAhrsSample: this is preprod-demo route-comparison debug
-     *  data, not a durable trip log. */
+    /** GPS / IMU-dead-reckon point. On network failure the point is spooled locally and flushed
+     *  when CloudUploadWorker next has connectivity (phone+ESP walk without Wi-Fi). */
     fun uploadGeoPoint(kind: String, lat: Double, lon: Double, unixMs: Long, accuracyM: Double?): Result {
+        if (!lat.isFinite() || !lon.isFinite()) {
+            return Result(false, "non-finite lat/lon")
+        }
+        val acc = accuracyM?.takeIf { it.isFinite() }
         if (!settings.enabled) {
-            return Result(false, "cloud disabled")
+            val n = offload.exportGeoPoint(kind, lat, lon, unixMs, acc)
+            return Result(false, "queued $n (cloud off)")
         }
         val body = JSONObject().apply {
             put("device_id", settings.deviceId)
@@ -532,12 +627,21 @@ class CloudUploader(private val context: Context) {
             put("unix_ms", unixMs)
             put("lat", lat)
             put("lon", lon)
-            if (accuracyM != null) put("accuracy_m", accuracyM)
+            if (acc != null) put("accuracy_m", acc)
         }.toString()
         return try {
-            postJson("${settings.baseUrl}/v1/ingest/geo", body)
+            val result = postJson("${settings.baseUrl}/v1/ingest/geo", body)
+            if (!result.ok) {
+                val n = offload.exportGeoPoint(kind, lat, lon, unixMs, acc)
+                if (n == 1) CloudUploadScheduler.enqueueNow(context)
+                Result(false, "queued $n (${result.message})")
+            } else {
+                result
+            }
         } catch (e: Exception) {
-            Result(false, e.message ?: "geo upload failed")
+            val n = offload.exportGeoPoint(kind, lat, lon, unixMs, acc)
+            if (n == 1) CloudUploadScheduler.enqueueNow(context)
+            Result(false, "queued $n (${e.message ?: "geo upload failed"})")
         }
     }
 
@@ -628,7 +732,11 @@ class CloudUploader(private val context: Context) {
                 return Result(false, "HTTP $code: $text")
             }
             val resp = JSONObject(text)
-            val accepted = resp.optInt("accepted", linesAcceptedFallback(text))
+            val accepted = when {
+                resp.has("accepted") -> resp.optInt("accepted")
+                resp.optBoolean("ok", false) -> 1
+                else -> linesAcceptedFallback(text)
+            }
             val duplicates = resp.optInt("duplicates", 0)
             return Result(true, "uploaded $accepted", accepted, duplicates)
         } finally {

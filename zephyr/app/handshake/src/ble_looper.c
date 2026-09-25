@@ -9,6 +9,8 @@
 #include "ble_imu_gatt.h"
 
 #include "stall_watchdog.h"
+#include "app_func_trace.h"
+#include "stack_ra_check.h"
 
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/kernel.h>
@@ -35,12 +37,20 @@ K_MSGQ_DEFINE(ble_looper_q, sizeof(struct ble_looper_msg), BLE_LOOPER_Q_DEPTH, 4
 
 static void dispatch_msg(const struct ble_looper_msg *msg)
 {
+	STACK_RA_CHECK_SETUP;
+	APP_ENTER();
 	switch (msg->type) {
 	case BLE_LOOPER_CONNECTED:
+		LOG_ERR(">> dispatch CONNECTED");
 		ble_imu_gatt_looper_connected(msg->conn);
+		STACK_RA_CHECK();
+		LOG_ERR("<< dispatch CONNECTED");
 		break;
 	case BLE_LOOPER_DISCONNECTED:
+		LOG_ERR(">> dispatch DISCONNECTED reason=%u", msg->u8);
 		ble_imu_gatt_looper_disconnected(msg->u8);
+		STACK_RA_CHECK();
+		LOG_ERR("<< dispatch DISCONNECTED");
 		break;
 	case BLE_LOOPER_ADV_START:
 		(void)ble_imu_gatt_looper_adv_start(false);
@@ -52,6 +62,7 @@ static void dispatch_msg(const struct ble_looper_msg *msg)
 		LOG_WRN("ble_looper: unknown evt %u", msg->type);
 		break;
 	}
+	APP_LEAVE();
 }
 
 static int ble_looper_post(const struct ble_looper_msg *msg)
@@ -75,6 +86,7 @@ int ble_looper_init(void)
 
 void ble_looper_poll(void)
 {
+	STACK_RA_CHECK_SETUP;
 	for (;;) {
 		struct ble_looper_msg msg;
 
@@ -82,7 +94,10 @@ void ble_looper_poll(void)
 			break;
 		}
 
+		APP_ENTER();
 		dispatch_msg(&msg);
+		APP_LEAVE();
+		STACK_RA_CHECK();
 
 		if (msg.type == BLE_LOOPER_CONNECTED && msg.conn != NULL) {
 			bt_conn_unref(msg.conn);
@@ -90,8 +105,10 @@ void ble_looper_poll(void)
 	}
 
 	ble_imu_gatt_looper_tick();
+	STACK_RA_CHECK();
 	stall_watchdog_feed_main();
 	ble_crash_gatt_looper_tick();
+	STACK_RA_CHECK();
 	stall_watchdog_feed_main();
 }
 
@@ -103,13 +120,21 @@ int ble_looper_post_connected(struct bt_conn *conn, uint8_t err)
 		.conn = NULL,
 	};
 
+	APP_ENTER();
 	if (err != 0U || conn == NULL) {
 		LOG_ERR("connect failed (%u)", err);
+		APP_LEAVE();
 		return 0;
 	}
 
 	msg.conn = bt_conn_ref(conn);
-	return ble_looper_post(&msg);
+	{
+		const int rc = ble_looper_post(&msg);
+
+		LOG_ERR("post CONNECTED rc=%d", rc);
+		APP_LEAVE();
+		return rc;
+	}
 }
 
 int ble_looper_post_disconnected(uint8_t reason)

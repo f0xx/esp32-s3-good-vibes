@@ -32,6 +32,15 @@ class StatusBannerController private constructor(
     private var draining = false
     private var current: Item? = null
 
+    /** Sticky caption: stays up until [hide] or another sticky with the same key. */
+    fun showSticky(
+        level: StatusBannerLevel,
+        message: String,
+        coalesceKey: String = "ota",
+    ) {
+        show(level, message, holdMs = STICKY_MS, coalesceKey = coalesceKey)
+    }
+
     fun show(
         level: StatusBannerLevel,
         message: String,
@@ -120,6 +129,10 @@ class StatusBannerController private constructor(
     }
 
     private fun scheduleHide(holdMs: Long) {
+        if (holdMs >= STICKY_MS) {
+            hideRunnable = null
+            return
+        }
         val task = Runnable {
             hideRunnable = null
             slideOut {
@@ -176,6 +189,7 @@ class StatusBannerController private constructor(
 
     companion object {
         private const val SLIDE_MS = 280L
+        private const val STICKY_MS = Long.MAX_VALUE / 4
 
         fun attach(contentRoot: ViewGroup): StatusBannerController {
             val banner = android.view.LayoutInflater.from(contentRoot.context)

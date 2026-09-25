@@ -2,7 +2,7 @@
 
 #include <zephyr/bluetooth/uuid.h>
 
-#define BLE_NET_JSON_MAX 1024
+#define BLE_NET_JSON_MAX 2048
 
 #define BT_UUID_NET_SVC_VAL \
 	BT_UUID_128_ENCODE(0x4a6e0200, 0x0000, 0x1000, 0x8000, 0x00805f9b34fb)

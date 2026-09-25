@@ -10,14 +10,22 @@
     <string name="status_disconnected">Disconnected</string>
     <string name="notification_channel_ble">IMU BLE session</string>
     <string name="notification_connected">Connected to ESP32 IMU</string>
-    <string name="notification_idle">BLE service idle — tap to open</string>
+    <string name="notification_idle">Looking for ESP…</string>
+    <string name="notification_scanning">Scanning for ESP…</string>
+    <string name="notification_connecting">Connecting to ESP…</string>
+    <string name="notification_ntp_synced">Connected · NTP synced</string>
+    <string name="notification_ntp_syncing">Connected · NTP syncing</string>
+    <string name="notification_dfu">DFU %1$d%%</string>
+    <string name="notification_permissions">BLE permissions needed — tap to allow</string>
     <string name="notification_autopilot">Autopilot relay — periodic BLE sync active</string>
     <string name="ota_file">OTA from file</string>
     <string name="ota_check_cloud">Check for OTA</string>
     <string name="ota_prompt_apk_title">App update</string>
-    <string name="ota_prompt_apk_body">Install APK %1$s (%2$d)? Firmware OTA waits until this app is current.</string>
+    <string name="ota_prompt_apk_body">Current app: %1$s (%2$d)\nAvailable: %3$s (%4$d)\n\nFirmware OTA waits until this app is current.</string>
     <string name="ota_prompt_fw_title">ESP32 firmware update</string>
-    <string name="ota_prompt_fw_body">Install %1$s over BLE?\nCurrently: %2$s</string>
+    <string name="ota_prompt_fw_body">Current firmware: %1$s (%2$d)\nAvailable: %3$s (%4$d)\n\nStay near the board. The app stays locked until this finishes or fails.</string>
+    <string name="ota_busy">OTA already in progress</string>
+    <string name="ota_lock_hint">OTA in progress — wait until it finishes or fails</string>
     <string name="ota_install">Install</string>
     <string name="ota_later">Later</string>
     <string name="ota_need_unknown_sources">Allow installing this app from itself (unknown sources), then check for OTA again.</string>
@@ -31,7 +39,8 @@
     <string name="wifi_hub_prov_keep">Open setup hotspot (keep profiles)</string>
     <string name="wifi_hub_prov_erase">Open setup hotspot (erase profiles)</string>
     <string name="wifi_scan_title">Nearby WiFi</string>
-    <string name="wifi_scanning">ESP is scanning… (8–15 s)</string>
+    <string name="wifi_scanning">ESP is scanning nearby WiFi…</string>
+    <string name="wifi_scan_ble_paused">ESP scanning (BLE paused — reconnects when done)</string>
     <string name="wifi_scan_empty">No networks found yet. Stay on this screen or tap Rescan.</string>
     <string name="wifi_profiles_title">Saved profiles</string>
     <string name="wifi_profiles_empty">No profiles stored on ESP. Scan and connect, or use setup hotspot.</string>
@@ -66,6 +75,13 @@
     <string name="crash_debug_status_disconnected">Not connected — tap Connect on the main screen first.</string>
     <string name="crash_debug_status_ready">Debug firmware ready (dbg=1). Inject buttons enabled.</string>
     <string name="crash_debug_status_try_anyway">Debug flag not seen yet — inject may still work if crash BLE service is present.</string>
+    <string name="led_debug_heading">Acrylic LED wire map</string>
+    <string name="led_debug_help">This is an ST7789 TFT (not OLED): the backlight is held off so it does not mix into the acrylic. The scene keeps rendering. R/G/B match those diodes. Leave restores backlight and the status LED schema.</string>
+    <string name="led_debug_r">R (programmed red)</string>
+    <string name="led_debug_g">G (programmed green)</string>
+    <string name="led_debug_b">B (programmed blue)</string>
+    <string name="led_debug_wire">Programmed RGB: R=%1$s G=%2$s B=%3$s — look at the LED and write down the visible colour.</string>
+    <string name="led_debug_disconnected">Connect BLE first, then toggle R/G/B.</string>
     <string name="vibro_idle">Vibro: — (connect BLE)</string>
     <string name="cloud_settings">Cloud</string>
     <string name="menu_vibro">Vibro…</string>
@@ -99,7 +115,8 @@
 
     <string name="ahrs_menu">AHRS live view (full speed)…</string>
     <string name="ahrs_title">AHRS — live orientation</string>
-    <string name="ahrs_help">On-device attitude filter (complementary filter, gyro+accel, no magnetometer — yaw drifts over time). Separated from the other modes because it forces full CPU clock (240 MHz) and max IMU sample rate (100 Hz) for the smoothest fusion — this is NOT a battery saver. Speed reverts to Auto when you leave this screen. For a 3D cube view, open the web debug page from the dashboard.</string>
+    <string name="ahrs_help">On-device Madgwick AHRS (accel+gyro; no magnetometer — yaw drifts). This screen forces 240 MHz / 100 Hz IMU and a live BLE notify link; GPS runs only here. IMU map points use the first GPS fix + ESP walk distance (wdcm) and gyro yaw. AHRS cannot measure altitude — GPS alt is shown when the phone has it.</string>
+    <string name="ahrs_gps_idle">GPS: starting…</string>
     <string name="ahrs_status_boosting">Boosting CPU/IMU speed…</string>
     <string name="ahrs_status_live">Live</string>
     <string name="ahrs_status_stale">No data yet</string>
@@ -138,4 +155,15 @@
     <string name="vibro_ref_wizard_progress">Progress: %1$d / %2$d references</string>
     <string name="vibro_ref_wizard_finish">Upload &amp; finish</string>
     <string name="vibro_ref_wizard_menu">Reference wizard…</string>
+    <string name="repair_wizard_title">Repair / operator</string>
+    <string name="repair_wizard_menu">Repair / operator…</string>
+    <string name="repair_wizard_help">Attach this ESP to a machine, then START REPAIR before mechanical work. A single window (vd) is only a candidate — the backend pages the mechanic. After END REPAIR, re-record references if the mechanical path changed.</string>
+    <string name="repair_wizard_machine_key">Machine key</string>
+    <string name="repair_wizard_machine_name">Machine name</string>
+    <string name="repair_wizard_attach">Create / attach sensor</string>
+    <string name="repair_wizard_start">START REPAIR</string>
+    <string name="repair_wizard_end">END REPAIR</string>
+    <string name="repair_wizard_parts">Parts changed</string>
+    <string name="repair_wizard_notes">Notes</string>
+    <string name="repair_wizard_new_ref">New references required (mechanical path changed)</string>
 </resources>

@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Good Vibes — Wearable (MT200)</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --panel: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --ok: #3fb950;
+      --accent: #58a6ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.45;
+    }
+    header { padding: 1rem 1.25rem; border-bottom: 1px solid var(--border); background: var(--panel); }
+    header h1 { margin: 0; font-size: 1.25rem; font-weight: 600; }
+    header p { margin: 0.35rem 0 0; color: var(--muted); font-size: 0.9rem; }
+    header a { color: var(--accent); text-decoration: none; }
+    main { max-width: 1100px; margin: 0 auto; padding: 1rem 1.25rem 2rem; }
+    .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; }
+    .card h2 { margin: 0 0 0.75rem; font-size: 1rem; }
+    .stat-value { font-size: 2.4rem; font-weight: 650; letter-spacing: -0.03em; }
+    .stat-unit { color: var(--muted); font-size: 0.95rem; }
+    .stat-meta { color: var(--muted); font-size: 0.8rem; margin-top: 0.35rem; }
+    label { display: block; font-size: 0.8rem; color: var(--muted); margin-bottom: 0.25rem; }
+    input, button {
+      font: inherit;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      padding: 0.45rem 0.6rem;
+    }
+    input { width: 100%; }
+    button { cursor: pointer; background: #21262d; margin-top: 0.5rem; }
+    button:hover { border-color: var(--accent); }
+    .row { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: end; margin-bottom: 0.75rem; }
+    .row > * { flex: 1; min-width: 140px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+    th, td { text-align: left; padding: 0.35rem 0.4rem; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 500; }
+    .err { color: #f85149; font-size: 0.85rem; }
+    .ok { color: var(--ok); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Wearable — MT200 via ESP32 bridge</h1>
+    <p>Low-rate HR / SpO2 / steps / kcal / distance from the watch, IMU walk_cm, and hop RSSI (phone measures ESP↔phone; ESP measures MT200↔ESP; missing = −127 dBm). Phone relay POSTs /v1/ingest/wearable. <a href="./">&larr; back to dashboard</a></p>
+  </header>
+  <main>
+    <section class="card" style="margin-bottom:1rem">
+      <h2>Connection</h2>
+      <div class="row">
+        <div>
+          <label for="apiKey">API key (X-API-Key)</label>
+          <input id="apiKey" type="text" placeholder="dev-change-me" />
+        </div>
+        <div>
+          <label for="deviceId">ESP32 device id</label>
+          <input id="deviceId" type="text" placeholder="ESP32S3 IMU sim" />
+        </div>
+        <div>
+          <button type="button" id="pollBtn">Start polling</button>
+        </div>
+      </div>
+      <p id="status" class="stat-meta">Idle.</p>
+    </section>
+    <div class="grid" style="margin-bottom:1rem">
+      <div class="card">
+        <h2>Heart rate</h2>
+        <div class="stat-value" id="hrVal">—</div>
+        <div class="stat-unit">bpm</div>
+        <div class="stat-meta" id="hrMeta"></div>
+      </div>
+      <div class="card">
+        <h2>SpO2</h2>
+        <div class="stat-value" id="spo2Val">—</div>
+        <div class="stat-unit">%</div>
+        <div class="stat-meta" id="spo2Meta"></div>
+      </div>
+      <div class="card">
+        <h2>Steps</h2>
+        <div class="stat-value" id="stepsVal">—</div>
+        <div class="stat-unit">count</div>
+        <div class="stat-meta" id="stepsMeta"></div>
+      </div>
+      <div class="card">
+        <h2>Watch kcal</h2>
+        <div class="stat-value" id="kcalVal">—</div>
+        <div class="stat-unit">kcal</div>
+        <div class="stat-meta" id="kcalMeta"></div>
+      </div>
+      <div class="card">
+        <h2>Watch distance</h2>
+        <div class="stat-value" id="distVal">—</div>
+        <div class="stat-unit">km</div>
+        <div class="stat-meta" id="distMeta"></div>
+      </div>
+      <div class="card">
+        <h2>Battery</h2>
+        <div class="stat-value" id="batVal">—</div>
+        <div class="stat-unit">%</div>
+        <div class="stat-meta" id="batMeta"></div>
+      </div>
+      <div class="card">
+        <h2>IMU walk</h2>
+        <div class="stat-value" id="walkVal">—</div>
+        <div class="stat-unit">cm</div>
+        <div class="stat-meta" id="walkMeta"></div>
+      </div>
+      <div class="card">
+        <h2>ESP↔phone RSSI</h2>
+        <div class="stat-value" id="rssiEspVal">—</div>
+        <div class="stat-unit">dBm</div>
+        <div class="stat-meta" id="rssiEspMeta"></div>
+      </div>
+      <div class="card">
+        <h2>MT200↔ESP RSSI</h2>
+        <div class="stat-value" id="rssiMtVal">—</div>
+        <div class="stat-unit">dBm</div>
+        <div class="stat-meta" id="rssiMtMeta"></div>
+      </div>
+    </div>
+    <section class="card">
+      <h2>Recent samples</h2>
+      <table>
+        <thead>
+          <tr><th>ts</th><th>kind</th><th>source</th><th>value</th><th>seq</th></tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </section>
+  </main>
+  <script>
+    const HINTS = __DEMO_HINTS_JSON__;
+    const API = '/app/good_vibes/v1';
+
+    const $ = (id) => document.getElementById(id);
+    if (HINTS && HINTS.api_key && !$("apiKey").value) $("apiKey").value = HINTS.api_key;
+
+    let timer = null;
+
+    function headers() {
+      return { "X-API-Key": $("apiKey").value.trim() };
+    }
+
+    function setKind(kind, valId, metaId, suffix, scale, digits) {
+      const latest = window._kinds && window._kinds[kind];
+      if (!latest) {
+        $(valId).textContent = "—";
+        $(metaId).textContent = "";
+        return;
+      }
+      let v = latest.value;
+      if (v !== null && v !== undefined && scale) v = v / scale;
+      if (v === null || v === undefined) {
+        $(valId).textContent = "—";
+      } else if (digits != null) {
+        $(valId).textContent = Number(v).toFixed(digits);
+      } else {
+        $(valId).textContent = String(v);
+      }
+      const ageMs = Math.max(0, Date.now() - latest.ts_ms);
+      const pad = (n) => String(n).padStart(2, "0");
+      let ageStr;
+      let s = Math.round(ageMs / 1000);
+      if (s < 60) ageStr = s + "s";
+      else {
+        const days = Math.floor(s / 86400); s %= 86400;
+        const h = Math.floor(s / 3600); s %= 3600;
+        const m = Math.floor(s / 60); const sec = s % 60;
+        if (days > 0) ageStr = `${days}d ${h}:${pad(m)}:${pad(sec)}`;
+        else if (h > 0) ageStr = `${h}:${pad(m)}:${pad(sec)}`;
+        else ageStr = `${m}:${pad(sec)}`;
+      }
+      $(metaId).textContent = `${latest.source} · ${ageStr} ago${suffix || ""}`;
+    }
+
+    async function tick() {
+      const device = $("deviceId").value.trim();
+      if (!device) {
+        $("status").textContent = "Set a device id.";
+        return;
+      }
+      try {
+        const latestRes = await fetch(`${API}/wearable/${encodeURIComponent(device)}/latest`, { headers: headers() });
+        if (latestRes.status === 404) {
+          $("status").textContent = "No wearable samples yet — POST /v1/ingest/wearable or wait for the phone relay.";
+          return;
+        }
+        if (!latestRes.ok) throw new Error(`latest HTTP ${latestRes.status}`);
+        const latest = await latestRes.json();
+        window._kinds = latest.kinds || {};
+        setKind("hr", "hrVal", "hrMeta", "");
+        setKind("spo2", "spo2Val", "spo2Meta", "");
+        setKind("steps", "stepsVal", "stepsMeta", "");
+        setKind("kcal_x10", "kcalVal", "kcalMeta", "", 10, 1);
+        {
+          const steps = window._kinds.steps;
+          const unitEl = $("distVal").parentElement.querySelector(".stat-unit");
+          if (steps && steps.value != null) {
+            const h = 170;
+            let stride;
+            if (h < 155) stride = (h * 20) / 42 / 100;
+            else if (h < 174) stride = (h * 13) / 28 / 100;
+            else stride = (h * 19) / 42 / 100;
+            const km = (Number(steps.value) * stride) / 1000;
+            $("distVal").textContent = km.toFixed(2);
+            if (unitEl) unitEl.textContent = "km";
+            let s = Math.max(0, Math.round((Date.now() - steps.ts_ms) / 1000));
+            let ageStr;
+            if (s < 60) ageStr = s + "s";
+            else {
+              const pad = (n) => String(n).padStart(2, "0");
+              const days = Math.floor(s / 86400); s %= 86400;
+              const h = Math.floor(s / 3600); s %= 3600;
+              const m = Math.floor(s / 60); const sec = s % 60;
+              if (days > 0) ageStr = `${days}d ${h}:${pad(m)}:${pad(sec)}`;
+              else if (h > 0) ageStr = `${h}:${pad(m)}:${pad(sec)}`;
+              else ageStr = `${m}:${pad(sec)}`;
+            }
+            const raw = window._kinds.distance_mm && window._kinds.distance_mm.value != null
+              ? ` · sport ${(Number(window._kinds.distance_mm.value) / 1000).toFixed(2)} m`
+              : "";
+            $("distMeta").textContent = `est. from steps · ${ageStr} ago${raw}`;
+          } else {
+            setKind("distance_mm", "distVal", "distMeta", "", 1000, 2);
+            if (unitEl) unitEl.textContent = "m";
+          }
+        }
+        setKind("battery_pct", "batVal", "batMeta", "");
+        setKind("walk_cm", "walkVal", "walkMeta", "");
+        setKind("rssi_esp", "rssiEspVal", "rssiEspMeta", "");
+        setKind("rssi_mt200", "rssiMtVal", "rssiMtMeta", "");
+        $("status").innerHTML = `<span class="ok">live</span> · recv ${new Date(latest.recv_ms).toLocaleTimeString()}`;
+
+        const histRes = await fetch(`${API}/wearable/${encodeURIComponent(device)}/samples?limit=40`, { headers: headers() });
+        if (histRes.ok) {
+          const rows = await histRes.json();
+          $("rows").innerHTML = rows.map((r) => {
+            const t = new Date(r.ts_ms).toLocaleTimeString();
+            return `<tr><td>${t}</td><td>${r.kind}</td><td>${r.source}</td><td>${r.value ?? ""}</td><td>${r.seq}</td></tr>`;
+          }).join("");
+        }
+      } catch (err) {
+        $("status").innerHTML = `<span class="err">${err}</span>`;
+      }
+    }
+
+    $("pollBtn").addEventListener("click", () => {
+      if (timer) clearInterval(timer);
+      tick();
+      timer = setInterval(tick, 2000);
+      $("pollBtn").textContent = "Polling…";
+    });
+  </script>
+</body>
+</html>

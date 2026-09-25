@@ -4,7 +4,8 @@ import android.content.Context
 
 /** Last-seen firmware + declined OTA versions (re-prompt only when the offer changes). */
 class OtaSettings(context: Context) {
-    private val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    @Suppress("DEPRECATION")
+    private val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_MULTI_PROCESS)
 
     var lastFwVersion: String
         get() = prefs.getString(KEY_FW, "") ?: ""
@@ -21,6 +22,14 @@ class OtaSettings(context: Context) {
     var declinedFwVersionCode: Int
         get() = prefs.getInt(KEY_DECLINED_FW_CODE, 0)
         set(value) = prefs.edit().putInt(KEY_DECLINED_FW_CODE, value).apply()
+
+    /**
+     * Survives process death across PackageInstaller self-update. Cleared once
+     * [ImuApplication] / [BootReceiver] finishes relaunch + [OtaSession.complete].
+     */
+    var pendingAppRestart: Boolean
+        get() = prefs.getBoolean(KEY_PENDING_APP_RESTART, false)
+        set(value) = prefs.edit().putBoolean(KEY_PENDING_APP_RESTART, value).apply()
 
     fun liveVersionCode(): Int {
         if (lastFwVersionCode > 0) return lastFwVersionCode
@@ -49,8 +58,11 @@ class OtaSettings(context: Context) {
         private const val KEY_FW_CODE = "last_fw_version_code"
         private const val KEY_DECLINED_APK = "declined_apk_version_code"
         private const val KEY_DECLINED_FW_CODE = "declined_fw_version_code"
+        private const val KEY_PENDING_APP_RESTART = "pending_app_restart"
 
         fun parseVersionCode(name: String): Int {
+            val gv = GvAppVersion.parseCode(name)
+            if (gv > 0) return gv
             val m = Regex("""v(\d+)""", RegexOption.IGNORE_CASE).find(name.trim())
             return m?.groupValues?.get(1)?.toIntOrNull() ?: 0
         }

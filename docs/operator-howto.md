@@ -45,7 +45,7 @@
 
 **Audience:** field operator (not firmware developer).  
 **Kit:** Waveshare **ESP32-S3-LCD-1.47B** (QMI8658 IMU), Android app **ESP32S3 IMU sim**, optional **Veepoo / H-Band MT200** watch, optional cloud **Good Vibes**.  
-**Firmware on the board:** handshake (`handshake v160` at the time of writing). BLE name: `ESP32S3 IMU sim`.  
+**Firmware on the board:** handshake (`handshake v189` at the time of writing). BLE name: `ESP32S3 IMU sim`.  
 **Cloud (production):** `https://apps.f0xx.org/app/good_vibes`
 
 This is the complete field FAQ: every supported topology, how to prepare hardware, how to tune the phone pipeline, and where each metric lives (app vs Grafana vs raw files).
@@ -57,7 +57,7 @@ This is the complete field FAQ: every supported topology, how to prepare hardwar
 | Rule | Why |
 |------|-----|
 | The **phone never talks to the MT200**. Only the ESP32 can hold the watch link. | The watch is **single-LE-link**. H-Band XOR ESP32 XOR a laptop. |
-| The **ESP32 never talks to Good Vibes by itself** in the current handshake build. | WiFi STA is compiled **off** (`CONFIG_WIFI=n`). The phone is the relay. |
+| The **ESP32 never talks to Good Vibes by itself**. | WiFi STA is compiled **on** but lazy (wizard scan/connect, NTP). Cloud still goes through the phone. |
 | **Raw IMU samples stay on the BLE link / phone UI.** Cloud stores **verdicts**, **wearable samples**, **spectra (on demand)**, **crashes**, **battery bench**. | Bandwidth and flash. |
 | Glue the **board**, not a flying wire to the IMU. The QMI8658 is on the PCB (I2C SDA 48 / SCL 47). | You measure whatever mechanical path reaches that chip. |
 | After moving the sensor to a new machine, **re-run the reference wizard**. | Old “healthy” fingerprints become false ALERTs. |
@@ -70,7 +70,7 @@ This is the complete field FAQ: every supported topology, how to prepare hardwar
 | **B** ESP32 + MT200 + phone | Board + watch + Android | Yes | Case A **plus** HR / SpO2 / steps from the watch, hop RSSI |
 | **C** MT200 + phone only | Watch + H-Band | **No** | Use the vendor **H Band** app. ESP32S3ImuSim cannot pair the watch. |
 | **D** ESP32 alone | Board, no phone | Limited | LCD scene, RGB LED, local verdicts; **no cloud**, no watch (bridge needs the debug build, still no HTTP) |
-| **E** ESP32 + WiFi (no phone) | — | **Not current** | Handshake has WiFi **disabled**. Re-enable only with a coexistence-tested firmware. |
+| **E** ESP32 + WiFi (no phone) | Board + AP | Limited | STA via **Device… → WiFi wizard** (BLE provision). NTP can run; **no cloud** without the phone. |
 
 ```mermaid
 flowchart TB
@@ -150,7 +150,7 @@ sequenceDiagram
 | Layer | What it is | When to use |
 |-------|------------|-------------|
 | **Phone UI** | Live scene, vibro caption, banners | Tuning, “is it alive?” |
-| **Good Vibes web** | `…/app/good_vibes/` verdicts; `…/wearable` live HR/steps | Shift overview, CSV/TSV export |
+| **Good Vibes web** | `…/app/good_vibes/` verdicts; `…/wearable` HR/steps; `…/ahrs` cube; `…/map` GPS vs IMU | Shift overview, AHRS lab, CSV/TSV export |
 | **Grafana** | Verdicts, wearable, crashes, battery bench | Trends, lag, RSSI, edge features |
 
 Production Grafana (behind the same host): `https://apps.f0xx.org/app/good_vibes/grafana/`
@@ -176,7 +176,7 @@ Two hardware variants. Software path is the same on the phone; the watch only ad
 
 ### 2.2 Variant B — ESP32 + MT200 (recommended for HR / SpO2)
 
-**What the watch measures:** heart rate, SpO2, on-watch step counter, watch battery.  
+**What the watch measures:** heart rate, SpO2 (time-sliced vs HR), on-watch step counter, kcal, distance, watch battery.  
 **What the ESP32 adds:** IMU walk_cm, BLE RSSI of the watch hop, relay to the phone.
 
 **Hard rules**
@@ -197,7 +197,7 @@ sequenceDiagram
   participant Cloud as Good Vibes
   Note over Watch: H-Band must be off
   ESP->>Watch: Scan + GATT (F008)
-  ESP->>Watch: HR start D0 01 / SpO2 80 01 02 / steps F1 20
+  ESP->>Watch: F1 20 g-sensor + D0 01 HR; D8 sport poll; SpO2 window ~every 60s
   Watch-->>ESP: 20-byte notifies
   ESP-->>Phone: STATUS wok, HR, SpO2, steps, RSSI
   Phone-->>Phone: Live wearable caption
@@ -233,6 +233,8 @@ sequenceDiagram
 | HR | Optical bpm | 40–180 locked; 0 = no lock | Wearable live page after upload | Grafana **Wearable** | `wearable_samples` kind=`hr` |
 | SpO2 | % | 95–100 on-wrist; `1` on wire = wear fail, not 1% | Wearable page | Grafana Wearable | kind=`spo2` |
 | Watch steps | Watch pedometer | Monotonic during walk | Wearable page | Grafana Wearable | kind=`steps` |
+| Watch kcal | Sport-model kcal (D8) | Rises with activity | Wearable page | Grafana Wearable | kind=`kcal_x10` (÷10) |
+| Watch distance | Sport-model metres | Independent of IMU walk_cm | Wearable page | Grafana Wearable | kind=`distance_mm` (÷1000) |
 | IMU `walk_cm` | Board integrated walk | Rises when the **board** moves | STATUS / wearable page | Grafana Wearable (compare vs watch steps) | kind=`walk_cm` |
 | ESP↔phone RSSI | Phone-measured | Roughly −40…−80 indoor | STATUS | Wearable RSSI panels | ingest rssi fields |
 | MT200↔ESP RSSI | ESP-measured | −70 table, worse on wrist; −127 = N/A | STATUS | Wearable hop RSSI | `mt200` rssi |
@@ -332,18 +334,21 @@ Then:
    - Choose 1–5 references (3 is a good default).  
    - Each take: **normal idle vibration ~12 s**, hold still relative to the housing (you are not “shaking” a turbine).  
    - **Upload & finish**.
-2. **Vibro… → Vibro mode** to switch diagnosis tier later without the full wizard.
-3. **Vibro… → Capture mix…** (expert) only if you know mix/dyn ratios.
-4. **Vibro… → FFT analyze** switches the ESP to **Raw IMU**, collects a burst, uploads a 128-bin spectrum. Use when Grafana verdicts look wrong and you want a picture of the line.
-5. **Vibro… → Verdict history** — last on-phone levels without opening Grafana.
+2. **Vibro… → Repair / operator…** — attach this ESP as a **sensor** on a **machine**, then **START REPAIR** before mechanical work (CMD 14 pauses live persist; refs stay). After the job, **END REPAIR** and pick the FTA leaf (bearing / misalignment / cavitation / electrical / process / other). If the mechanical path changed, the app opens the reference wizard; process-only with the same mount can **Arm** and keep refs.
+3. **Vibro… → Vibro mode** to switch diagnosis tier later without the full wizard.
+4. **Vibro… → FFT analyze** switches the ESP to **Raw IMU**, collects a burst, uploads a 128-bin spectrum. Use when Grafana candidates look wrong and you want a picture of the line.
+5. **Vibro… → Verdict history** — last on-phone **candidate** levels (`vd`), not the mechanic page.
 
-Acrylic LED (GPIO38): **red** solid on WARN/ALERT (and other NOK); **off** when armed and healthy. Colour chart: [Appendix: Acrylic status LED](#appendix-acrylic-status-led).
+A single window `vd=2` is a **candidate**, not a page. The backend pages the mechanic when **operator ALARM** fires (increasing trend, last K candidates ≥ WARN, score ≥ 0.6), excluding repair windows. Phone banner and Good Vibes **Machine / operator** show that page.
+
+Acrylic LED (GPIO38): **off** when armed with refs loaded. A single WARN/ALERT window does **not** turn the pixel red. Red is still **armed without a loaded reference**. Colour chart: [Appendix: Acrylic status LED](#appendix-acrylic-status-led).
 
 ### 3.4 Metrics — attention, dashboard, raw
 
 | Metric | Meaning | Attention | Phone | Dashboard | Raw |
 |--------|---------|-----------|-------|-----------|-----|
-| `vd` level | 0 OK, 1 WARN, 2 ALERT | ALERT after a good reference ⇒ process change or loose mount | Vibro caption | Grafana **Verdicts** | `verdicts.level` |
+| `vd` / `candidate_level` | Edge window 0/1/2 | Evidence only — never pages the mechanic | Caption `cand …` | Grafana **candidate** + Good Vibes table | `verdicts.level` |
+| `operator_level` / `operator_alert` | Backend trend + confidence, repair gaps excluded | **Page the mechanic** on ALARM | Banner from `GET …/operator_status` | Good Vibes machine card + Grafana Operator | `operator_status` |
 | `vrms` / `vpeak` | Time-domain energy | Step change after maintenance | Caption | Verdicts RMS panel | columns |
 | `vcorr` / `bcorr` | Similarity to reference | Drop ⇒ spectral shape changed | Caption | band_corr panel | `raw_json` |
 | `bdmax` | Worst band delta | Which band moved | Caption | band_delta_max | `raw_json` |
@@ -358,49 +363,222 @@ Acrylic LED (GPIO38): **red** solid on WARN/ALERT (and other NOK); **off** when 
 **Live web:** `https://apps.f0xx.org/app/good_vibes/`  
 **Do not** stare at live RAW IMU in Grafana — it is not stored. Use FFT upload or the phone scene.
 
-**False ALERT checklist:** loose glue, USB cable, reference taken while the machine was off, board rotated, nearby hammering, deep-sleep preset on a machine that should be continuous.
+**False candidate checklist:** loose glue, USB cable, reference taken while the machine was off, board rotated, nearby hammering, deep-sleep preset on a machine that should be continuous. A lone `vd=2` is not an operator ALARM — wait for trend, or open **Repair / operator** if you are already working on the machine.
 
 ---
 
 ## 4. Other operator workflows
 
+These are **lab / setup tools**, not the daily body or vibro loops. Each subsection is a full operator pass: what it is, what to tap on the phone, how to know it worked.
+
+Do **§1.3 Connect** first. Most of these menus refuse to open (or show “Connect to the ESP32 over BLE first”) until the status line is connected.
+
 ### 4.1 Floor / mounting calibration
 
 **Device… → Floor level calibration…**
 
-- Purpose: persistent tilt correction vs a **true level** (bubble). Not a vibration reference.
-- Place board on a known-flat surface, still, **Start**.
-- Clear if you remount at a new angle.
+This is **not** the silent per-boot “keep still” gyro/accel zero, and **not** a vibration reference. Boot cal only removes sensor bias. Floor cal stores a **persistent tilt matrix**: “this enclosure sits a few degrees off true level — treat that as flat.” It survives reboot and is applied on top of boot cal.
+
+**When to run it**
+
+- The board is glued / clamped / in a case at a fixed angle and you want roll/pitch / the LCD horizon / AHRS to read **0° when the machine (or table) is level**.
+- After you remount at a **new** angle — old correction is wrong; **Clear** then recapture.
+
+**Skip it** when the board is worn loosely on a body (strap bounce is not a fixed mount) or you only care about vibration fingerprints.
+
+**Phone pipeline**
+
+| Step | Where | What you do |
+|------|-------|-------------|
+| 1 | Main **Connect** | Wait until connected |
+| 2 | Optional | Put a **bubble level** on the same surface you will use as “true flat” |
+| 3 | **Device… → Floor level calibration…** | Status should say **Not calibrated** or **Calibrated** (last residual) |
+| 4 | Place the **board** on that surface, still | Confirm dialog, tap **Start calibration** |
+| 5 | Hold still ~3 s | Banner “Floor calibration started”; progress bar fills |
+| 6 | Done | Status **Calibrated**, line like `corrected 2.40° of mounting tilt` |
+
+**How to check**
+
+- Re-open the same screen after a reboot: it must still say **Calibrated** (flash-backed).
+- Open **AHRS** (§4.2) or the main **Angles / scene** chip: sitting on that same surface, roll/pitch should sit near 0°. If they sit at a constant offset, you calibrated on a surface that was not actually level — **Clear** and redo next to a bubble.
+- **Clear calibration** only when you remount or the residual looks insane (>15° on a table you know is flat usually means the board moved during the window).
 
 ### 4.2 AHRS / orientation lab
 
-**Device… → AHRS live view (full speed)…**
+**What this is (new user, 30 seconds)**
 
-- Complementary filter, gyro+accel, **no magnetometer** → yaw drifts.
-- Forces 240 MHz + 100 Hz. Leave the screen to restore Auto.
-- 3D debug page on the backend: `ahrs.html` (lab).
+AHRS = *attitude and heading reference*: the ESP32 runs **Madgwick** fusion (gyro + accelerometer) into **roll, pitch, yaw** and a 3×3 rotation matrix (`rot4` on BLE). There is **no magnetometer**, so **yaw slowly drifts** when you stand still — that is expected, not a broken board.
+
+The phone screen is a **live lab readout** (numbers + GPS). The **3D cube** lives in the browser. A **map** can overlay phone GPS vs IMU dead-reckoning while this screen stays open.
+
+Opening this screen **forces 240 MHz CPU + 100 Hz IMU**. Leave it (back to the main screen) to restore Auto. Do not leave it up overnight on battery.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor Op as Operator
+  participant Phone as Android app
+  participant ESP as ESP32 handshake
+  participant Cloud as Good Vibes
+  Op->>Phone: Connect + Cloud URL/key
+  Op->>Phone: Device → AHRS live view
+  Phone->>ESP: CPU 240 MHz, IMU 100 Hz
+  ESP-->>Phone: STATUS rot4, wdcm, yawd100
+  Phone-->>Op: Roll / pitch / yaw + GPS line
+  Phone->>Cloud: POST /v1/ingest/ahrs (~5 Hz)
+  Note over Phone: GPS only while this screen is open
+  Phone->>Cloud: POST geo gps + imu
+  Op->>Cloud: Browser /ahrs cube and /map
+  Op->>Phone: Back / leave AHRS
+  Phone->>ESP: Restore Auto power
+```
+
+#### What to set up in the mobile app
+
+| Step | Menu / control | Setting |
+|------|----------------|---------|
+| 1 | Main **Connect** | Stay connected. AHRS will not open until BLE is up. |
+| 2 | **Device… → Cloud** | Enable cloud. URL `https://apps.f0xx.org/app/good_vibes`. Paste API key (or **Import from clipboard**). **Device ID** = a stable name you will type on the web page. **Test connection**. |
+| 3 | Android **Location** | Allow for this app. GPS and the map path run **only** on the AHRS screen. |
+| 4 | Optional **Device… → Floor level calibration…** | §4.1 — do this *before* AHRS if you want “table = 0°”. |
+| 5 | Optional **Device… → Profile wizard** | **Body sensor (computed)** or **Body sensor (scene mirror)** is fine. Vibro presets are unused here. |
+| 6 | **Device… → AHRS live view (full speed)…** | Status goes **Boosting…** then **Live (240 MHz / 100 Hz)**. |
+
+You do **not** need the MT200 watch. You do **not** run the vibro reference wizard.
+
+#### How to check (phone)
+
+1. Status line is **Live (240 MHz / 100 Hz)**, not **No data yet** or **Connect to the ESP32…**.
+2. Readout shows **Roll / Pitch / Yaw** updating a few times per second. Yaw also prints `(ESP n.n°)` from firmware (`yawd100`).
+3. **Tilt test:** pitch the USB end up — **pitch** should move several degrees and settle when you hold still. Roll the board onto its long edge — **roll** moves. Accel pulls roll/pitch back to gravity; they must not keep spinning on a still table.
+4. **Yaw test:** rotate the board on the table like a compass. Yaw should follow. Put it down: yaw may creep ~1° every few seconds. That is no-mag drift, not a failed gyro cal. A **steady spin of many degrees per second while the board is still** is a failed boot gyro zero — leave the board still, reboot, wait for `Gyro calibration OK` on serial (or just power-cycle and don’t touch it for ~3 s).
+5. GPS panel: after a few seconds outdoors (or near a window) you want `GPS: lat, lon ±N m` and, if cloud is on, `uploaded ok`. `GPS: permission denied` → Android settings. `cloud off` → §1.4. `IMU geo: waiting for first GPS + walk_cm` until the first fix; then walk a few metres and `walk` / `imu pts` should rise.
+6. Leave the screen (toolbar back). Chip temp and battery drain should drop; IMU rate returns to the profile default.
+
+#### How to check (web cube + map)
+
+Keep the phone on the AHRS screen (or at least BLE connected with cloud on — the cube relay is in the BLE service). On a laptop:
+
+| Check | URL | What “good” looks like |
+|-------|-----|------------------------|
+| 3D cube | `https://apps.f0xx.org/app/good_vibes/ahrs` | Paste the **same API key** and **same Device ID** as the phone. Cube rotates when you tilt the board; X=red (roll), Y=green (pitch), Z=blue (yaw/up). |
+| Route map | `https://apps.f0xx.org/app/good_vibes/map` | **AHRS screen stays open** (GPS). Walk a short loop. Green = phone GPS, red = IMU dead-reckon from the **first GPS** + `wdcm` + gyro yaw. Layers can be toggled. |
+
+Dashboard home also links both: `https://apps.f0xx.org/app/good_vibes/` → **AHRS debug** / **GPS + IMU route**.
+
+AHRS samples are **live in the backend process** (best-effort, no retry). A backend recreate / restart wipes the in-memory cube until the phone sends the next samples. Failed geo POSTs spool to the phone file `offload/geo.jsonl`.
+
+#### Limits operators ask about
+
+| Topic | Fact |
+|-------|------|
+| Compass heading | **No.** ESP uses Madgwick (accel+gyro); yaw is still gyro-only with no magnetometer. Do not navigate by it after a minute of standing still. |
+| Altitude | **No** baro on the ESP. Height on the AHRS screen is **phone GPS** only. |
+| Power | This screen is the opposite of Auto. Use it to look, then leave. |
+| Cube vs phone numbers | Same `rot4` from the ESP. If the cube is frozen but the phone is Live, the web page has the wrong key/device_id or cloud is off. |
+| Map IMU vs GPS | IMU path starts at the **first GPS** of this AHRS session. Indoor GPS jump will offset the whole red trace. |
 
 ### 4.3 Battery bench
 
 **Device… → Battery bench…**
 
-- Unplug USB. Start. Config locks until Stop.
-- Samples upload when cloud is on. Grafana **Battery bench**.
+Lab discharge curve: the ESP locks config and samples pack voltage at **1 Hz** while you run **on battery**. Cloud (when enabled) uploads the session; Grafana **Battery bench** plots it.
+
+**Phone pipeline**
+
+| Step | Where | What you do |
+|------|-------|-------------|
+| 1 | Board | Charge, then **unplug USB-C**. USB/DC makes the curve look flat at ~4.2 V. |
+| 2 | Main **Connect** | BLE up |
+| 3 | **Device… → Cloud** | Enable if you want Grafana (same key/device_id as always) |
+| 4 | **Device… → Battery bench…** | Optional session label (e.g. `dc-full-scene`) |
+| 5 | **Start bench** | Confirm. Banner “unplug USB for accurate discharge”. Status **Bench running — config locked**. |
+| 6 | Run the scenario | Typical: LCD on, BLE connected, Auto or a known profile. Note what you did. |
+| 7 | **Stop bench** | Unlocks config. **Upload pending samples** if cloud was off during the run. |
+
+**How to check**
+
+- Phone: `pending upload: N` goes to 0 after **Upload** / autopilot flush.
+- Grafana **Battery bench** (`imu-battery-bench`): a new session_id, voltage trending down off USB, not a flat 4.2 V line.
+- You cannot change Profile / Config editor while the bench is running — that lock is the point. Stop first.
+
+Do not start a bench on a machine you are about to capture vibration on; Stop first so config writes work again.
 
 ### 4.4 WiFi wizard (provisioning only)
 
-**Device… → WiFi wizard** still talks **over BLE**. Handshake **does not bring WiFi STA up** in the current `prj.conf`. Use it only if you are on a firmware that re-enabled WiFi. Hotspot fallback (when implemented on that build): `ESP32-IMU-Setup` / `imu12345` → `http://192.168.4.1`.
+**Device… → WiFi wizard**
+
+The ESP **does not upload to Good Vibes by itself**. WiFi STA is for **NTP / clock** and lab connectivity. Cloud still goes through the phone. The menu appears only when STATUS `feat` includes WiFi (`CAP_WIFI`).
+
+Talks **over BLE**. While the ESP WiFi radio is scanning or connecting, **IMU NOTIFY pauses** — the live scene may freeze; it returns when the radio is idle. If the phone will not accept a long LE interval, the ESP **drops the BLE link for the scan** (banner: BLE paused) and advertises again when the WiFi radio is released so the app can reconnect and read results.
+
+**Phone pipeline (BLE scan — preferred)**
+
+| Step | Where | What you do |
+|------|-------|-------------|
+| 1 | Main **Connect** | Required |
+| 2 | **Device… → WiFi wizard** | Hub: scan / saved profiles / hotspot |
+| 3 | **Scan nearby networks** | Wait; banner may say BLE paused |
+| 4 | Tap the AP | Enter WPA2 password (empty if open) → **Connect / save** |
+| 5 | **Saved profiles on ESP** | Later you can activate or delete without re-typing |
+
+**Setup hotspot (if scan fails)**
+
+1. Hub → **Open setup hotspot (keep profiles)** (or **erase profiles** if you want a clean slate).
+2. On the **same** phone/tablet: Android Settings → WiFi → join **`ESP32-IMU-Setup`** / password **`imu12345`**.
+3. Open `http://192.168.4.1` if the captive page does not appear. Enter the building AP there.
+4. BLE can stay up for status; the phone’s own WAN is on the ESP hotspot until you leave that AP.
+
+**How to check**
+
+- Wizard / STATUS: STA associated, not looping scan.
+- Serial: NTP / clock sync after the boot delay (not instant).
+- Good Vibes still empty until the **phone** has WAN + Cloud enabled — WiFi on the ESP does not replace §1.4.
 
 ### 4.5 OTA (app then firmware)
 
-1. Phone and board connected (or autopilot will pick up later).
-2. **Device… → Check for OTA**.
-3. **APK first**, then firmware. The phone refuses FW OTA if the app is too old (`min_apk_versionCode`).
-4. USB `flash-zephyr.sh handshake` remains the recovery path if BLE OTA fails.
+Two independent version counters (app and firmware), both advertised on the Good Vibes CDN — **not** Android Cast `/v0/ota/`. Full sequence (cloud builder, GATT, A/B, Insights OK/NOK): **[zephyr-ota.md](zephyr-ota.md)**.
+
+**Phone pipeline**
+
+| Step | Where | What you do |
+|------|-------|-------------|
+| 1 | Main **Connect** | Needed for firmware OTA. APK can download without the board. |
+| 2 | **Device… → Check for OTA** | Fetches `https://cdn.f0xx.org/good_vibes/v0/ota/channel/stable.json` (retries `cdn0`–`cdn2`) |
+| 3 | Prompt **App update** | **Install** first. Allow unknown sources for this app if Android asks. |
+| 4 | Re-open app, Connect, **Check for OTA** again | Prompt **ESP32 firmware update** (shows current `handshake vNN`) |
+| 5 | Keep the phone near the board | Do not kill the app mid-transfer. After 99% the phone shows **restarting** and must **reconnect** so A/B can confirm. Do not reset the ESP. |
+
+**How to check**
+
+- Phone: after APK install, app version name on the main/about or `adb shell dumpsys package com.esp32s3.imusim | grep versionName`.
+- After FW OTA: stay connected ~10 s. STATUS / caption shows the **cloud** name (`00.0001.0000.NNNNN`), not desk `handshake vNN`. Serial: `crash ring ready`, that `fw` string, `BOOT armed (released=1)`. Insights OTA card is a **crash-ring** `fw_upgrade` row — it appears only after that reconnect + drain. If you reset before confirm, McUboot **reverts** and you are back on the previous slot (`handshake vNN` after a USB factory image).
+- Phone **refuses firmware** if the APK is older than the channel’s `min_apk_versionCode` — that is why APK is first.
+- **Later** on a prompt just defers; **Check for OTA** again when you are ready.
+- **Device… → OTA from file** is the USB-less lab path (pick a `.bin` / MCUboot image). Recovery if BLE OTA fails: USB `zephyr/scripts/flash-zephyr.sh handshake`.
 
 ### 4.6 Crash debug (lab)
 
-**Device… → Crash debug (dev)…** only on builds with `dbg=1`. Injects a fault; relay uploads the crash ring. Grafana **Crashes**. Do not use on a production machine capture.
+**Device… → Crash debug (dev)…**
+
+Only useful on images with crash-debug extras (`dbg=1` / `CRASH_DEBUG`). Production machine captures: **do not inject**.
+
+**Phone pipeline**
+
+| Step | Where | What you do |
+|------|-------|-------------|
+| 1 | Main **Connect** | Status on this screen: **Debug firmware ready (dbg=1)** |
+| 2 | Optional **Run BIST** | Self-test; check serial / STATUS `bist` — does not reboot |
+| 3 | **Inject & reboot** | Pick a fault, confirm. ESP resets immediately |
+| 4 | Stay in range | Autopilot / next BLE session drains the crash ring and uploads |
+
+**How to check**
+
+- Serial after inject: crash ring slot pending, then a clean `handshake vNN` boot.
+- Grafana **ESP32 IMU Crashes** (`imu-crashes`): new row for this device_id, reason matching the inject.
+- Good Vibes does not need a special “crash page” — the phone relay is enough if Cloud is on.
+
+Do not use inject to “test the LED” on a board that is mid reference-wizard or battery bench.
 
 ---
 
@@ -535,11 +713,17 @@ Cloud key/URL; **Upload now**; WAN; device_id mismatch vs Grafana variable.
 **Two data holes: wearable vs verdicts**  
 Different pipelines. Wearable is fire-and-forget; verdicts retry via JSONL. A quiet STATUS does not mean the watch ingest died.
 
+**AHRS says No data yet / cube frozen**  
+BLE not connected; or cloud off / wrong Device ID / wrong API key on `…/ahrs`. Phone must show **Live (240 MHz / 100 Hz)**. Backend restart clears the in-memory cube until the next samples.
+
+**AHRS yaw creeps while the board sits still**  
+Expected (no magnetometer). A fast continuous spin on a still table is a bad boot gyro zero — power-cycle and do not touch the board for a few seconds.
+
 **OTA offered forever**  
 Phone APK still older than manifest `min_apk_versionCode`, or FW_VERSION_CODE not bumped on the image you flashed.
 
 **Cast builder vs IMU builder (lab)**  
-Android Cast and IMU are **separate tenants**. IMU jobs must show project `imu`, containers `imu-bld-*` / `imu-zephyr-bld-*`, channel `imu`. Never `androidcast-bld-*`, never Cast OTA version `00.01.00.xxxx`. See `ci/cast/README.md`.
+Android Cast and IMU are **separate tenants**. IMU jobs must show project `imu`, containers `imu-bld-*` / `imu-zephyr-bld-*`, DB channel `imu` (publishes `good_vibes/…/stable.json`). Never `androidcast-bld-*`, never Cast path `/v0/ota/` without the `good_vibes` prefix. Cloud app/fw versions start at `00.0001.0000.00001` on **separate** counters. See `ci/cast/README.md`.
 
 **What does the acrylic LED colour mean? (board status / readiness)**  
 Single WS2812 on GPIO38. ✓ = that RGB channel is on. Empty = off. `*reserved*` = that colour combo is not wired. Flash is 2 s on / 2 s off. Healthy armed run is **off**. Full date/FW wiring: [Appendix: Acrylic status LED](#appendix-acrylic-status-led).
@@ -548,11 +732,10 @@ Single WS2812 on GPIO38. ✓ = that RGB channel is on. Empty = off. `*reserved*`
 |-----------|---|---|---|
 | Setup — no reference profiles (solid blue) | | | ✓ |
 | Await arm — refs recorded, not started (blue flash 2s/2s) | | | ✓ |
-| OK pulse — NVS/config saved (~2 s solid blue) | | | ✓ |
-| NOK — WARN/ALERT or armed without loaded ref (solid red) | ✓ | | |
+| OK pulse — NVS/config saved (~2 s solid green) | | ✓ | |
+| NOK — armed without loaded ref (solid red) | ✓ | | |
 | Battery ≤10% SOC on battery, not USB/DC (yellow flash 2s/2s) | ✓ | ✓ | |
 | Operational — armed, refs OK, no fault (off) | | | |
-| Green only | *reserved* | *reserved* | *reserved* |
 | Magenta (R+B) | *reserved* | *reserved* | *reserved* |
 | Cyan (G+B) | *reserved* | *reserved* | *reserved* |
 | White (R+G+B) | *reserved* | *reserved* | *reserved* |
@@ -565,10 +748,13 @@ Single WS2812 on GPIO38. ✓ = that RGB channel is on. Empty = off. `*reserved*`
 Kill H-Band → power ESP → Connect phone → Profile **Body sensor (computed)** → Cloud on → wear watch → wait for HR → open `/wearable`.
 
 **New pump, 20 minutes**  
-Glue on bearing cap → Connect → Profile **Vibro: normal** → Reference wizard ×3 at idle → Cloud group `pump-7` → confirm LED **off** after arm (healthy run) → Grafana Verdicts.
+Glue on bearing cap → Connect → Profile **Vibro: normal** → **Repair / operator** create machine + attach sensor → Reference wizard ×3 at idle → Arm → Cloud group `pump-7` → confirm LED **off** after arm → Good Vibes machine card (operator), Grafana candidates. After a bearing/seal/remount job: START REPAIR → work → END REPAIR (leaf) → re-wizard if `new_ref_required`.
 
 **Overnight unattended**  
 Intermittent or machine-monitor preset → Rendezvous bridge → phone plugged in BLE range → morning Grafana + CSV.
+
+**AHRS cube + short walk, 5 minutes**  
+Connect → Cloud on (remember device_id) → optional Floor level cal on a bubble-level table → **AHRS live view** → confirm Live + tilt test → laptop `…/ahrs` (same key + id) → walk with AHRS still open → `…/map` → leave AHRS to restore Auto.
 
 ---
 
@@ -580,6 +766,8 @@ Intermittent or machine-monitor preset → Rendezvous bridge → phone plugged i
 | BLE name | `ESP32S3 IMU sim` |
 | Cloud | `https://apps.f0xx.org/app/good_vibes` |
 | Wearable UI | `…/wearable` |
+| AHRS cube | `…/ahrs` |
+| GPS + IMU map | `…/map` |
 | Grafana | `…/grafana/` |
 | Phone queue | app files `offload/verdicts.jsonl` (+ gzip) |
 | Firmware flash | `zephyr/scripts/flash-zephyr.sh handshake` |
@@ -592,28 +780,24 @@ Intermittent or machine-monitor preset → Rendezvous bridge → phone plugged i
 
 ## Appendix: Acrylic status LED
 
-**Wired:** 2026-08-23 (handshake `vibro_led.c` schema in commit `7de0208`).  
-**Firmware:** `handshake v160` (`FW_VERSION_NAME` / `FW_VERSION_CODE` 160 in `zephyr/app/common/fw_version.h`).
+**Wired:** 2026-08-30 (handshake `vibro_led.c`, `handshake v186`). Per-window `vd` no longer drives red.  
+**Pixel:** single WS2812 on **GPIO38**, **RGB** wire order (bench: v183 GRB swapped R↔G). Channel drive 48/255.
 
-The red acrylic edge light is a **single WS2812** pixel on **GPIO38** (GRB wire order). Channel drive is 48/255 when on. Handshake turns the pixel **off** at boot, then `vibro_led` owns it for the rest of the run. The diffuser is red: a firmware **green** channel looks red through the plastic, so the “OK pulse” is driven as **blue**, not green.
+GPIO38 is driven by the ESP32-S3 **RMT** peripheral (Arduino timings: 10 MHz, 0-bit 0.4/0.8 µs, 1-bit 0.8/0.4 µs). Crash debug LED mapping holds the TFT backlight off (scene still renders) so only the pixel lights the acrylic.
 
-**Solid vs flash.** Solid means the channel stays on. Flash is 2 s on / 2 s off (`LED_FLASH_PERIOD_MS` 4000, `LED_FLASH_ON_MS` 2000). The OK pulse is a **solid ~2 s** burst (`LED_OK_PULSE_MS`), then the base state returns. Flash off-phases look the same as operational off.
+**Solid vs flash.** Solid means the channel stays on. Flash is 2 s on / 2 s off. The OK pulse is a **solid ~2 s** burst, then the base state returns.
 
 **Priority** (first match wins): OK pulse → battery critical → setup (no refs) → await arm → NOK → off.
 
-✓ = that RGB channel is driven for the condition. Empty = channel off. `*reserved*` = that colour combo is **not wired** in this firmware.
+✓ = that RGB channel is driven. Empty = channel off.
 
-| Condition | R | G | B |
-|-----------|---|---|---|
-| Setup — no reference profiles in flash (solid blue) | | | ✓ |
-| Await arm — refs recorded, not started / CMD 10 (blue flash 2s/2s) | | | ✓ |
-| OK pulse — NVS / config saved (~2 s solid blue) | | | ✓ |
-| NOK — verdict WARN/ALERT, or armed without a loaded reference (solid red) | ✓ | | |
-| Battery critical — ≤10% SOC **and** on battery, not USB/DC (yellow flash 2s/2s) | ✓ | ✓ | |
-| Operational — armed, refs OK, no active fault (off) | | | |
-| Green only | *reserved* | *reserved* | *reserved* |
-| Magenta (R+B) | *reserved* | *reserved* | *reserved* |
-| Cyan (G+B) | *reserved* | *reserved* | *reserved* |
-| White (R+G+B) | *reserved* | *reserved* | *reserved* |
+| Condition | R | G | B | Looks like |
+|-----------|---|---|---|------------|
+| Setup — no reference profiles (solid) | | | ✓ | blue |
+| Await arm — refs recorded, not started / CMD 10 (flash 2s/2s) | | | ✓ | blue ↔ off |
+| OK pulse — NVS / config saved (~2 s) | | ✓ | | green |
+| NOK — armed without a loaded reference | ✓ | | | red |
+| Battery critical — ≤10% SOC **and** on battery, not USB/DC (flash) | ✓ | ✓ | | yellow ↔ off |
+| Operational — armed, refs OK, no active fault | | | | off |
 
 **Not a colour in this table.** BLE advertising, BLE connected, charging / on USB, OTA, crash, MT200 watch link, and WiFi do **not** set the acrylic LED. Charging specifically suppresses the yellow battery flash (`on_dc` → not critical). Smoke firmware (`WS147B-Zephyr`) only turns the pixel off; it does not use this schema.

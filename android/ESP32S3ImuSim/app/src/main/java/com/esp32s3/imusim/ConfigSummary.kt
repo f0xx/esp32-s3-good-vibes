@@ -82,7 +82,7 @@ object ConfigSummary {
 
         return String.format(
             Locale.US,
-            "cfg v%d | bat %.2f-%.2fV | zoom %.2f/%.2f/%.2f | gyro %.3f/%.3f/%.3f | walk %.0fcm step %.2f-%.2fm | imu a=%.2f g=%.2f poll %dms | pp=%d cpu=%d imu=%dHz tft=%d wake=%ds active=%ds | cap %s%s%s",
+            "cfg v%d | bat %.2f-%.2fV | zoom %.2f/%.2f/%.2f | gyro %.3f/%.3f/%.3f | walk %.0fcm step %.2f-%.2fm | imu a=%.2f g=%.2f poll %dms | pp=%d cpu=%d imu=%dHz tft=%d wake=%ds active=%ds | cap %s%s",
             version,
             batEmpty,
             batFull,

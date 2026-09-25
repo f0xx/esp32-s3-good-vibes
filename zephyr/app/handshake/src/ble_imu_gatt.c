@@ -2,7 +2,6 @@
  * Zephyr BLE IMU GATT — protocol parity with Arduino ble_gatt_provider.cpp
  */
 
-#include <inttypes.h>
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
@@ -38,6 +37,8 @@
 #include "clock_sync.h"
 #include "crash_report.h"
 #include "soft_reboot.h"
+#include "ota_ab.h"
+#include "ota_channel.h"
 #include "bist.h"
 #include "crash_debug.h"
 #include "display_panel.h"
@@ -46,16 +47,18 @@
 #include "imu_pipeline.h"
 #include "metrics_compact.h"
 #include "power_manager.h"
-#include "scene_snapshot.h"
-#include "scene_zoom.h"
 #include "device_config.h"
 #include "vibro_capture.h"
 #include "vibro_schedule.h"
 #include "vibro_verdict_store.h"
 #include "radio_scheduler.h"
+#include "network_manager.h"
 #include "stall_watchdog.h"
 #include "vibro_led.h"
 #include "mt200_bridge.h"
+#include "mt200_sample_queue.h"
+#include "app_func_trace.h"
+#include "stack_ra_check.h"
 
 LOG_MODULE_REGISTER(ble_imu, LOG_LEVEL_INF);
 
@@ -72,14 +75,39 @@ static struct bt_uuid_128 imu_cpu_mhz_uuid = BT_UUID_INIT_128(BT_UUID_IMU_CPU_MH
 static struct bt_uuid_128 imu_imu_hz_uuid = BT_UUID_INIT_128(BT_UUID_IMU_IMU_HZ_VAL);
 static struct bt_uuid_128 imu_bench_uuid = BT_UUID_INIT_128(BT_UUID_IMU_BENCH_VAL);
 
-static uint8_t g_mode = BLE_IMU_MODE_COMPUTED;
-static uint16_t g_poll_ms = BLE_IMU_DEFAULT_POLL_MS;
-static uint32_t g_seq;
-static uint32_t g_caps;
-static bool g_notify_enabled;
-static bool g_connected;
-static bool g_traffic_paused;
-static struct bt_conn *g_conn;
+static volatile uint8_t g_mode = BLE_IMU_MODE_COMPUTED;
+static volatile uint16_t g_poll_ms = BLE_IMU_DEFAULT_POLL_MS;
+static volatile uint32_t g_seq;
+static volatile uint32_t g_caps;
+static volatile bool g_notify_enabled;
+static volatile bool g_connected;
+static volatile bool g_traffic_paused;
+static struct bt_conn *volatile g_conn;
+/* Desk soak: long-lived phone links freeze the S3 (~40m GDB v290 with SPI gated).
+ * Prophylactic drop+re-advertise — past the 1hr hang-soak gate. */
+#define BLE_LINK_REFRESH_MS (90U * 60U * 1000U)
+static int64_t g_link_up_at;
+static volatile uint16_t g_saved_le_interval;
+static volatile uint16_t g_saved_le_latency;
+static volatile uint16_t g_saved_le_timeout;
+static volatile bool g_wifi_le_params;
+
+static void mtu_exchange_cb(struct bt_conn *conn, uint8_t err,
+			    struct bt_gatt_exchange_params *params)
+{
+	ARG_UNUSED(params);
+	if (err) {
+		LOG_WRN("ATT MTU exchange failed (%u)", err);
+	} else {
+		LOG_INF("ATT MTU %u", bt_gatt_get_mtu(conn));
+	}
+}
+
+static struct bt_gatt_exchange_params g_mtu_exchange = {
+	.func = mtu_exchange_cb,
+};
+
+static bool conn_is_phone_link(struct bt_conn *conn);
 
 static char g_status_json[2][BLE_IMU_STATUS_JSON_MAX];
 static char g_data_json[2][BLE_IMU_ATT_PAYLOAD_MAX];
@@ -89,11 +117,11 @@ static size_t g_status_len[2];
 static size_t g_data_len[2];
 static size_t g_compact_len[2];
 
-static struct bt_gatt_attr *g_notify_attr;
-static uint32_t g_commit_count;
+static struct bt_gatt_attr *volatile g_notify_attr;
+static volatile uint32_t g_commit_count;
 static atomic_t g_need_prep_batch;
-static int64_t g_poll_next_ms;
-static bool g_poll_armed;
+static volatile int64_t g_poll_next_ms;
+static volatile bool g_poll_armed;
 
 /*
  * bt_gatt_notify() loss detection + bounded retry — the 30Hz IMU stream previously discarded
@@ -109,10 +137,57 @@ static bool g_poll_armed;
  */
 #define NOTIFY_RETRY_MAX 3U
 #define NOTIFY_RETRY_DELAY_MS 8U
-static bool g_notify_resend_pending;
-static uint8_t g_notify_retry_count;
-static uint32_t g_notify_fail_count;
-static uint32_t g_notify_drop_count;
+static volatile bool g_notify_resend_pending;
+static volatile uint8_t g_notify_retry_count;
+static volatile uint32_t g_notify_fail_count;
+static volatile uint32_t g_notify_drop_count;
+/* Cumulative ATT payload bytes, plus a rate between STATUS builds.
+ * Whole-kB totals stayed 0 until 1024 B and hid a live link. */
+static volatile uint32_t g_ble_tx_bytes;
+static volatile uint32_t g_ble_rx_bytes;
+static uint32_t g_ble_tx_mark;
+static uint32_t g_ble_rx_mark;
+static uint32_t g_ble_mark_ms;
+static uint32_t g_ble_tx_bps;
+static uint32_t g_ble_rx_bps;
+
+static void ble_rates_update(void)
+{
+	const uint32_t now = k_uptime_get_32();
+	const uint32_t tx = g_ble_tx_bytes;
+	const uint32_t rx = g_ble_rx_bytes;
+
+	if (g_ble_mark_ms == 0U) {
+		g_ble_mark_ms = now;
+		g_ble_tx_mark = tx;
+		g_ble_rx_mark = rx;
+		return;
+	}
+	const uint32_t dt = now - g_ble_mark_ms;
+
+	if (dt < 1000U) {
+		return;
+	}
+	g_ble_tx_bps = (tx - g_ble_tx_mark) * 1000U / dt;
+	g_ble_rx_bps = (rx - g_ble_rx_mark) * 1000U / dt;
+	g_ble_tx_mark = tx;
+	g_ble_rx_mark = rx;
+	g_ble_mark_ms = now;
+}
+
+static void ble_account_tx(size_t n)
+{
+	if (n > 0U) {
+		g_ble_tx_bytes += (uint32_t)n;
+	}
+}
+
+static void ble_account_rx(size_t n)
+{
+	if (n > 0U) {
+		g_ble_rx_bytes += (uint32_t)n;
+	}
+}
 
 static int json_write_idx(void)
 {
@@ -149,12 +224,12 @@ static int stable_read_idx(int *frozen, uint16_t offset)
 	return *frozen;
 }
 
-static bool g_notify_want;
-static int64_t g_time_unix_ms;
-static int16_t g_time_tz_min;
-static bool g_screen_want;
-static uint8_t g_cpu_mhz_want;
-static uint8_t g_imu_hz_want;
+static volatile bool g_notify_want;
+static volatile int64_t g_time_unix_ms;
+static volatile int16_t g_time_tz_min;
+static volatile bool g_screen_want;
+static volatile uint8_t g_cpu_mhz_want;
+static volatile uint8_t g_imu_hz_want;
 static atomic_t g_defer_notify;
 static atomic_t g_notify_skip_poll;
 static atomic_t g_defer_time;
@@ -164,7 +239,7 @@ static atomic_t g_defer_poll;
 static atomic_t g_defer_cpu_mhz;
 static atomic_t g_defer_imu_hz;
 static atomic_t g_defer_bench;
-static uint8_t g_bench_cmd_want;
+static volatile uint8_t g_bench_cmd_want;
 
 static bool bench_blocks_config(void)
 {
@@ -174,8 +249,9 @@ static bool bench_blocks_config(void)
 /* Defer batch/notify traffic briefly after grace — stacking flash spool + batch prep on the
  * grace boundary correlated with TG0WDT_SYS_RST (see ble_crash_gatt_looper_tick comment). */
 #define BLE_POST_GRACE_MS    BLE_IMU_POST_GRACE_MS
-/* Defer first adv until IMU/BT settle. No duty-cycle pause — bt_le_adv_stop() wedged sysworkq @ 2min. */
-#define BLE_ADV_BOOT_DELAY_MS 8000
+/* Defer first adv until IMU/BT settle. Was 8s (felt like a 15s boot); IMU cal already
+ * finished before BLE init — 2s is enough for controller settle. */
+#define BLE_ADV_BOOT_DELAY_MS 2000
 #define BLE_ADV_STOP_DEFER_MS 500
 /*
  * Was 0x0a00/0x0f00 (1600-2400ms) — a scanner has to wait up to ~2.4s just to
@@ -190,17 +266,19 @@ static bool bench_blocks_config(void)
 #define BLE_ADV_INT_MIN 0x00a0
 #define BLE_ADV_INT_MAX 0x00f0
 
-static bool g_adv_boot_delay_done;
-static bool g_adv_active;
-static bool g_adv_stop_pending;
-static int64_t g_adv_start_deadline;
-static int64_t g_adv_stop_deadline;
+static volatile bool g_adv_boot_delay_done;
+static volatile bool g_adv_active;
+static volatile bool g_adv_stop_pending;
+static volatile bool g_hold_adv; /* WiFi / OTA */
+static volatile bool g_hold_adv_mt200; /* MT200 central — drop peripheral adv (soak) */
+static volatile int64_t g_adv_start_deadline;
+static volatile int64_t g_adv_stop_deadline;
 
-static int64_t g_connect_grace_until;
-static int64_t g_traffic_ready_at;
-static bool g_grace_prep_pending;
+static volatile int64_t g_connect_grace_until;
+static volatile int64_t g_traffic_ready_at;
+static volatile bool g_grace_prep_pending;
 static atomic_t g_defer_notify_send;
-static int64_t g_last_disconnect_at;
+static volatile int64_t g_last_disconnect_at;
 
 static bool in_connect_grace(void)
 {
@@ -250,6 +328,11 @@ bool ble_imu_disconnected_settled(uint32_t min_idle_ms)
 
 bool app_flash_erase_safe(void)
 {
+	/* Phone peripheral OR MT200 central — either live LE link makes flash_area_erase
+	 * correlate with silent TG0 / total freeze on this board. */
+	if (mt200_bridge_active()) {
+		return false;
+	}
 	return ble_imu_disconnected_settled(FLASH_ERASE_DISCONNECT_SETTLE_MS);
 }
 
@@ -359,94 +442,6 @@ static size_t pack_compact_attitude(uint8_t *dst, size_t cap, uint32_t seq, uint
 	return BLE_C1_HDR + BLE_C1_ATT_REC;
 }
 
-static void append_raw_record(char *dst, size_t dst_size, size_t *len, uint32_t t_ms,
-			      const struct imu_sample *s, float dm)
-{
-	char rec[128];
-	int n = snprintf(rec, sizeof(rec),
-			 "%s[%" PRIu32 ",%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.3f]",
-			 (*len > 0) ? "," : "", t_ms, (double)s->ax, (double)s->ay,
-			 (double)s->az, (double)s->gx, (double)s->gy, (double)s->gz, (double)dm);
-
-	if (n <= 0 || (size_t)n >= sizeof(rec) || *len + (size_t)n + 1U >= BLE_IMU_COMMIT_BYTES ||
-	    *len + (size_t)n >= dst_size) {
-		return;
-	}
-	memcpy(dst + *len, rec, (size_t)n);
-	*len += (size_t)n;
-}
-
-static void append_computed_record(char *dst, size_t dst_size, size_t *len, uint32_t t_ms,
-				   const struct scene_snapshot *snap, const struct mat3 *rot)
-{
-	char rec[512];
-	int n = snprintf(
-		rec, sizeof(rec),
-		"%s[%" PRIu32 ",%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
-		"%.3f,%.3f,%.3f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f]",
-		(*len > 0) ? "," : "", t_ms, (double)json_safe(snap->walk_distance_m),
-		(double)json_safe(snap->footer_unproject.x),
-		(double)json_safe(snap->footer_unproject.y),
-		(double)json_safe(snap->footer_unproject.z), (double)scene_zoom_current()[0],
-		(double)scene_zoom_current()[1], (double)scene_zoom_current()[2], (double)json_safe(rot->m[0][0]),
-		(double)json_safe(rot->m[0][1]), (double)json_safe(rot->m[0][2]),
-		(double)json_safe(rot->m[1][0]), (double)json_safe(rot->m[1][1]),
-		(double)json_safe(rot->m[1][2]), (double)json_safe(rot->m[2][0]),
-		(double)json_safe(rot->m[2][1]), (double)json_safe(rot->m[2][2]),
-		(double)snap->axes[0].p0.x, (double)snap->axes[0].p0.y, (double)snap->axes[0].p1.x,
-		(double)snap->axes[0].p1.y, (double)snap->axes[1].p0.x, (double)snap->axes[1].p0.y,
-		(double)snap->axes[1].p1.x, (double)snap->axes[1].p1.y, (double)snap->axes[2].p0.x,
-		(double)snap->axes[2].p0.y, (double)snap->axes[2].p1.x, (double)snap->axes[2].p1.y);
-
-	if (n <= 0 || (size_t)n >= sizeof(rec) || *len + (size_t)n + 1U >= BLE_IMU_COMMIT_BYTES ||
-	    *len + (size_t)n >= dst_size) {
-		return;
-	}
-	memcpy(dst + *len, rec, (size_t)n);
-	*len += (size_t)n;
-}
-
-static void append_scene_record(char *dst, size_t dst_size, size_t *len, uint32_t t_ms,
-				const struct scene_snapshot *snap)
-{
-	char rec[512];
-	int n = snprintf(
-		rec, sizeof(rec),
-		"%s[%" PRIu32 ",%.3f,%.3f,%.3f,%.3f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f",
-		(*len > 0) ? "," : "", t_ms, (double)json_safe(snap->walk_distance_m),
-		(double)json_safe(snap->footer_unproject.x),
-		(double)json_safe(snap->footer_unproject.y),
-		(double)json_safe(snap->footer_unproject.z), (double)snap->axes[0].p0.x,
-		(double)snap->axes[0].p0.y, (double)snap->axes[0].p1.x, (double)snap->axes[0].p1.y,
-		(double)snap->axes[1].p0.x, (double)snap->axes[1].p0.y, (double)snap->axes[1].p1.x,
-		(double)snap->axes[1].p1.y, (double)snap->axes[2].p0.x, (double)snap->axes[2].p0.y,
-		(double)snap->axes[2].p1.x, (double)snap->axes[2].p1.y);
-
-	if (n <= 0 || (size_t)n >= sizeof(rec)) {
-		return;
-	}
-
-	for (int i = 0; i < 8; i++) {
-		const int m = snprintf(rec + n, sizeof(rec) - (size_t)n, ",%.1f,%.1f",
-				       (double)snap->corners[i].x, (double)snap->corners[i].y);
-
-		if (m <= 0) {
-			return;
-		}
-		n += m;
-	}
-
-	const int close = snprintf(rec + n, sizeof(rec) - (size_t)n, "]");
-
-	if (close <= 0 || *len + (size_t)n + (size_t)close >= dst_size ||
-	    *len + (size_t)n + (size_t)close >= BLE_IMU_COMMIT_BYTES) {
-		return;
-	}
-	n += close;
-	memcpy(dst + *len, rec, (size_t)n);
-	*len += (size_t)n;
-}
-
 static void clamp_json_len(size_t *len, size_t cap)
 {
 	if (*len >= cap) {
@@ -504,6 +499,7 @@ static void json_finalize(char *buf, size_t cap, size_t *len, int written)
 
 static void refresh_json(uint32_t record_count, const char *records, size_t records_len)
 {
+	STACK_RA_CHECK_SETUP;
 	stall_watchdog_feed_main();
 	struct imu_sample sample;
 	const struct battery_state *bat = battery_monitor_state();
@@ -513,7 +509,7 @@ static void refresh_json(uint32_t record_count, const char *records, size_t reco
 	const float volts = bat != NULL ? bat->voltage_v : BAT_FULL_V;
 	const float pct = bat != NULL ? (float)bat->percent : 100.0f;
 	const float trend = bat != NULL ? bat->trend_v : 0.0f;
-	const unsigned power_src = (bat != NULL && bat->on_dc) ? 1U : 0U;
+	const unsigned power_src = (bat != NULL && bat->on_dc) ? 2U : 1U;
 	struct attitude_estimator att = { .state = { .rotation = mat3_identity() } };
 	const bool have_sample = imu_pipeline_snapshot(&sample, &att);
 
@@ -522,7 +518,7 @@ static void refresh_json(uint32_t record_count, const char *records, size_t reco
 	/* Rotation matrix (attitude_update() runs every tick regardless of BLE render mode —
 	 * see imu_pipeline_tick()) piggybacked on the always-on DATA JSON header so AHRS
 	 * consumers (web debug page) get it at full BLE-tick rate without a dedicated
-	 * characteristic or poll path. See attitude.c: complementary filter, no magnetometer,
+	 * characteristic or poll path. See attitude.c: Madgwick IMU (6DOF), no magnetometer,
 	 * so yaw is gyro-integrated only and will drift — roll/pitch are accel-corrected.
 	 *
 	 * Encoded as int16 (x10000, i.e. 4 decimal digits) rather than %f — this exact
@@ -547,6 +543,9 @@ static void refresh_json(uint32_t record_count, const char *records, size_t reco
 	const int32_t walk_cm = (int32_t)(imu_pipeline_walk_distance_m() * 100.0f);
 	const int32_t yaw_deg100 = (int32_t)(att.state.yaw * (180.0f / (float)M_PI) * 100.0f);
 	struct mt200_telem wt;
+	struct mt200_sample drained;
+	const bool have_drain = g_connected && mt200_sample_queue_pop(&drained);
+	const unsigned wq_left = (unsigned)mt200_sample_queue_pending();
 
 	mt200_bridge_telem(&wt);
 
@@ -554,13 +553,29 @@ static void refresh_json(uint32_t record_count, const char *records, size_t reco
 			 "{\"s\":%u,\"m\":%u,\"w\":%d,\"h\":%d,\"n\":%u,\"p\":%u,\"v\":%.2f,"
 			 "\"pct\":%u,\"tr\":%.3f,\"rot4\":[%d,%d,%d,%d,%d,%d,%d,%d,%d],"
 			 "\"wdcm\":%d,\"yawd100\":%d,"
-			 "\"whr\":%u,\"wsp\":%u,\"wst\":%u,\"wbat\":%u,\"wok\":%u,\"wrssi\":%d,"
+			 "\"whr\":%u,\"wsp\":%u,\"wst\":%u,\"wbat\":%u,\"wkcal\":%u,\"wdst\":%u,"
+			 "\"wok\":%u,\"wrssi\":%d,\"wseq\":%u,\"wq\":%u,"
+			 "\"wd\":{\"seq\":%u,\"ms\":%u,\"hr\":%u,\"sp\":%u,\"st\":%u,\"bat\":%u,"
+			 "\"kcal\":%u,\"dst\":%u,\"flg\":%u},"
+			 "\"bb\":%u,\"bsid\":%u,\"bseq\":%u,"
 			 "\"d\":[%.*s]}",
 			 g_seq, g_mode, PANEL_W, PANEL_H, record_count, power_src, (double)volts,
 			 (unsigned)pct, (double)trend, r00, r01, r02, r10, r11, r12, r20, r21, r22,
 			 walk_cm, yaw_deg100, (unsigned)wt.hr, (unsigned)wt.spo2,
-			 (unsigned)wt.steps, (unsigned)wt.bat_pct,
-			 wt.flags != 0U ? 1U : 0U, (int)wt.rssi, (int)records_len, records);
+			 (unsigned)wt.steps, (unsigned)wt.bat_pct, (unsigned)wt.kcal_x10,
+			 (unsigned)wt.dist_mm, wt.flags != 0U ? 1U : 0U, (int)wt.rssi,
+			 (unsigned)wt.seq, wq_left,
+			 have_drain ? (unsigned)drained.esp_seq : 0U,
+			 have_drain ? (unsigned)drained.wall_ms : 0U,
+			 have_drain ? (unsigned)drained.hr : 0U,
+			 have_drain ? (unsigned)drained.spo2 : 0U,
+			 have_drain ? (unsigned)drained.steps : 0U,
+			 have_drain ? (unsigned)drained.bat_pct : 0U,
+			 have_drain ? (unsigned)drained.kcal_x10 : 0U,
+			 have_drain ? (unsigned)drained.dist_mm : 0U,
+			 have_drain ? (unsigned)drained.flags : 0U,
+			 battery_bench_active() ? 1U : 0U, battery_bench_session_id(),
+			 battery_bench_sample_seq(), (int)records_len, records);
 	if (n < 0) {
 		g_data_len[w] = 0;
 	} else {
@@ -570,11 +585,13 @@ static void refresh_json(uint32_t record_count, const char *records, size_t reco
 
 	n = snprintf(g_status_json[w], sizeof(g_status_json[w]),
 		     "{\"s\":%u,\"m\":%u,\"n\":%u,\"b\":%u,\"p\":%u,\"v\":%.2f,\"pct\":%u,"
-		     "\"tr\":%.3f,\"pp\":%u,\"fw\":\"" FW_VERSION_NAME "\",\"fwc\":%u,\"imu\":%u,\"scr\":%u,"
+		     "\"tr\":%.3f,\"pp\":%u,\"fw\":\"" FW_VERSION_NAME "\",\"fwc\":%u,\"feat\":%u,\"dbg\":%u,"
+		     "\"imu\":%u,\"scr\":%u,"
 		     "\"cpumhz\":%u,\"cpuov\":%u,\"cpuact\":%u,\"cpuclamp\":%u,\"imuhz\":%u,\"imuov\":%u,"
 		     "\"wrssi\":%d",
 		     g_seq, g_mode, record_count, (unsigned)g_data_len[w], power_src, (double)volts,
 		     (unsigned)pct, (double)trend, POWER_PROFILE_DC_FULL, (unsigned)FW_VERSION_CODE,
+		     g_caps, IS_ENABLED(CONFIG_APP_CRASH_DEBUG) ? 1U : 0U,
 		     imu_pipeline_live() ? 1U : 0U, power_manager_screen_on() ? 1U : 0U,
 		     (unsigned)power_manager_cpu_mhz_desired(), (unsigned)power_manager_cpu_mhz_override(),
 		     (unsigned)power_manager_cpu_mhz_settled(), power_manager_cpu_ble_clamped() ? 1U : 0U,
@@ -599,6 +616,39 @@ static void refresh_json(uint32_t record_count, const char *records, size_t reco
 			      (unsigned)power_manager_apb_mhz_actual(), (unsigned)spcap,
 			      (unsigned)spused, (unsigned)spfree, (unsigned)sppend,
 			      (unsigned)dramf_kb);
+	}
+
+	/* Bus/radio breadcrumbs early — must survive STATUS truncate before vibro/edge dump. */
+	if (n > 0) {
+		char ssid[33];
+		char esc[40];
+		const size_t sl = network_manager_wifi_ssid(ssid, sizeof(ssid));
+		size_t ei = 0;
+
+		for (size_t i = 0; i < sl && ei + 1U < sizeof(esc); i++) {
+			const char c = ssid[i];
+
+			esc[ei++] = (c == '"' || c == '\\') ? '\'' : c;
+		}
+		esc[ei] = '\0';
+
+		ble_rates_update();
+		n += snprintf(g_status_json[w] + n, sizeof(g_status_json[w]) - (size_t)n,
+			      ",\"spi\":%u,\"i2c\":%u,\"blerxkb\":%u,\"bletxkb\":%u,"
+			      "\"blerxb\":%u,\"bletxb\":%u,\"blerxbps\":%u,\"bletxbps\":%u,"
+			      "\"wifi\":%u,\"wfr\":%d,\"wap\":%u",
+			      (unsigned)CONFIG_APP_PANEL_SPI_MHZ, 400U,
+			      (unsigned)(g_ble_rx_bytes / 1024U),
+			      (unsigned)(g_ble_tx_bytes / 1024U),
+			      (unsigned)g_ble_rx_bytes, (unsigned)g_ble_tx_bytes,
+			      (unsigned)g_ble_rx_bps, (unsigned)g_ble_tx_bps,
+			      network_manager_link_up() ? 1U : 0U,
+			      (int)network_manager_wifi_rssi(),
+			      network_manager_portal_active() ? 1U : 0U);
+		if (n > 0 && ei > 0U) {
+			n += snprintf(g_status_json[w] + n, sizeof(g_status_json[w]) - (size_t)n,
+				      ",\"wssid\":\"%s\"", esc);
+		}
 	}
 
 	if (chip_temp_valid() && n > 0) {
@@ -723,9 +773,10 @@ static void refresh_json(uint32_t record_count, const char *records, size_t reco
 
 	if (n > 0) {
 		n += snprintf(g_status_json[w] + n, sizeof(g_status_json[w]) - (size_t)n,
-			      ",\"rr\":\"%s\",\"boot_part\":\"%s\"",
+			      ",\"rr\":\"%s\",\"boot_part\":\"%s\",\"och\":\"%s\"",
 			      crash_report_reset_reason_str(),
-			      soft_reboot_partition_label(soft_reboot_boot_partition()));
+			      soft_reboot_partition_label(soft_reboot_boot_partition()),
+			      ota_channel_get());
 	}
 
 #if defined(CONFIG_APP_CRASH_DEBUG)
@@ -739,6 +790,11 @@ static void refresh_json(uint32_t record_count, const char *records, size_t reco
 		}
 	}
 #endif
+
+	if (n > 0 && vibro_capture_sensing_paused()) {
+		n += snprintf(g_status_json[w] + n, sizeof(g_status_json[w]) - (size_t)n,
+			      ",\"repair\":1");
+	}
 
 	if (n > 0 && battery_bench_active()) {
 		struct battery_bench_snapshot snap;
@@ -760,6 +816,7 @@ static void refresh_json(uint32_t record_count, const char *records, size_t reco
 	json_finalize(g_status_json[w], sizeof(g_status_json[w]), &g_status_len[w], n);
 
 	json_publish(w);
+	STACK_RA_CHECK();
 	stall_watchdog_feed_main();
 }
 
@@ -943,10 +1000,12 @@ static void poll_tick(void)
 
 static void notify_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
+	APP_ENTER();
 	ARG_UNUSED(attr);
 
 	g_notify_want = (value == BT_GATT_CCC_NOTIFY);
 	atomic_set(&g_defer_notify, 1);
+	APP_LEAVE();
 }
 
 static ssize_t read_mode(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -955,60 +1014,75 @@ static ssize_t read_mode(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 	ARG_UNUSED(conn);
 	ARG_UNUSED(attr);
 
-	return bt_gatt_attr_read(conn, attr, buf, len, offset, &g_mode, sizeof(g_mode));
+	uint8_t mode = g_mode;
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, &mode, sizeof(mode));
 }
 
 static ssize_t write_mode(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			  const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
 {
+	APP_ENTER();
 	ARG_UNUSED(conn);
 	ARG_UNUSED(attr);
 	ARG_UNUSED(flags);
 
 	if (offset != 0 || len < 1) {
+		APP_LEAVE();
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 	if (bench_blocks_config()) {
+		APP_LEAVE();
 		return BT_GATT_ERR(BT_ATT_ERR_WRITE_NOT_PERMITTED);
 	}
 
 	g_mode = *(const uint8_t *)buf;
 	atomic_set(&g_defer_mode, 1);
+	ble_account_rx(len);
+	APP_LEAVE();
 	return len;
 }
 
 static ssize_t read_status(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			   void *buf, uint16_t len, uint16_t offset)
 {
+	ssize_t n;
+
 	if (in_connect_grace()) {
 		static const char grace[] = "{\"s\":0,\"m\":0,\"n\":0,\"scr\":1}";
 
-		return bt_gatt_attr_read(conn, attr, buf, len, offset, grace, sizeof(grace) - 1U);
+		n = bt_gatt_attr_read(conn, attr, buf, len, offset, grace, sizeof(grace) - 1U);
+	} else {
+		const int idx = stable_read_idx(&g_status_read_idx, offset);
+
+		n = bt_gatt_attr_read(conn, attr, buf, len, offset, g_status_json[idx],
+				      g_status_len[idx]);
 	}
-
-	const int idx = stable_read_idx(&g_status_read_idx, offset);
-
-	return bt_gatt_attr_read(conn, attr, buf, len, offset, g_status_json[idx],
-				 g_status_len[idx]);
+	if (n > 0) {
+		ble_account_tx((size_t)n);
+	}
+	return n;
 }
 
 static ssize_t read_data(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			 void *buf, uint16_t len, uint16_t offset)
 {
+	ssize_t n;
+
 	if (in_connect_grace()) {
 		static const char grace[] = "{\"s\":0,\"n\":0,\"d\":[]}";
 
-		return bt_gatt_attr_read(conn, attr, buf, len, offset, grace, sizeof(grace) - 1U);
+		n = bt_gatt_attr_read(conn, attr, buf, len, offset, grace, sizeof(grace) - 1U);
+	} else {
+		const int idx = stable_read_idx(&g_data_read_idx, offset);
+
+		n = bt_gatt_attr_read(conn, attr, buf, len, offset, g_data_json[idx],
+				      g_data_len[idx]);
 	}
-
-	const int idx = stable_read_idx(&g_data_read_idx, offset);
-
-	/*
-	 * Do not rebuild JSON here — Android reads DATA on every NOTIFY (~30 Hz).
-	 * build_batch() does scene projection + snprintf and wedged the BT stack
-	 * after minutes of polling. commit_batch() on the workqueue owns updates.
-	 */
-	return bt_gatt_attr_read(conn, attr, buf, len, offset, g_data_json[idx], g_data_len[idx]);
+	if (n > 0) {
+		ble_account_tx((size_t)n);
+	}
+	return n;
 }
 
 static ssize_t read_poll_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -1026,14 +1100,17 @@ static ssize_t read_poll_ms(struct bt_conn *conn, const struct bt_gatt_attr *att
 static ssize_t write_poll_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			     const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
 {
+	APP_ENTER();
 	ARG_UNUSED(conn);
 	ARG_UNUSED(attr);
 	ARG_UNUSED(flags);
 
 	if (offset != 0 || len < 2) {
+		APP_LEAVE();
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 	if (bench_blocks_config()) {
+		APP_LEAVE();
 		return BT_GATT_ERR(BT_ATT_ERR_WRITE_NOT_PERMITTED);
 	}
 
@@ -1049,6 +1126,7 @@ static ssize_t write_poll_ms(struct bt_conn *conn, const struct bt_gatt_attr *at
 
 	g_poll_ms = ms;
 	atomic_set(&g_defer_poll, 1);
+	APP_LEAVE();
 	return len;
 }
 
@@ -1066,14 +1144,17 @@ static ssize_t read_notify(struct bt_conn *conn, const struct bt_gatt_attr *attr
 static ssize_t write_time(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			  const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
 {
+	APP_ENTER();
 	ARG_UNUSED(conn);
 	ARG_UNUSED(attr);
 	ARG_UNUSED(flags);
 
 	if (offset != 0 || len < 8) {
+		APP_LEAVE();
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 	if (bench_blocks_config()) {
+		APP_LEAVE();
 		return BT_GATT_ERR(BT_ATT_ERR_WRITE_NOT_PERMITTED);
 	}
 
@@ -1100,6 +1181,7 @@ static ssize_t write_time(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 	 * callback / heavy BT context) stacked with the phone's connect burst (CCCD + MODE +
 	 * poll + TIME + crash/offload) and correlated with TG0WDT_SYS_RST when task_wdt was
 	 * not fed for >2s (CONFIG_TASK_WDT_MIN_TIMEOUT). */
+	APP_LEAVE();
 	return len;
 }
 
@@ -1130,14 +1212,17 @@ static ssize_t read_screen(struct bt_conn *conn, const struct bt_gatt_attr *attr
 static ssize_t write_screen(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			    const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
 {
+	APP_ENTER();
 	ARG_UNUSED(conn);
 	ARG_UNUSED(attr);
 	ARG_UNUSED(flags);
 
 	if (offset != 0 || len < 1) {
+		APP_LEAVE();
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 	if (bench_blocks_config()) {
+		APP_LEAVE();
 		return BT_GATT_ERR(BT_ATT_ERR_WRITE_NOT_PERMITTED);
 	}
 
@@ -1145,6 +1230,7 @@ static ssize_t write_screen(struct bt_conn *conn, const struct bt_gatt_attr *att
 
 	g_screen_want = on;
 	atomic_set(&g_defer_screen, 1);
+	APP_LEAVE();
 	return len;
 }
 
@@ -1162,14 +1248,17 @@ static ssize_t read_cpu_mhz(struct bt_conn *conn, const struct bt_gatt_attr *att
 static ssize_t write_cpu_mhz(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			     const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
 {
+	APP_ENTER();
 	ARG_UNUSED(conn);
 	ARG_UNUSED(attr);
 	ARG_UNUSED(flags);
 
 	if (offset != 0 || len < 1) {
+		APP_LEAVE();
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 	if (bench_blocks_config()) {
+		APP_LEAVE();
 		return BT_GATT_ERR(BT_ATT_ERR_WRITE_NOT_PERMITTED);
 	}
 
@@ -1177,6 +1266,7 @@ static ssize_t write_cpu_mhz(struct bt_conn *conn, const struct bt_gatt_attr *at
 	 * clamp_cpu_mhz() inside apply_rates() — no clamping needed here. */
 	g_cpu_mhz_want = *(const uint8_t *)buf;
 	atomic_set(&g_defer_cpu_mhz, 1);
+	APP_LEAVE();
 	return len;
 }
 
@@ -1194,14 +1284,17 @@ static ssize_t read_imu_hz(struct bt_conn *conn, const struct bt_gatt_attr *attr
 static ssize_t write_imu_hz(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			    const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
 {
+	APP_ENTER();
 	ARG_UNUSED(conn);
 	ARG_UNUSED(attr);
 	ARG_UNUSED(flags);
 
 	if (offset != 0 || len < 1) {
+		APP_LEAVE();
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 	if (bench_blocks_config()) {
+		APP_LEAVE();
 		return BT_GATT_ERR(BT_ATT_ERR_WRITE_NOT_PERMITTED);
 	}
 
@@ -1217,6 +1310,7 @@ static ssize_t write_imu_hz(struct bt_conn *conn, const struct bt_gatt_attr *att
 
 	g_imu_hz_want = hz;
 	atomic_set(&g_defer_imu_hz, 1);
+	APP_LEAVE();
 	return len;
 }
 
@@ -1237,16 +1331,19 @@ static ssize_t read_bench(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 static ssize_t write_bench(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			   const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
 {
+	APP_ENTER();
 	ARG_UNUSED(conn);
 	ARG_UNUSED(attr);
 	ARG_UNUSED(flags);
 
 	if (offset != 0 || len < 1) {
+		APP_LEAVE();
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 
 	g_bench_cmd_want = *(const uint8_t *)buf;
 	atomic_set(&g_defer_bench, 1);
+	APP_LEAVE();
 	return len;
 }
 
@@ -1309,19 +1406,37 @@ static const struct bt_data sd[] = {
 		sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 };
 
+static void le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t latency,
+			     uint16_t timeout)
+{
+	APP_ENTER();
+	if (!conn_is_phone_link(conn)) {
+		APP_LEAVE();
+		return;
+	}
+	LOG_INF("phone BLE interval=%u (=%ums) latency=%u timeout=%u", interval,
+		(unsigned)((interval * 125U) / 100U), latency, timeout);
+	APP_LEAVE();
+}
+
 static void connected(struct bt_conn *conn, uint8_t err)
 {
+	APP_ENTER();
 	ble_imu_on_connected(conn, err);
+	APP_LEAVE();
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
+	APP_ENTER();
 	ble_imu_on_disconnected(conn, reason);
+	APP_LEAVE();
 }
 
 BT_CONN_CB_DEFINE(conn_cb) = {
 	.connected = connected,
 	.disconnected = disconnected,
+	.le_param_updated = le_param_updated,
 };
 
 static int ble_imu_advertise_start_now(void);
@@ -1373,6 +1488,8 @@ int ble_imu_gatt_init(void)
 	g_compact_len[1] = 0;
 	clock_sync_begin();
 	g_caps = ble_imu_zephyr_caps();
+	LOG_INF("CHAR_CAPS/feat=0x%x wifi=%u", g_caps,
+		(g_caps & BLE_CAP_WIFI) != 0U ? 1U : 0U);
 	build_batch();
 
 	g_notify_attr = bt_gatt_find_by_uuid(imu_svc.attrs, imu_svc.attr_count,
@@ -1386,7 +1503,7 @@ int ble_imu_gatt_init(void)
 static int ble_imu_advertise_start_now(void)
 {
 	static const struct bt_le_adv_param adv_param = BT_LE_ADV_PARAM_INIT(
-		BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_USE_IDENTITY, BLE_ADV_INT_MIN,
+		BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_USE_IDENTITY, BLE_ADV_INT_MIN,
 		BLE_ADV_INT_MAX, NULL);
 
 	int err = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
@@ -1408,7 +1525,7 @@ static int ble_imu_advertise_start_now(void)
 
 int ble_imu_gatt_looper_adv_start(bool restart)
 {
-	if (g_connected) {
+	if (g_connected || g_hold_adv || g_hold_adv_mt200) {
 		return 0;
 	}
 
@@ -1437,10 +1554,74 @@ static bool conn_is_phone_link(struct bt_conn *conn)
 
 void ble_imu_on_connected(struct bt_conn *conn, uint8_t err)
 {
+	APP_ENTER();
 	if (!conn_is_phone_link(conn)) {
+		LOG_INF("conn CB ignore (not phone peripheral)");
+		APP_LEAVE();
 		return;
 	}
+	LOG_INF("conn CB accept phone err=%u", err);
 	(void)ble_looper_post_connected(conn, err);
+	APP_LEAVE();
+}
+
+static void phone_conn_params_for_wifi(bool wifi_busy)
+{
+	struct bt_conn_info info;
+	int err;
+
+	if (g_conn == NULL || bt_conn_get_info(g_conn, &info) != 0 ||
+	    info.type != BT_CONN_TYPE_LE) {
+		return;
+	}
+
+	if (wifi_busy) {
+		/* interval_us replaces deprecated le.interval (1.25 ms units). */
+		const uint16_t cur = (uint16_t)(info.le.interval_us / 1250U);
+
+		if (!g_wifi_le_params) {
+			/* Don't snapshot an already-stretched interval as the restore
+			 * target (seen as restore interval=600 after a previous scan). */
+			if (cur < 200U) {
+				g_saved_le_interval = cur;
+				g_saved_le_latency = info.le.latency;
+				g_saved_le_timeout = info.le.timeout;
+			} else {
+				g_saved_le_interval = 32U;
+				g_saved_le_latency = 0U;
+				g_saved_le_timeout = 42U;
+			}
+			g_wifi_le_params = true;
+		}
+		/* 400–800 × 1.25 ms = 500–1000 ms. Supervision timeout must satisfy
+		 * timeout*4 > (1+latency)*interval_max (Zephyr bt_le_conn_params_valid).
+		 * 600/4/800 failed that check (EINVAL -22) so v168 scanned at 40 ms. */
+		err = bt_conn_le_param_update(g_conn, BT_LE_CONN_PARAM(400, 800, 4, 1200));
+		LOG_INF("phone BLE stretch for WiFi (%d) was interval=%u saved=%u", err, cur,
+			g_saved_le_interval);
+		return;
+	}
+
+	if (!g_wifi_le_params) {
+		return;
+	}
+	g_wifi_le_params = false;
+	{
+		uint16_t min = g_saved_le_interval > 4U ? (uint16_t)(g_saved_le_interval - 2U)
+							 : g_saved_le_interval;
+		uint16_t max = (uint16_t)(g_saved_le_interval + 2U);
+		uint16_t timeout = g_saved_le_timeout > 0U ? g_saved_le_timeout : 400U;
+
+		if (min < 6U) {
+			min = 6U;
+		}
+		if (max < min) {
+			max = min;
+		}
+		err = bt_conn_le_param_update(g_conn, BT_LE_CONN_PARAM(min, max, g_saved_le_latency,
+								      timeout));
+		LOG_INF("phone BLE restore after WiFi (%d) interval=%u", err, g_saved_le_interval);
+	}
 }
 
 void ble_imu_gatt_set_traffic_paused(bool paused)
@@ -1450,6 +1631,7 @@ void ble_imu_gatt_set_traffic_paused(bool paused)
 	}
 
 	g_traffic_paused = paused;
+	phone_conn_params_for_wifi(paused);
 	if (paused) {
 		LOG_INF("IMU BLE traffic paused (WiFi radio active)");
 	} else if (g_connected && g_notify_enabled) {
@@ -1458,16 +1640,88 @@ void ble_imu_gatt_set_traffic_paused(bool paused)
 	}
 }
 
+bool ble_imu_phone_conn_quiet_for_wifi(void)
+{
+	struct bt_conn_info info;
+
+	if (g_conn == NULL) {
+		return true;
+	}
+	if (bt_conn_get_info(g_conn, &info) != 0 || info.type != BT_CONN_TYPE_LE) {
+		return true;
+	}
+	/* 160 * 1.25 ms = 200 ms — enough for a 2.4 GHz dwell if the phone
+	 * won't accept a 500 ms+ interval. Prefer 400 ms when the stretch lands. */
+	return info.le.interval_us >= (160U * 1250U);
+}
+
+void ble_imu_phone_stretch_for_wifi(void)
+{
+	phone_conn_params_for_wifi(true);
+}
+
+static void ble_imu_apply_adv_hold(const char *why_held)
+{
+	const bool held = g_hold_adv || g_hold_adv_mt200;
+
+	if (held) {
+		/* Flag alone only blocks re-start — actively stop so the BT
+		 * controller frees 2.4 GHz airtime (WiFi scan or MT200 central). */
+		g_adv_start_deadline = 0;
+		if (g_adv_active) {
+			g_adv_stop_pending = true;
+			g_adv_stop_deadline = k_uptime_get();
+		}
+		if (why_held != NULL) {
+			LOG_INF("BLE adv held (%s)", why_held);
+		}
+	} else if (!g_connected) {
+		LOG_INF("BLE adv released");
+		(void)ble_imu_gatt_looper_adv_start(true);
+	}
+}
+
+void ble_imu_set_hold_adv(bool hold)
+{
+	if (g_hold_adv == hold) {
+		return;
+	}
+	g_hold_adv = hold;
+	ble_imu_apply_adv_hold(hold ? "WiFi/OTA" : NULL);
+}
+
+void ble_imu_set_mt200_adv_hold(bool hold)
+{
+	if (g_hold_adv_mt200 == hold) {
+		return;
+	}
+	g_hold_adv_mt200 = hold;
+	ble_imu_apply_adv_hold(hold ? "MT200 central" : NULL);
+}
+
+void ble_imu_disconnect_phone_for_wifi(void)
+{
+	if (g_conn == NULL) {
+		return;
+	}
+	LOG_INF("phone BLE drop for WiFi scan");
+	(void)bt_conn_disconnect(g_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+}
+
 void ble_imu_on_disconnected(struct bt_conn *conn, uint8_t reason)
 {
+	APP_ENTER();
 	if (!conn_is_phone_link(conn)) {
+		APP_LEAVE();
 		return;
 	}
 	(void)ble_looper_post_disconnected(reason);
+	APP_LEAVE();
 }
 
 void ble_imu_gatt_looper_connected(struct bt_conn *conn)
 {
+	APP_ENTER();
 	printk("ble_imu: link up (looper)\n");
 
 	if (g_conn) {
@@ -1476,6 +1730,7 @@ void ble_imu_gatt_looper_connected(struct bt_conn *conn)
 
 	g_conn = bt_conn_ref(conn);
 	g_connected = true;
+	g_link_up_at = k_uptime_get();
 	g_connect_grace_until = k_uptime_get() + BLE_CONNECT_GRACE_MS;
 	g_traffic_ready_at = g_connect_grace_until + BLE_POST_GRACE_MS;
 	g_poll_armed = false;
@@ -1484,14 +1739,28 @@ void ble_imu_gatt_looper_connected(struct bt_conn *conn)
 	g_adv_stop_pending = g_adv_active;
 	g_adv_stop_deadline = k_uptime_get() + BLE_ADV_STOP_DEFER_MS;
 	power_manager_set_ble_active(true);
+	ota_ab_note_phone_up();
+	/* Dual-role: keep MT200 central up while phone is connected (BT_MAX_CONN>=3).
+	 * phone_hold used to drop the watch and starved Good Vibes wearable ingest. */
+	if (g_conn != NULL) {
+		const int mtu_err = bt_gatt_exchange_mtu(g_conn, &g_mtu_exchange);
+
+		if (mtu_err != 0 && mtu_err != -EALREADY) {
+			LOG_WRN("ATT MTU exchange start failed (%d)", mtu_err);
+		}
+	}
 	LOG_INF("connected (grace %ums)", BLE_CONNECT_GRACE_MS);
+	APP_LEAVE();
 }
 
 void ble_imu_gatt_looper_disconnected(uint8_t reason)
 {
+	APP_ENTER();
 	g_connected = false;
 	g_notify_enabled = false;
 	g_traffic_paused = false;
+	g_link_up_at = 0;
+	g_wifi_le_params = false;
 	g_connect_grace_until = 0;
 	g_traffic_ready_at = 0;
 	g_grace_prep_pending = false;
@@ -1509,8 +1778,10 @@ void ble_imu_gatt_looper_disconnected(uint8_t reason)
 	}
 
 	power_manager_set_ble_active(false);
+	vibro_led_debug_set(false, 0U);
 	LOG_INF("disconnected (%u)", reason);
 	(void)ble_imu_gatt_looper_adv_start(true);
+	APP_LEAVE();
 }
 
 bool ble_imu_link_active(void)
@@ -1530,6 +1801,17 @@ void ble_imu_gatt_looper_tick(void)
 	adv_stop_tick();
 
 	if (!g_connected) {
+		return;
+	}
+
+	/* Prophylactic link refresh — continuous phone BLE freezes MSPI/heap (~40m). */
+	if (g_link_up_at > 0 &&
+	    (k_uptime_get() - g_link_up_at) >= (int64_t)BLE_LINK_REFRESH_MS &&
+	    g_conn != NULL) {
+		LOG_WRN("phone BLE link refresh after %umin (soak survival)",
+			BLE_LINK_REFRESH_MS / 60000U);
+		g_link_up_at = 0; /* one-shot until reconnect */
+		(void)bt_conn_disconnect(g_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 		return;
 	}
 
@@ -1562,15 +1844,25 @@ void ble_imu_gatt_looper_tick(void)
 	}
 
 	if (atomic_get(&g_defer_time) != 0) {
+		APP_ENTER();
 		atomic_set(&g_defer_time, 0);
+		const bool was_synced = clock_sync_is_synced();
+
 		if (clock_sync_set_from_phone(g_time_unix_ms, g_time_tz_min)) {
 			LOG_INF("TIME phone corrected unix_ms=%lld tz=%d",
 				(long long)g_time_unix_ms, (int)g_time_tz_min);
+			/* First apply or large drift — push wall clock to MT200 now. */
+			mt200_bridge_sync_time();
 		} else {
 			LOG_INF("TIME phone check unix_ms=%lld tz=%d drift=%lld ms",
 				(long long)g_time_unix_ms, (int)g_time_tz_min,
 				(long long)clock_sync_last_drift_ms());
+			/* First phone TIME that only updates tz still means we have wall clock. */
+			if (!was_synced && clock_sync_is_synced()) {
+				mt200_bridge_sync_time();
+			}
 		}
+		APP_LEAVE();
 	}
 
 	if (atomic_get(&g_defer_mode) != 0) {
@@ -1634,16 +1926,25 @@ void ble_imu_gatt_looper_tick(void)
 			    g_compact_len[idx] <= (size_t)att_payload_max) {
 				rc = bt_gatt_notify(g_conn, g_notify_attr, g_compact[idx],
 						    (uint16_t)g_compact_len[idx]);
+				if (rc == 0) {
+					ble_account_tx(g_compact_len[idx]);
+				}
 			} else if (att_payload_max > 0U && g_data_len[idx] > 0U &&
 				   g_data_len[idx] <= (size_t)att_payload_max) {
 				rc = bt_gatt_notify(g_conn, g_notify_attr, g_data_json[idx],
 						    (uint16_t)g_data_len[idx]);
+				if (rc == 0) {
+					ble_account_tx(g_data_len[idx]);
+				}
 			} else {
 				uint8_t payload[4];
 
 				sys_put_le32(g_seq, payload);
 				rc = bt_gatt_notify(g_conn, g_notify_attr, payload,
 						    sizeof(payload));
+				if (rc == 0) {
+					ble_account_tx(sizeof(payload));
+				}
 			}
 
 			/* Loss detection + bounded retry — see NOTIFY_RETRY_MAX's doc
@@ -1671,8 +1972,6 @@ void ble_imu_gatt_looper_tick(void)
 	}
 
 	poll_tick();
-	if (g_connected && power_manager_tft_render_enabled()) {
-		stall_watchdog_feed_render();
-	}
+	/* Do not feed render WDT from BLE — masks SPI/flush hangs (frozen cube). */
 	stall_watchdog_feed_main();
 }

@@ -1,8 +1,8 @@
 # Zephyr experiment — revertable fork (F8)
 
-**Status:** frozen planning doc for a forked thread. **Does not replace** Arduino firmware on `main`.
+**Status:** historical planning doc. Production handshake path is **`next/zephyr`** on **Zephyr v4.4.2 / SDK 1.0.1** — see [zephyr-install.md](zephyr-install.md) (upgrade table) and [zephyr-build.md](zephyr-build.md). This file is kept for revert contract and pin-map notes; do not treat open questions below as current blockers.
 
-**Goal:** evaluate Zephyr on real hardware with a path back to `./scripts/build.sh production --upload`.
+**Goal (original):** evaluate Zephyr on real hardware with a path back to `./scripts/build.sh production --upload`.
 
 ---
 
@@ -42,7 +42,7 @@ Current Arduino stack (~90 C++ units): QMI8658, ST7789+LVGL-style scene, BLE GAT
 | Track | Board | Notes |
 |-------|--------|--------|
 | **Your hardware** | Waveshare ESP32-S3-LCD-1.47**B** on `/dev/ttyACM0` | Custom out-of-tree board `esp32s3_lcd_147b` in `zephyr/boards/waveshare/` |
-| **Reference DTS** | Waveshare 1.28″ in Zephyr 3.7 | Pin template only (different GPIO map) |
+| **Reference DTS** | Waveshare 1.28″ (in-tree / older trees) | Pin template only (different GPIO map) |
 
 **Recommendation:** build `hello_world` for `esp32s3_devkitm/esp32s3/procpu` → flash → serial sanity → custom Waveshare overlay → IMU/LCD/BLE port.
 
@@ -101,21 +101,21 @@ python3 -m venv .venv
 source ~/zephyrproject/.venv/bin/activate
 pip install -U pip wheel west
 
-# LTS tag — bump in fork if you want mainline
-west init -m https://github.com/zephyrproject-rtos/zephyr --mr v3.7.0
+# Stable tag — bump when adopting a newer Zephyr release
+west init -m https://github.com/zephyrproject-rtos/zephyr --mr v4.4.2
 cd zephyr
 west update
 pip install -r scripts/requirements.txt   # pyelftools etc. (west packages needs newer west)
 
-# Zephyr SDK — must be complete ~1.4GB download before tar xf
+# Zephyr SDK 1.0+ (minimal + esp32s3 toolchain); GNU tools live under gnu/
 cd ~
-wget -c https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v0.16.8/zephyr-sdk-0.16.8_linux-x86_64.tar.xz
-tar tf zephyr-sdk-0.16.8_linux-x86_64.tar.xz >/dev/null   # verify not truncated
-tar xf zephyr-sdk-0.16.8_linux-x86_64.tar.xz
-~/zephyr-sdk-0.16.8/setup.sh -t xtensa-espressif_esp32s3_zephyr-elf -c -h
+wget -c https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v1.0.1/zephyr-sdk-1.0.1_linux-x86_64_minimal.tar.xz
+tar tf zephyr-sdk-1.0.1_linux-x86_64_minimal.tar.xz >/dev/null   # verify not truncated
+tar xf zephyr-sdk-1.0.1_linux-x86_64_minimal.tar.xz
+~/zephyr-sdk-1.0.1/setup.sh -t xtensa-espressif_esp32s3_zephyr-elf -c -h
 
 cat > ~/.zephyrrc <<'EOF'
-export ZEPHYR_SDK_INSTALL_DIR="$HOME/zephyr-sdk-0.16.8"
+export ZEPHYR_SDK_INSTALL_DIR="$HOME/zephyr-sdk-1.0.1"
 EOF
 
 source ~/zephyrproject/.venv/bin/activate
@@ -173,8 +173,8 @@ Copy into new chat:
 
 ---
 
-## Open questions for you
+## Open questions (resolved / stale)
 
-1. **Zephyr version:** v3.7 LTS vs main (v4.x has Waveshare 1.28″ board)?
-2. **First flash OK?** `hello_world` on generic S3 target (no LCD yet) — backup taken?
-3. **Forked thread:** custom `zephyr/app` in-repo vs standalone west workspace?
+1. **Zephyr version:** **v4.4.2 + SDK 1.0.1** adopted (was v3.7.0 / 0.16.8). See [zephyr-install.md](zephyr-install.md).
+2. **First flash OK?** Desk handshake path is green; use `flash-zephyr.sh handshake` + boot-log verify.
+3. **Layout:** in-repo `zephyr/app/handshake` + board under `zephyr/boards/waveshare/` (west tree stays outside the git repo).

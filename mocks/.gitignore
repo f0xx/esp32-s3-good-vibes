@@ -1,0 +1,13 @@
+build*/
+build-*/
+**/handshake_host
+*.o
+*.o.d
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.bin
+san_nvs*.bin
+smoke_nvs.bin
+mocks_nvs.bin

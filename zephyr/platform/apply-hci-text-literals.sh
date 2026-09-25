@@ -14,14 +14,21 @@ if grep -q 'mtext-section-literals' "$CMAKE"; then
 fi
 
 python3 - "$CMAKE" <<'PY'
+import re
 import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
 text = path.read_text()
-needle = "zephyr_library_sources_ifdef(CONFIG_BT_ESP32       hci_esp32.c)\n"
-if needle not in text:
+# 3.7 used padded spaces; 4.x keep-sorted uses a single space.
+pat = re.compile(
+    r"^zephyr_library_sources_ifdef\(CONFIG_BT_ESP32\s+hci_esp32\.c\)\n",
+    re.M,
+)
+m = pat.search(text)
+if not m:
     raise SystemExit("ERROR: hci_esp32.c source line not found in CMakeLists.txt")
+needle = m.group(0)
 insert = needle + (
     "if(CONFIG_BT_ESP32)\n"
     "  set_source_files_properties(hci_esp32.c PROPERTIES COMPILE_OPTIONS "

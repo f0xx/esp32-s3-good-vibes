@@ -19,13 +19,14 @@
 #include <zephyr/sys/reboot.h>
 
 #include "crash_report.h"
+#include "ota_channel.h"
 #include "soft_reboot.h"
 
 LOG_MODULE_REGISTER(ota_ab, LOG_LEVEL_INF);
 
 #define OTA_AB_MAGIC     0x4F544142U /* OTAB */
 #define SETTINGS_KEY     "ota_ab/state"
-#define OTA_CONFIRM_MS   30000U
+#define OTA_CONFIRM_MS   8000U
 #define OTA_AB_MAX_TRIES 3U
 
 struct ota_ab_state {
@@ -41,6 +42,7 @@ struct ota_ab_state {
 
 static struct ota_ab_state g_st;
 static bool g_loaded;
+static bool g_confirm_on_ble;
 
 static uint32_t st_crc(const struct ota_ab_state *s)
 {
@@ -87,8 +89,11 @@ static uint8_t inactive_target_slot(void)
 
 static void report_ota_outcome(const char *outcome, uint8_t from_slot, uint8_t target_slot)
 {
+	char tagged[16];
+
+	ota_channel_format_outcome(tagged, sizeof(tagged), outcome);
 	crash_report_append_soft("fw_upgrade", (uint8_t)esp_reset_reason(), from_slot, target_slot,
-				 outcome);
+				 tagged);
 }
 
 void ota_ab_init(void)
@@ -148,14 +153,20 @@ void ota_ab_on_boot(void)
 	}
 }
 
+void ota_ab_note_phone_up(void)
+{
+	g_confirm_on_ble = true;
+}
+
 void ota_ab_poll(void)
 {
 	if (!g_loaded || !state_valid(&g_st) || !g_st.pending || boot_is_img_confirmed()) {
 		return;
 	}
-	if (k_uptime_get() < OTA_CONFIRM_MS) {
+	if (!g_confirm_on_ble && k_uptime_get() < OTA_CONFIRM_MS) {
 		return;
 	}
+	g_confirm_on_ble = false;
 	if (boot_write_img_confirmed() != 0) {
 		LOG_WRN("ota_ab confirm failed");
 		return;
@@ -168,6 +179,10 @@ void ota_ab_poll(void)
 #else /* !CONFIG_BOOTLOADER_MCUBOOT */
 
 void ota_ab_on_boot(void)
+{
+}
+
+void ota_ab_note_phone_up(void)
 {
 }
 
@@ -202,9 +217,16 @@ int ota_ab_finish_and_reboot(struct flash_img_context *ctx)
 		LOG_ERR("ota_ab boot_request_upgrade failed");
 		return -EIO;
 	}
+	soft_reboot_invalidate_boot_cache();
 #endif
 
-	soft_reboot_schedule(SOFT_REBOOT_FW_UPGRADE, from, target);
+	{
+		char tagged[16];
+
+		ota_channel_note_source(ota_channel_get());
+		ota_channel_format_outcome(tagged, sizeof(tagged), "reboot");
+		soft_reboot_schedule_ota(SOFT_REBOOT_FW_UPGRADE, from, target, tagged);
+	}
 	LOG_INF("ota_ab staged %u bytes for %s → %s — reboot",
 		ctx != NULL ? (unsigned)flash_img_bytes_written(ctx) : 0U,
 		soft_reboot_partition_label(from), soft_reboot_partition_label(target));

@@ -17,13 +17,15 @@
 
 #include "stall_watchdog.h"
 
+#include "appdata_layout.h"
+
 LOG_MODULE_REGISTER(crash_ring, LOG_LEVEL_INF);
 
-#define CRASH_RING_PARTITION   scratch_partition
-#define CRASH_RING_PARTITION_ID FIXED_PARTITION_ID(CRASH_RING_PARTITION)
+#define CRASH_RING_PARTITION   appdata_partition
+#define CRASH_RING_PARTITION_ID PARTITION_ID(CRASH_RING_PARTITION)
 
-#if !FIXED_PARTITION_EXISTS(CRASH_RING_PARTITION)
-#error "crash-ring flash partition required"
+#if !PARTITION_EXISTS(CRASH_RING_PARTITION)
+#error "crash-ring requires appdata_partition (OTA-safe; not McUboot image-scratch)"
 #endif
 
 #define CRASH_HDR_MAGIC  0x43525348U /* CRSH */
@@ -31,26 +33,16 @@ LOG_MODULE_REGISTER(crash_ring, LOG_LEVEL_INF);
 #define CRASH_FLAG_PENDING 0x01U
 #define CRASH_FLAG_SOFT    0x02U
 
-#define CRASH_RING_SECTOR_BYTES 4096U
+#define CRASH_RING_SECTOR_BYTES APPDATA_SECTOR_BYTES
 /*
- * scratch_partition (256KB) layout — DO NOT move any consumer's base offset without checking
- * all of these against each other, they all share this one partition:
- *   0        : crash_ring sector A (this file, 4KB)
- *   4096     : vibro_verdict_store (verdict spool, 4KB)
- *   8192     : vibro_ref_store header (4KB)
- *   12288    : vibro_ref_store slots, VIBRO_REF_STORE_SLOTS x 4KB (20KB) -> ends at 32768
- *   32768    : crash_ring sector B (this file, 4KB)  <-- picked here, not at a contiguous
- *              offset from sector A, specifically to land in free space past every other
- *              consumer instead of colliding with vibro_verdict_store at 4096.
- *   36864+   : free
- *
- * scratch_partition is far more than the 8KB (two sectors) this needs — so we can ping-pong the
- * ring across two independent sectors instead of squeezing everything into one. See
- * persist_ring()'s doc comment for why a single shared sector isn't safe against a reset
- * landing mid-erase/write.
+ * appdata layout — see appdata_layout.h (compile-time overlap guards).
+ * Sector A @ 0, sector B @ 32768 (after vibro stores).
  */
 #define CRASH_RING_NUM_SECTORS   2U
-static const off_t g_sector_base[CRASH_RING_NUM_SECTORS] = { 0, 32768 };
+static const off_t g_sector_base[CRASH_RING_NUM_SECTORS] = {
+	APPDATA_CRASH_RING_A_OFF,
+	APPDATA_CRASH_RING_B_OFF,
+};
 
 #define CRASH_RECORD_SIZE 256U
 #define CRASH_HEADER_SIZE 32U
@@ -85,11 +77,15 @@ struct crash_ring_record {
 	uint8_t boot_part;
 	uint8_t target_part;
 	char reason[16];
-	char fw_version[24];
+	char fw_version[32];
 	char ota_outcome[16];
+	char thread_name[16];
 	uint32_t backtrace[CRASH_REPORT_BACKTRACE_MAX];
 	uint32_t crc32;
 } __packed;
+
+BUILD_ASSERT(sizeof(struct crash_ring_record) <= CRASH_RECORD_SIZE,
+	     "crash_ring_record must fit one flash slot");
 
 static struct crash_ring_header g_hdr;
 static bool g_loaded;
@@ -185,7 +181,7 @@ static int read_record(uint8_t slot, struct crash_ring_record *out)
  * in a half-erased/half-written state with no valid fallback, wiping every crash record that
  * was in it — including ones that were never touched by this particular update.
  *
- * Fix: ping-pong between two independent 4KB sectors (scratch_partition has 256KB, so this
+ * Fix: ping-pong between two independent 4KB sectors (appdata_partition has 256KB, so this
  * costs nothing). Every persist_ring() call writes a *complete* new copy (header + every still
  * valid record) into the *other* sector, and only flips g_active_sector to it after the whole
  * write succeeds. The old sector is never touched, so no matter when a reset strikes the new
@@ -369,6 +365,35 @@ int crash_ring_append_soft(const struct crash_report_info *info, const struct cr
 		return -EINVAL;
 	}
 
+	slot = (uint8_t)(g_hdr.write_idx % CRASH_RING_SLOTS);
+
+	if (info->soft && g_hdr.count >= CRASH_RING_SLOTS) {
+		struct crash_ring_record victim;
+
+		/* Never let soft:silent_hang (etc.) overwrite a hard pending fatal — that is how
+		 * the ~47m render-thread fatal vanished before the phone drained the ring. */
+		if (read_record(slot, &victim) == 0 &&
+		    (victim.flags & CRASH_FLAG_PENDING) != 0U &&
+		    (victim.flags & CRASH_FLAG_SOFT) == 0U) {
+			LOG_INF("crash ring: drop soft reason=%s — would overwrite hard pending",
+				info->reason != NULL ? info->reason : "?");
+			return 0;
+		}
+	} else if (!info->soft && g_hdr.count >= CRASH_RING_SLOTS) {
+		/* Prefer replacing a soft pending slot so fatals survive ring wrap. */
+		for (uint8_t i = 0; i < CRASH_RING_SLOTS; i++) {
+			struct crash_ring_record old;
+			const uint8_t cand = (uint8_t)((slot + i) % CRASH_RING_SLOTS);
+
+			if (read_record(cand, &old) == 0 &&
+			    (old.flags & CRASH_FLAG_PENDING) != 0U &&
+			    (old.flags & CRASH_FLAG_SOFT) != 0U) {
+				slot = cand;
+				break;
+			}
+		}
+	}
+
 	memset(&rec, 0, sizeof(rec));
 	rec.magic = CRASH_REC_MAGIC;
 	rec.seq = g_hdr.next_seq++;
@@ -388,6 +413,9 @@ int crash_ring_append_soft(const struct crash_report_info *info, const struct cr
 	snprintf(rec.reason, sizeof(rec.reason), "%s",
 		 info->reason != NULL ? info->reason : "unknown");
 	snprintf(rec.fw_version, sizeof(rec.fw_version), "%s", info->fw_version);
+	if (info->thread_name[0] != '\0') {
+		snprintf(rec.thread_name, sizeof(rec.thread_name), "%s", info->thread_name);
+	}
 	if (info->ota_outcome[0] != '\0') {
 		snprintf(rec.ota_outcome, sizeof(rec.ota_outcome), "%s", info->ota_outcome);
 	}
@@ -403,11 +431,6 @@ int crash_ring_append_soft(const struct crash_report_info *info, const struct cr
 	}
 	rec.crc32 = rec_crc(&rec);
 
-	/* No pre-check/reformat needed for a slot that already holds a record: persist_ring()
-	 * always ping-pongs to a fresh sector with every still-valid record rewritten together,
-	 * so overwriting the oldest slot when the ring wraps is safe and never touches the other
-	 * slots' data. */
-	slot = (uint8_t)(g_hdr.write_idx % CRASH_RING_SLOTS);
 	/* This slot is about to hold a brand-new record — any stale RAM-only "cleared" bit for
 	 * the record it used to hold no longer applies. */
 	g_ram_cleared_mask &= ~BIT(slot);
@@ -490,11 +513,12 @@ static int append_record_json(char *buf, size_t off, size_t len, uint8_t slot,
 	uint8_t bt_count = rec->bt_count < max_bt ? rec->bt_count : max_bt;
 
 	n = snprintf(buf + off, len - off,
-		     "{\"pending\":1,\"slot\":%u,\"seq\":%u,\"size\":%u,\"pc\":%u,\"exccause\":%u,"
-		     "\"excvaddr\":%u,\"reason\":\"%s\",\"fw\":\"%s\",\"reset\":%u,\"uptime\":%u,"
-		     "\"bt\":[",
-		     slot, rec->seq, rec->dump_size, rec->pc, rec->exccause, rec->excvaddr,
-		     rec->reason, rec->fw_version, rec->reset_reason, rec->uptime_ms);
+		     "{\"pending\":1,\"slot\":%u,\"seq\":%u,\"size\":%u,\"pc\":%u,\"pcx\":\"0x%08x\","
+		     "\"exccause\":%u,\"excvaddr\":%u,\"reason\":\"%s\",\"fw\":\"%s\",\"reset\":%u,"
+		     "\"uptime\":%u,\"th\":\"%s\",\"bt\":[",
+		     slot, rec->seq, rec->dump_size, rec->pc, rec->pc, rec->exccause, rec->excvaddr,
+		     rec->reason, rec->fw_version, rec->reset_reason, rec->uptime_ms,
+		     rec->thread_name[0] != '\0' ? rec->thread_name : "");
 	if (n <= 0 || off + (size_t)n >= len) {
 		return -ENOMEM;
 	}
@@ -615,7 +639,8 @@ int crash_ring_list_json(char *buf, size_t len)
 			}
 			buf[off++] = ',';
 		}
-		n = append_record_json(buf, off, len, s, &rec, 4U, false);
+		n = append_record_json(buf, off, len, s, &rec, 0U,
+				       (rec.flags & CRASH_FLAG_SOFT) != 0U);
 		if (n < 0) {
 			/* Out of room for this slot's full detail — stop here; the client will
 			 * pick up the remaining slot(s) on the next relay round. */

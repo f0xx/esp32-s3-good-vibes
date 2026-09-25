@@ -1,36 +1,47 @@
 #!/usr/bin/env bash
-# Bump BT_LONG_WQ_STACK_SIZE default — upstream Zephyr issue #92224: default
-# 1300 (BT_GATT_CACHING=y case) overflows on connect-time deferred HCI work,
-# corrupting adjacent memory. Symbol is hidden (no prompt), so it can't be
-# overridden from prj.conf; patch the Kconfig default directly.
-#
-# Bumped again 1300 -> 2048 -> 3072: this WQ runs deferred GATT/HCI work,
-# which for this app can include our own config-service write callbacks
-# (vibro reference start/stop, offload ACK). 2048 was still marginal enough
-# to contribute to sporadic double-exception/WDT resets; the big stack
-# buffers that used to run on this path were since moved to static storage
-# (see vibro_capture.c / vibro_band_rms.c), but keep extra headroom here too.
+# Force BT_LONG_WQ_STACK_SIZE — upstream Zephyr issue #92224 + local desk data:
+# default chain is NO_OPTIMIZATIONS→4096, BT_ECC→1400, BT_GATT_CACHING→1300.
+# With BT_ECC=y the 1400 default wins and thread_analyzer shows 98% use
+# (unused 28 / 1408) overnight — overflow there smashes adjacent stacks
+# (render Invalid SP / LoadProhibited@0). Symbol is prompt-less so prj.conf
+# cannot override; patch Kconfig defaults directly.
 set -euo pipefail
 
 ZEPHYR_ROOT="${1:?usage: apply-bt-long-wq-stack.sh ZEPHYR_ROOT}"
 KCONFIG="$ZEPHYR_ROOT/subsys/bluetooth/host/Kconfig"
+WANT=3072
 
-if grep -q 'default 3072 if BT_GATT_CACHING' "$KCONFIG"; then
-	echo "BT_LONG_WQ_STACK_SIZE patch already applied"
+if grep -qE "default ${WANT} if BT_ECC" "$KCONFIG" && \
+   grep -qE "default ${WANT} if BT_GATT_CACHING" "$KCONFIG"; then
+	echo "BT_LONG_WQ_STACK_SIZE patch already applied (-> ${WANT})"
 	exit 0
 fi
 
-python3 - "$KCONFIG" <<'PY'
+python3 - "$KCONFIG" "$WANT" <<'PY'
+import re
 import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
+want = sys.argv[2]
 text = path.read_text()
-old_needles = ("\tdefault 1300 if BT_GATT_CACHING\n", "\tdefault 2048 if BT_GATT_CACHING\n")
-found = next((n for n in old_needles if n in text), None)
-if found is None:
-    raise SystemExit("ERROR: BT_LONG_WQ_STACK_SIZE default line not found")
-text = text.replace(found, "\tdefault 3072 if BT_GATT_CACHING\n")
-path.write_text(text)
-print("Applied BT_LONG_WQ_STACK_SIZE patch (-> 3072)")
+# Replace the whole default block inside BT_LONG_WQ_STACK_SIZE.
+pat = re.compile(
+    r"(config BT_LONG_WQ_STACK_SIZE\n"
+    r"\tint \"Long workqueue stack size\.\"\n)"
+    r"(?:\tdefault [^\n]+\n)+",
+    re.M,
+)
+repl = (
+    rf"\1"
+    rf"\tdefault {want} if NO_OPTIMIZATIONS\n"
+    rf"\tdefault {want} if BT_ECC\n"
+    rf"\tdefault {want} if BT_GATT_CACHING\n"
+    rf"\tdefault {want}\n"
+)
+new, n = pat.subn(repl, text, count=1)
+if n != 1:
+    raise SystemExit("ERROR: BT_LONG_WQ_STACK_SIZE default block not found")
+path.write_text(new)
+print(f"Applied BT_LONG_WQ_STACK_SIZE patch (-> {want}, including BT_ECC)")
 PY

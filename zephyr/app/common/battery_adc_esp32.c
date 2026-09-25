@@ -1,14 +1,16 @@
 /*
- * Battery ADC — Zephyr channel setup + IDF esp_adc_cal (Arduino analogReadMilliVolts parity).
+ * Battery ADC — Zephyr ADC DT channel only (no IDF esp_adc_cal; removed in
+ * Zephyr 4.x / newer Espressif HAL ports).
  */
 
 #include "battery_adc_esp32.h"
 
-#include <esp_adc_cal.h>
+#include <stddef.h>
 
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/adc.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/util.h>
 
 LOG_MODULE_REGISTER(bat_adc, LOG_LEVEL_INF);
 
@@ -17,15 +19,12 @@ LOG_MODULE_REGISTER(bat_adc, LOG_LEVEL_INF);
 #endif
 
 static const struct adc_dt_spec g_bat_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 0);
-static esp_adc_cal_characteristics_t g_chars;
 static bool g_ready;
-static bool g_cal_ok;
 
 int battery_adc_init(void)
 {
 	int raw = 0;
 	uint16_t mv = 0;
-	esp_adc_cal_value_t cal_type;
 
 	if (!adc_is_ready_dt(&g_bat_adc)) {
 		LOG_ERR("battery ADC device not ready");
@@ -37,37 +36,43 @@ int battery_adc_init(void)
 		return -EIO;
 	}
 
-	cal_type = esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100,
-					    &g_chars);
-	g_cal_ok = cal_type < ESP_ADC_CAL_VAL_NOT_SUPPORTED;
 	g_ready = true;
 
-	battery_adc_read_raw(&raw);
-	battery_adc_read_mv(&mv);
-	LOG_INF("battery probe raw=%d adc=%umV cal=%d ok=%d", raw, mv, (int)cal_type, g_cal_ok);
+	(void)battery_adc_read_raw(&raw);
+	(void)battery_adc_read_mv(&mv);
+	LOG_INF("battery probe raw=%d adc=%umV (zephyr adc_raw_to_millivolts_dt)", raw, mv);
 	return 0;
 }
 
 bool battery_adc_cal_ok(void)
 {
-	return g_cal_ok;
+	return g_ready;
 }
 
 int battery_adc_read_raw(int *raw_out)
 {
-	int raw;
+	int16_t buf = 0;
+	struct adc_sequence seq = {
+		.buffer = &buf,
+		.buffer_size = sizeof(buf),
+	};
+	int err;
 
 	if (!g_ready) {
 		return -EIO;
 	}
 
-	raw = adc1_get_raw(ADC1_CHANNEL_0);
-	if (raw < 0) {
-		return -EIO;
+	err = adc_sequence_init_dt(&g_bat_adc, &seq);
+	if (err) {
+		return err;
+	}
+	err = adc_read_dt(&g_bat_adc, &seq);
+	if (err) {
+		return err;
 	}
 
 	if (raw_out != NULL) {
-		*raw_out = raw;
+		*raw_out = (int)buf;
 	}
 	return 0;
 }
@@ -75,24 +80,31 @@ int battery_adc_read_raw(int *raw_out)
 int battery_adc_read_mv(uint16_t *mv_out)
 {
 	int raw = 0;
-	uint32_t mv = 0;
+	int32_t mv = 0;
+	int err;
 
-	if (!g_ready || !g_cal_ok) {
+	if (!g_ready) {
 		return -EIO;
 	}
 
-	if (battery_adc_read_raw(&raw) != 0) {
-		return -EIO;
+	err = battery_adc_read_raw(&raw);
+	if (err) {
+		return err;
 	}
 
-	mv = esp_adc_cal_raw_to_voltage((uint32_t)raw, &g_chars);
+	mv = raw;
+	err = adc_raw_to_millivolts_dt(&g_bat_adc, &mv);
+	if (err) {
+		return err;
+	}
+
 	if (mv_out != NULL) {
-		*mv_out = (uint16_t)mv;
+		*mv_out = (uint16_t)CLAMP(mv, 0, 65535);
 	}
 	return 0;
 }
 
 int battery_adc_debug_atten(void)
 {
-	return (int)ADC_ATTEN_DB_11;
+	return 11; /* historical ADC_ATTEN_DB_11 marker for logs */
 }

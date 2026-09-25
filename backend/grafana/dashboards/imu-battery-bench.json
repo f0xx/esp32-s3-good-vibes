@@ -1,0 +1,289 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "imu-pg"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT label AS \"Session\"\nFROM battery_bench_sessions\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND session_id = ${session_id:raw}\nLIMIT 1",
+          "refId": "A"
+        }
+      ],
+      "title": "Session label",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "imu-pg"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 8,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT COUNT(*) AS samples\nFROM battery_bench_samples\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND session_id = ${session_id:raw}",
+          "refId": "A"
+        }
+      ],
+      "title": "Samples",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "imu-pg"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT ROUND(AVG(est_ma)::numeric, 1) AS \"mA\"\nFROM battery_bench_samples\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND session_id = ${session_id:raw}\n  AND est_ma IS NOT NULL",
+          "refId": "A"
+        }
+      ],
+      "title": "Avg est. current (mA)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "imu-pg"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "volt"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "id": 4,
+      "targets": [
+        {
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts_ms AS time, voltage AS \"Voltage (V)\"\nFROM battery_bench_samples\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND session_id = ${session_id:raw}\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
+          "refId": "A"
+        }
+      ],
+      "title": "Cell voltage",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "imu-pg"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "max": 100,
+          "min": 0
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "id": 5,
+      "targets": [
+        {
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts_ms AS time, pct AS \"Battery %\"\nFROM battery_bench_samples\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND session_id = ${session_id:raw}\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
+          "refId": "A"
+        }
+      ],
+      "title": "Battery %",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "imu-pg"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "mamp"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
+      "id": 6,
+      "targets": [
+        {
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts_ms AS time, est_ma AS \"Est. current (mA)\"\nFROM battery_bench_samples\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND session_id = ${session_id:raw}\n  AND est_ma IS NOT NULL\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
+          "refId": "A"
+        }
+      ],
+      "title": "Estimated discharge current (dV/dt)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "imu-pg"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "id": 7,
+      "targets": [
+        {
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts_ms AS time, trend_v AS \"dV trend (V/sample)\"\nFROM battery_bench_samples\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND session_id = ${session_id:raw}\n  AND ts_ms >= $__from AND ts_ms <= $__to\nORDER BY ts_ms",
+          "refId": "A"
+        }
+      ],
+      "title": "Voltage trend",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "imu-pg"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 20
+      },
+      "id": 8,
+      "targets": [
+        {
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT ts_ms, seq, voltage, pct, est_ma, cpu_mhz, imu_hz, render_hz, uptime_ms\nFROM battery_bench_samples\nWHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}')\n  AND session_id = ${session_id:raw}\nORDER BY seq DESC\nLIMIT 200",
+          "refId": "A"
+        }
+      ],
+      "title": "Recent samples",
+      "type": "table"
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": [
+    "imu",
+    "battery",
+    "bench"
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "device",
+        "type": "query",
+        "datasource": {
+          "type": "postgres",
+          "uid": "imu-pg"
+        },
+        "query": "SELECT DISTINCT device_id FROM battery_bench_sessions ORDER BY 1",
+        "refresh": 1,
+        "includeAll": true,
+        "definition": "SELECT DISTINCT device_id FROM battery_bench_sessions ORDER BY 1",
+        "allValue": "All",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "All"
+        }
+      },
+      {
+        "name": "session_id",
+        "type": "query",
+        "datasource": {
+          "type": "postgres",
+          "uid": "imu-pg"
+        },
+        "query": "SELECT session_id::text FROM battery_bench_sessions WHERE ('${device:raw}' = 'All' OR device_id = '${device:raw}') ORDER BY started_ms DESC LIMIT 20",
+        "refresh": 1,
+        "includeAll": false
+      }
+    ]
+  },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "title": "ESP32 Battery Bench",
+  "uid": "imu-battery-bench",
+  "version": 1
+}

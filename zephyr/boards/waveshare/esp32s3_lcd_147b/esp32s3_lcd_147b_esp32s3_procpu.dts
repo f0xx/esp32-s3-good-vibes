@@ -65,7 +65,10 @@
 		st7789v: st7789v@0 {
 			compatible = "sitronix,st7789v";
 			reg = <0>;
-			mipi-max-frequency = <40000000>;
+			/* GPIO-matrix SPI2 (CLK 40 / MOSI 45 / CS 42), not the FSPI
+			 * IO_MUX pins. Matrix routing is specified to 20 MHz;
+			 * 40 MHz here double-faulted the PRO CPU (invalid SP). */
+			mipi-max-frequency = <20000000>;
 			width = <172>;
 			height = <320>;
 			x-offset = <34>;
@@ -85,7 +88,7 @@
 			nvgam-param = [d0 00 02 07 0a 28 31 54 47 0e 1c 17 1b 1e];
 			ram-param = [00 E0];
 			rgb-param = [40 02 14];
-			mipi-mode = <MIPI_DBI_MODE_SPI_4WIRE>;
+			mipi-mode = "MIPI_DBI_MODE_SPI_4WIRE";
 		};
 	};
 };
@@ -105,29 +108,39 @@
 			read-only;
 		};
 
+		/* 3 MiB slots so a desk -Og image fits. 16 MB flash; the tail
+		 * (scratch/NVS/coredump/appdata) moved up. A USB reflash is
+		 * required — old absolute NVS/appdata offsets are not reused. */
 		slot0_partition: partition@10000 {
 			label = "image-0";
-			reg = <0x00010000 0x00100000>;
+			reg = <0x00010000 0x00300000>;
 		};
 
-		slot1_partition: partition@110000 {
+		slot1_partition: partition@310000 {
 			label = "image-1";
-			reg = <0x00110000 0x00100000>;
+			reg = <0x00310000 0x00300000>;
 		};
 
-		scratch_partition: partition@210000 {
+		/* McUboot SWAP_USING_SCRATCH only — never store app data here. */
+		scratch_partition: partition@610000 {
 			label = "image-scratch";
-			reg = <0x00210000 0x00040000>;
+			reg = <0x00610000 0x00040000>;
 		};
 
-		storage_partition: partition@250000 {
+		storage_partition: partition@650000 {
 			label = "storage";
-			reg = <0x00250000 0x00004800>;
+			reg = <0x00650000 0x00008000>;
 		};
 
-		coredump_partition: partition@255000 {
+		coredump_partition: partition@658000 {
 			label = "coredump-partition";
-			reg = <0x00255000 DT_SIZE_K(16)>;
+			reg = <0x00658000 DT_SIZE_K(16)>;
+		};
+
+		/* Survives OTA: vibro refs, crash ring, verdict spool (was wrongly on scratch). */
+		appdata_partition: partition@65c000 {
+			label = "app-data";
+			reg = <0x0065c000 0x00040000>;
 		};
 	};
 };
@@ -147,6 +160,7 @@
 &i2c0 {
 	status = "okay";
 	clock-frequency = <I2C_BITRATE_FAST>;
+	scl-timeout-us = <20000>;
 	pinctrl-0 = <&i2c0_default>;
 	pinctrl-names = "default";
 };

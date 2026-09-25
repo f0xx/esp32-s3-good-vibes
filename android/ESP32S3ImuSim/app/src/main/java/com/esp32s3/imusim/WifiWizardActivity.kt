@@ -28,6 +28,8 @@ class WifiWizardActivity : AppCompatActivity() {
     private lateinit var serviceController: ImuServiceController
     private var imuService: IImuBleService? = null
     private var bleConnected = false
+    private var expectScanAcrossDisconnect = false
+    private var pendingScan = false
 
     private lateinit var toolbar: MaterialToolbar
     private lateinit var statusLine: TextView
@@ -67,17 +69,30 @@ class WifiWizardActivity : AppCompatActivity() {
             }
         }
 
-        when (intent.getStringExtra(EXTRA_START)) {
-            START_SCAN -> showScreen(Screen.SCAN, requestScan = true)
-            START_PROFILES -> showScreen(Screen.PROFILES, requestProfiles = true)
+        when {
+            intent.wantsWifiScan() -> showScreen(Screen.SCAN, requestScan = true)
+            intent.getStringExtra(EXTRA_START) == START_PROFILES ->
+                showScreen(Screen.PROFILES, requestProfiles = true)
             else -> showScreen(Screen.HUB)
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.wantsWifiScan()) {
+            showScreen(Screen.SCAN, requestScan = true)
         }
     }
 
     override fun onStart() {
         super.onStart()
         if (::serviceController.isInitialized) {
+            serviceController.setUiVisible(true)
             serviceController.requestState()
+            if (screen == Screen.SCAN) {
+                pullScanFromSessionOrPrefs()
+            }
         }
     }
 
@@ -89,7 +104,11 @@ class WifiWizardActivity : AppCompatActivity() {
     private val serviceEvents = object : ImuServiceController.Events {
         override fun onServiceReady(service: IImuBleService) {
             imuService = service
+            serviceController.setUiVisible(true)
             serviceController.requestState()
+            if (pendingScan) {
+                startScan()
+            }
         }
 
         override fun onSessionRestore(snapshot: Bundle) {
@@ -105,9 +124,21 @@ class WifiWizardActivity : AppCompatActivity() {
         override fun onConnectionChanged(connected: Boolean) {
             bleConnected = connected
             if (!connected) {
-                setStatus(getString(R.string.wifi_ble_required))
+                if (expectScanAcrossDisconnect) {
+                    setStatus(getString(R.string.wifi_scan_ble_paused))
+                } else {
+                    setStatus(getString(R.string.wifi_ble_required))
+                }
+            } else if (pendingScan) {
+                startScan()
+            } else if (expectScanAcrossDisconnect) {
+                setStatus(getString(R.string.wifi_scanning))
+                /* ESP finished while we were dropped — pull cached SCAN JSON. */
+                pollScanAfterReconnect()
             }
         }
+
+        override fun onCaps(caps: Int) {}
 
         override fun onPowerStatus(power: ImuProtocol.PowerStatus) {}
 
@@ -132,10 +163,7 @@ class WifiWizardActivity : AppCompatActivity() {
 
         override fun onNetScan(json: String) {
             runOnUiThread {
-                scanJson = json
-                if (screen == Screen.SCAN) {
-                    renderScanScreen()
-                }
+                applyScanJson(json, fromLive = true)
             }
         }
 
@@ -152,6 +180,15 @@ class WifiWizardActivity : AppCompatActivity() {
             runOnUiThread {
                 netStatusJson = json
                 updateNetStatusLine(json)
+                val st = runCatching { NetProtocol.parseStatus(json).state }.getOrNull()
+                /* scan_done notify can arrive while SCAN list still shows the local
+                 * scanning:1 placeholder — pull the service/session cache immediately. */
+                if (st == "scan_done" || st == "scan_failed") {
+                    expectScanAcrossDisconnect = false
+                    scanPollRunnable?.let { statusLine.removeCallbacks(it) }
+                    scanPollRunnable = null
+                    pullScanFromSessionOrPrefs()
+                }
                 if (screen == Screen.PROV) {
                     renderProvStatus()
                 }
@@ -161,20 +198,70 @@ class WifiWizardActivity : AppCompatActivity() {
 
     private fun applySnapshot(snap: Bundle) {
         bleConnected = snap.getBoolean(ImuSessionStore.KEY_CONNECTED, false)
-        snap.getString(ImuSessionStore.KEY_LAST_NET_SCAN)?.let { scanJson = it }
+        snap.getString(ImuSessionStore.KEY_LAST_NET_SCAN)?.let { applyScanJson(it, fromLive = false) }
         snap.getString(ImuSessionStore.KEY_LAST_NET_PROFILES)?.let { profilesJson = it }
         snap.getString(ImuSessionStore.KEY_LAST_NET_STATUS)?.let {
             netStatusJson = it
             updateNetStatusLine(it)
         }
-        if (bleConnected) {
+        if (expectScanAcrossDisconnect && bleConnected) {
+            setStatus(getString(R.string.wifi_scanning))
+        } else if (bleConnected) {
             setStatus(
                 snap.getString(ImuSessionStore.KEY_RELAY_CAPTION)
                     ?: getString(R.string.notification_connected),
             )
+        } else if (expectScanAcrossDisconnect) {
+            setStatus(getString(R.string.wifi_scan_ble_paused))
         } else {
             setStatus(getString(R.string.wifi_ble_required))
         }
+    }
+
+    /** Prefer non-empty AP lists over the local scanning:1 placeholder. */
+    private fun applyScanJson(json: String, fromLive: Boolean) {
+        val incomingAps = runCatching { NetProtocol.parseScan(json) }.getOrElse { emptyList() }
+        val incomingScanning = json.contains("\"scanning\":1")
+        val curAps = runCatching { NetProtocol.parseScan(scanJson ?: "") }.getOrElse { emptyList() }
+
+        if (incomingScanning && incomingAps.isEmpty() && curAps.isNotEmpty()) {
+            /* Keep prior rows visible while a new scan is in flight. */
+            scanJson = scanJson!!.replace(Regex("\"scanning\"\\s*:\\s*\\d"), "\"scanning\":1").let {
+                if (it.contains("\"scanning\"")) it else it.replace(Regex("\\}\\s*$"), ",\"scanning\":1}")
+            }
+        } else {
+            scanJson = json
+        }
+
+        if (!incomingScanning) {
+            expectScanAcrossDisconnect = false
+            scanPollRunnable?.let { statusLine.removeCallbacks(it) }
+            scanPollRunnable = null
+        }
+
+        if (screen == Screen.SCAN) {
+            val aps = runCatching { NetProtocol.parseScan(scanJson ?: "") }.getOrElse { emptyList() }
+            if (!incomingScanning || aps.isNotEmpty()) {
+                setStatus(
+                    if (aps.isEmpty()) {
+                        getString(R.string.wifi_scan_empty)
+                    } else if (incomingScanning) {
+                        getString(R.string.wifi_scanning) + " · ${aps.size}"
+                    } else {
+                        getString(R.string.wifi_scan_title) + " · ${aps.size}"
+                    },
+                )
+            }
+            renderScanScreen()
+        }
+    }
+
+    private fun pullScanFromSessionOrPrefs() {
+        val fromPrefs = sessionStore.lastNetScanJson
+        if (!fromPrefs.isNullOrBlank()) {
+            applyScanJson(fromPrefs, fromLive = false)
+        }
+        serviceController.requestState()
     }
 
     private fun showScreen(
@@ -250,10 +337,82 @@ class WifiWizardActivity : AppCompatActivity() {
         return false
     }
 
+    private var scanPollRunnable: Runnable? = null
+
+    private fun pollScanAfterReconnect() {
+        scanPollRunnable?.let { statusLine.removeCallbacks(it) }
+        var attempt = 0
+        val poll = object : Runnable {
+            override fun run() {
+                if (!expectScanAcrossDisconnect || !bleConnected) return
+                pullScanFromSessionOrPrefs()
+                attempt++
+                val haveAps = runCatching {
+                    NetProtocol.parseScan(scanJson ?: "").isNotEmpty()
+                }.getOrDefault(false)
+                val stillScanning = scanJson?.contains("\"scanning\":1") == true
+                if (haveAps && !stillScanning) {
+                    expectScanAcrossDisconnect = false
+                    return
+                }
+                if (attempt < 12 && expectScanAcrossDisconnect) {
+                    statusLine.postDelayed(this, 1_200L)
+                } else if (expectScanAcrossDisconnect) {
+                    expectScanAcrossDisconnect = false
+                    if (!haveAps) {
+                        scanJson = """{"aps":[],"scanning":0}"""
+                        if (screen == Screen.SCAN) renderScanScreen()
+                        setStatus(getString(R.string.wifi_scan_empty))
+                    } else if (screen == Screen.SCAN) {
+                        renderScanScreen()
+                    }
+                }
+            }
+        }
+        scanPollRunnable = poll
+        statusLine.postDelayed(poll, 500L)
+    }
+
     private fun startScan() {
-        if (!requireBle()) return
+        if (!requireBle()) {
+            pendingScan = true
+            setStatus(getString(R.string.wifi_scanning))
+            return
+        }
+        pendingScan = false
+        expectScanAcrossDisconnect = true
+        /* Do not wipe prior APs — ESP drops BLE for airtime and the UI would flash empty. */
+        val prior = scanJson
+        scanJson = when {
+            prior != null && prior.contains("\"aps\"") ->
+                if (prior.contains("\"scanning\"")) {
+                    prior.replace(Regex("\"scanning\"\\s*:\\s*\\d"), "\"scanning\":1")
+                } else {
+                    prior.replace(Regex("\\}\\s*$"), ",\"scanning\":1}")
+                }
+            else -> """{"aps":[],"scanning":1}"""
+        }
         setStatus(getString(R.string.wifi_scanning))
+        if (screen == Screen.SCAN) renderScanScreen()
         imuService?.requestNetScan()
+        statusLine.postDelayed({
+            if (!expectScanAcrossDisconnect) return@postDelayed
+            pullScanFromSessionOrPrefs()
+            if (!expectScanAcrossDisconnect) return@postDelayed
+            if (scanJson != null && !scanJson!!.contains("\"scanning\":1")) return@postDelayed
+            val haveAps = runCatching {
+                NetProtocol.parseScan(scanJson ?: "").isNotEmpty()
+            }.getOrDefault(false)
+            expectScanAcrossDisconnect = false
+            if (haveAps) {
+                scanJson = scanJson!!.replace(Regex("\"scanning\"\\s*:\\s*\\d"), "\"scanning\":0")
+                if (screen == Screen.SCAN) renderScanScreen()
+                return@postDelayed
+            }
+            scanJson = """{"aps":[],"scanning":0}"""
+            if (screen == Screen.SCAN) renderScanScreen()
+            setStatus(getString(R.string.wifi_scan_empty))
+        }, 35_000L)
     }
 
     private fun startProfiles() {
@@ -290,9 +449,9 @@ class WifiWizardActivity : AppCompatActivity() {
 
     private fun renderScanScreen() {
         val json = scanJson
-        val progress = findViewById<ProgressBar>(R.id.wifiListProgress)
-        val hint = findViewById<TextView>(R.id.wifiListHint)
-        val list = findViewById<RecyclerView>(R.id.wifiList)
+        val progress = findViewById<ProgressBar>(R.id.wifiListProgress) ?: return
+        val hint = findViewById<TextView>(R.id.wifiListHint) ?: return
+        val list = findViewById<RecyclerView>(R.id.wifiList) ?: return
         list.layoutManager = LinearLayoutManager(this)
 
         if (json == null) {
@@ -305,7 +464,7 @@ class WifiWizardActivity : AppCompatActivity() {
 
         val scanning = json.contains("\"scanning\":1")
         val aps = runCatching { NetProtocol.parseScan(json) }.getOrElse { emptyList() }
-        progress.visibility = if (scanning && aps.isEmpty()) View.VISIBLE else View.GONE
+        progress.visibility = if (scanning) View.VISIBLE else View.GONE
         hint.visibility = if (aps.isEmpty()) View.VISIBLE else View.GONE
         hint.text = if (scanning) getString(R.string.wifi_scanning) else getString(R.string.wifi_scan_empty)
 
@@ -479,5 +638,10 @@ class WifiWizardActivity : AppCompatActivity() {
         const val EXTRA_START = "wifi_start"
         const val START_SCAN = "scan"
         const val START_PROFILES = "profiles"
+        const val ACTION_WIFI_SCAN = "com.esp32s3.imusim.WIFI_SCAN"
+    }
+
+    private fun Intent.wantsWifiScan(): Boolean {
+        return action == ACTION_WIFI_SCAN || getStringExtra(EXTRA_START) == START_SCAN
     }
 }

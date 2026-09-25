@@ -8,7 +8,7 @@
 #
 # Frozen runner contract (Cast PHP should docker-run this image, not grow
 # androidcast-ci). Desk still flashes; cluster never sees /dev/ttyACM0.
-#   image:      imu-zephyr-ci:0.16.8
+#   image:      imu-zephyr-ci:1.0.3
 #   name:       imu-zephyr-bld-$BUILD_ID   (never androidcast-bld-*)
 #   jobs:       IMU_BUILD_JOBS, default nproc/2 (do not preempt Cast)
 #   mounts:     repo→/src, west tree→/zephyrproject, artifacts→/out
@@ -25,7 +25,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMU_REPO="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ZEPHYR_PROJECT="${ZEPHYR_PROJECT:-$HOME/zephyrproject}"
 APP="${1:-handshake}"
-IMAGE="${IMU_ZEPHYR_IMAGE:-imu-zephyr-ci:0.16.8}"
+IMAGE="${IMU_ZEPHYR_IMAGE:-imu-zephyr-ci:1.0.3}"
 DOCKERFILE="$IMU_REPO/zephyr/docker/Dockerfile.esp32s3-zephyr"
 OUT_DIR="${IMU_OUT_DIR:-$IMU_REPO/out/zephyr}"
 NPROC="$(nproc)"
@@ -51,7 +51,14 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
 fi
 
 mkdir -p "$OUT_DIR"
-echo "[docker-west] APP=$APP jobs=$BUILD_JOBS container=$CONTAINER_NAME"
+# dev OTA → crash-debug when caller did not set CRASH_DEBUG. Staging is release.
+if [[ -z "${CRASH_DEBUG:-}" ]]; then
+  case "$(echo "${OTA_CHANNEL:-imu}" | tr '[:upper:]' '[:lower:]')" in
+    dev) CRASH_DEBUG=1 ;;
+    *) CRASH_DEBUG=0 ;;
+  esac
+fi
+echo "[docker-west] APP=$APP jobs=$BUILD_JOBS container=$CONTAINER_NAME CRASH_DEBUG=$CRASH_DEBUG OTA_CHANNEL=${OTA_CHANNEL:-}"
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 # Host uid so HCI patches on the bind-mounted west tree are not left root-owned.
 docker run --rm --name "$CONTAINER_NAME" \
@@ -67,7 +74,10 @@ docker run --rm --name "$CONTAINER_NAME" \
   -e BUILD_JOBS="$BUILD_JOBS" \
   -e BUILD_DIR=/tmp/zephyr-build \
   -e PRISTINE="${PRISTINE:-1}" \
-  -e CRASH_DEBUG="${CRASH_DEBUG:-1}" \
+  -e CRASH_DEBUG="${CRASH_DEBUG}" \
+  -e OTA_CHANNEL="${OTA_CHANNEL:-}" \
+  -e FW_OTA_VERSION_NAME="${FW_OTA_VERSION_NAME:-}" \
+  -e FW_OTA_VERSION_CODE="${FW_OTA_VERSION_CODE:-}" \
   -e SB_CONFIG_BOOT_SIGNATURE_KEY_FILE=/src/zephyr/mcuboot/root-ec-p256.pem \
   -e HOME=/tmp \
   -w /src \

@@ -18,6 +18,7 @@ static const struct pwm_dt_spec bl_pwm = PWM_DT_SPEC_GET(BACKLIGHT_NODE);
 
 static uint8_t g_percent = PANEL_TFT_BL_DEFAULT_PERCENT;
 static bool g_on = true;
+static bool g_hold_off;
 
 static int apply_pwm(uint8_t percent)
 {
@@ -55,9 +56,42 @@ int panel_backlight_init(void)
 	return err;
 }
 
+void panel_backlight_hold_off(bool hold)
+{
+	if (hold == g_hold_off) {
+		if (hold && device_is_ready(bl_pwm.dev)) {
+			(void)pwm_set_pulse_dt(&bl_pwm, 0);
+		}
+		return;
+	}
+
+	g_hold_off = hold;
+	if (!device_is_ready(bl_pwm.dev)) {
+		return;
+	}
+
+	if (hold) {
+		(void)pwm_set_pulse_dt(&bl_pwm, 0);
+		LOG_INF("backlight held off (LED debug)");
+		return;
+	}
+
+	LOG_INF("backlight hold released — restore %s", g_on ? "on" : "off");
+	if (g_on) {
+		(void)apply_pwm(g_percent);
+	} else {
+		(void)pwm_set_pulse_dt(&bl_pwm, 0);
+	}
+}
+
 void panel_backlight_reapply(void)
 {
 	if (!device_is_ready(bl_pwm.dev)) {
+		return;
+	}
+
+	if (g_hold_off) {
+		(void)pwm_set_pulse_dt(&bl_pwm, 0);
 		return;
 	}
 
@@ -86,11 +120,13 @@ void panel_backlight_reapply(void)
 void panel_backlight_set_on(bool on)
 {
 	g_on = on;
-	if (on) {
-		(void)apply_pwm(g_percent);
-	} else {
-		(void)pwm_set_pulse_dt(&bl_pwm, 0);
+	if (g_hold_off || !on) {
+		if (device_is_ready(bl_pwm.dev)) {
+			(void)pwm_set_pulse_dt(&bl_pwm, 0);
+		}
+		return;
 	}
+	(void)apply_pwm(g_percent);
 }
 
 bool panel_backlight_is_on(void)
@@ -101,9 +137,10 @@ bool panel_backlight_is_on(void)
 void panel_backlight_set_percent(uint8_t percent)
 {
 	g_percent = percent;
-	if (g_on) {
-		(void)apply_pwm(g_percent);
+	if (g_hold_off || !g_on) {
+		return;
 	}
+	(void)apply_pwm(g_percent);
 }
 
 uint8_t panel_backlight_percent(void)

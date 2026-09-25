@@ -66,6 +66,7 @@ class ConfigEditorActivity : AppCompatActivity() {
             override fun onConnectionChanged(connected: Boolean) {
                 if (!connected) summaryText.text = "Connect BLE first"
             }
+            override fun onCaps(caps: Int) {}
             override fun onStatus(text: String) {}
             override fun onPowerStatus(power: ImuProtocol.PowerStatus) {}
             override fun onBatchJson(batchJson: String) {}

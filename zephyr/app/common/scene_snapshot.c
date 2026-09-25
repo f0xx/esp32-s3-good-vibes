@@ -1,3 +1,4 @@
+#include <stddef.h>
 #include "imu_sample.h"
 #include "scene_snapshot.h"
 #include "scene_zoom.h"

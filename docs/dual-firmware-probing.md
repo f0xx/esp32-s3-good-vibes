@@ -1,106 +1,89 @@
-# Dual-firmware probing — Arduino vs Zephyr
+# Dual-firmware probing — Zephyr vs Arduino
 
-Both firmware tracks stay in this repo so you can flash either image and probe the board from the Android app or nRF Connect.
+This repo still contains two firmware trees. **Only one image runs at a time.** Flash the
+track you want before scanning.
 
-| Track | Path | BLE name | Mobile handshake |
-|-------|------|----------|------------------|
-| **Arduino (production)** | `esp32_s3_imu_basics/` | `ESP32S3 IMU sim` | Full IMU + config + net + OTA |
-| **Zephyr smoke** | `zephyr/app/smoke/` | `WS147B-Zephyr` | Advertising only (HW sanity) |
-| **Zephyr handshake** | `zephyr/app/handshake/` | `ESP32S3 IMU sim` | IMU GATT stub (Z5) — app connects |
+| Track | Path | BLE name | Role today |
+|-------|------|----------|------------|
+| **Zephyr handshake** | `zephyr/app/handshake/` | `ESP32S3 IMU sim` | **Production.** Full IMU, scene, GATT (IMU / NET / config / OTA / crash), WiFi, A/B OTA, crash ring |
+| **Zephyr smoke** | `zephyr/app/smoke/` | `WS147B-Zephyr` | Hardware sanity only (LCD / BOOT / advertise). The Android app will not connect |
+| **Arduino production** | `esp32_s3_imu_basics/` | `ESP32S3 IMU sim` | **Frozen reference.** Battery curve and early UI. Do not ship new features here |
 
-Only one image runs at a time. Flash the track you want before scanning.
+Desk USB and cloud OTA both target **Zephyr handshake**. Cloud / phone / A/B detail:
+**[zephyr-ota.md](zephyr-ota.md)** (PDF: [zephyr-ota.pdf](zephyr-ota.pdf)).
 
----
-
-## Revert / restore Arduino
-
-Full 16 MB backup (recommended before first Zephyr flash):
-
-```bash
-./backups/restore-arduino-fullflash.sh
-# or
-./esp32_s3_imu_basics/scripts/build.sh production --upload
-```
-
-See `backups/LATEST` for SHA256 of the golden image.
+When Zephyr handshake and Arduino share the BLE name, power only one board nearby.
 
 ---
 
-## Flash Arduino (bare-metal)
+## Flash Zephyr handshake (default)
+
+West does not tolerate spaces in `BOARD_ROOT`. Use the helper (symlinks under `~/zephyrproject/`):
 
 ```bash
-./esp32_s3_imu_basics/scripts/build.sh production --upload
-```
-
-Expected after boot:
-
-- LCD scene / IMU UI (production app)
-- WS2812 acrylic via RMT (`rgbLedWrite` on GPIO38)
-- BLE advertises **`ESP32S3 IMU sim`** with IMU service UUID `4a6e0001-…`
-
----
-
-## Flash Zephyr handshake (mobile app parity stub)
-
-West does not tolerate spaces in `BOARD_ROOT`; use the helper script (symlinks under `~/zephyrproject/`):
-
-```bash
-chmod +x zephyr/scripts/flash-zephyr.sh
 PORT=/dev/ttyACM0 zephyr/scripts/flash-zephyr.sh handshake
 ```
 
-Manual equivalent (replace `/path/to/esp32-s3-imu-basics` with your clone):
+That writes **MCUboot @ 0x0** plus a **signed** image in slot A (`image-0`). After boot, serial
+must show `crash ring ready`, `handshake vNN` (or a cloud `00.0001.0000.NNNNN` stamp), and
+`BOOT armed (released=1)`.
 
-```bash
-source ~/zephyrproject/.venv/bin/activate && source ~/.zephyrrc
-REPO="/path/to/esp32-s3-imu-basics"
-ln -sfn "$REPO/zephyr/app/handshake" ~/zephyrproject/waveshare-handshake
-ln -sfn "$REPO/zephyr" ~/zephyrproject/waveshare-board-root
-cd ~/zephyrproject/zephyr
-west build -p always -b esp32s3_lcd_147b/esp32s3/procpu ~/zephyrproject/waveshare-handshake \
-  -- -DBOARD_ROOT=~/zephyrproject/waveshare-board-root
-west flash --esp-device /dev/ttyACM0
-```
+See [zephyr-build.md](zephyr-build.md) for the manual `west` equivalent.
 
 ### Boot behaviour (handshake)
 
-1. **WS2812 acrylic test** — red → green → blue (500 ms each), then red dimming 255→128→64→32→0, then off.
-2. **LCD corners** — UL red, UR green, LR blue, LL grey (172×320 ST7789, BGR565).
-3. **BLE** — connectable, name **`ESP32S3 IMU sim`**, IMU service UUID in advertising.
+- Live IMU scene on the 172×320 ST7789 (not the old RGB-corner stub).
+- Acrylic WS2812 on GPIO38 is operational (vibro / status), not a boot colour cycle.
+- BLE connectable, name **`ESP32S3 IMU sim`**, IMU service UUID in advertising.
+- STATUS JSON includes `fw` (`FW_VERSION_NAME`), `fwc` (`FW_VERSION_CODE`), `feat` (capability
+  bitmask), and `boot_part` (`A` or `B`).
+- CAPS / `feat` include IMU, TFT, config, temp, vibro, WiFi, **OTA**, RSSI, time, bench
+  (plus crash-debug / MT200 when those Kconfig bits are on).
 
-Press **BOOT** (GPIO0): acrylic R→G→B→off flash + white bar on LCD.
+**BOOT (GPIO0):** short tap toggles screen / backlight. Hold 10 s (after the grace window)
+erases WiFi NVS profiles and reboots. See [zephyr-build.md](zephyr-build.md).
 
-### Android app handshake (handshake firmware)
+### Android app (handshake)
 
 The app (`ImuProtocol.kt` / `BleImuClient.kt`) expects:
 
 1. Scan filter: device name **or** IMU service UUID
 2. Connect → MTU 517 → discover services
-3. Enable NOTIFY on `…0006`, write MODE / POLL_MS / TIME, read CAPS
-4. Poll DATA on NOTIFY
+3. Enable NOTIFY on DATA, write MODE / POLL_MS / TIME, read CAPS
+4. Poll DATA on NOTIFY; STATUS carries `fw` / `fwc` / `boot_part`
 
-Zephyr implements all seven IMU characteristics. **QMI8658** on I2C (SDA=48, SCL=47) feeds live samples into DATA batches:
+Modes (COMPUTED / RAW / SCENE / AHRS / vibro) are live QMI8658 + on-device fusion, not stubs.
+If IMU init fails, batches stay empty (`n:0`) — check I2C / WHO_AM_I.
 
-- **COMPUTED** (app default): one v3 row per poll with accel in `fx/fy/fz`, identity rotation matrix
-- **RAW**: `[t,ax,ay,az,gx,gy,gz,dm]` rows
-- **SCENE**: minimal row with live accel in footer fields
-
-STATUS includes chip temp from IMU (`tc`) and `"fw":"zephyr"`. CAPS = `IMU+TFT+TEMP`.
-
-Serial on boot should log `QMI8658 ready at 0x6B` and a sample line. If IMU init fails, batches stay empty (`n:0`) — check I2C wiring / WHO_AM_I.
-
-**BOOT bar:** full-screen GRAM clear on boot (ST7789 RAM survives MCU reset). BOOT press clears to black, then a solid white bar (row-wise draw). Pink bands were stale `0xFFE0` from older flashes — that value renders magenta on this panel.
+Cloud OTA: **Device… → Check for OTA**. Lab file OTA: **Device… → OTA from file**. Both write
+the inactive MCUboot slot over GATT. Sequence: [zephyr-ota.md](zephyr-ota.md).
 
 ---
 
 ## Flash Zephyr smoke (hardware-only)
 
 ```bash
-zephyr/scripts/flash-zephyr.sh smoke
+PORT=/dev/ttyACM0 zephyr/scripts/flash-zephyr.sh smoke
 ```
 
 - BLE name **`WS147B-Zephyr`** — will **not** match the Android app scan filter.
-- Use for LCD/BOOT/WS2812-off checks and nRF Connect visibility.
+- Use for LCD / BOOT / nRF Connect visibility. No IMU GATT, no OTA.
+
+---
+
+## Flash / restore Arduino (reference only)
+
+Arduino does **not** understand the current MCUboot A/B layout. Flashing it overwrites the
+Zephyr bootloader + slots. After Arduino, you must USB-flash handshake again before cloud OTA
+will work.
+
+```bash
+./esp32_s3_imu_basics/scripts/build.sh production --upload
+# or, if a golden 16 MB dump still exists:
+./backups/restore-arduino-fullflash.sh
+```
+
+See `backups/LATEST` for the SHA256 of the last golden image (may be absent on new clones).
 
 ---
 
@@ -110,14 +93,13 @@ The red acrylic edge light is a **single WS2812** (one GRB pixel) on **GPIO38**.
 
 | Layer | Arduino | Zephyr handshake |
 |-------|---------|------------------|
-| Physical | Digital NRZ ~800 kHz | Same (GPIO bit-bang) |
+| Physical | Digital NRZ ~800 kHz | Same |
 | Colour order | GRB | GRB |
-| “Brightness” | 8-bit R/G/B in protocol frame | Same — not DAC/ADC |
-| Timing | RMT peripheral | `esp_rom_delay_us` bit-bang |
+| Driver | RMT (`rgbLedWrite`) | `ws2812_gpio38.c` + `vibro_led.c` |
+| “Brightness” | 8-bit R/G/B in the protocol frame | Same — not DAC/ADC |
 
-There is **no** analog PWM/DAC on the data pin. “PWM/frequency” in product docs refers to **programmable RGB levels inside the WS2812 frame**, not ESP32 LEDC on GPIO38. Future Zephyr work may switch to the `ws2812` SPI/RMT driver; bit-bang matches Arduino behaviour today.
-
-**Do not** enable SPI3 CS on GPIO38 in devicetree — that latched red on early wrong-pin builds.
+There is **no** analog PWM/DAC on the data pin. **Do not** enable SPI3 CS on GPIO38 in
+devicetree — that latched red on early wrong-pin builds.
 
 ---
 
@@ -125,22 +107,41 @@ There is **no** analog PWM/DAC on the data pin. “PWM/frequency” in product d
 
 | Artifact | Path |
 |----------|------|
-| Arduino BLE headers | `esp32_s3_imu_basics/ble/ble_protocol.h`, `device_caps.h` |
-| Zephyr shared header | `zephyr/app/common/ble_imu_protocol.h` |
-| Zephyr GATT stub | `zephyr/app/handshake/src/ble_imu_gatt.c` |
-| Android | `android/ESP32S3ImuSim/.../ImuProtocol.kt`, `BleImuClient.kt` |
+| Zephyr IMU / CAPS | `zephyr/app/common/ble_imu_protocol.h` |
+| Zephyr GATT | `zephyr/app/handshake/src/ble_imu_gatt.c`, `ble_net_gatt.c`, `ble_config_gatt.c`, `ble_ota_gatt.c`, `ble_crash_gatt.c` |
+| Zephyr A/B | `zephyr/app/common/ota_ab.c`, `soft_reboot.c` |
+| Arduino BLE headers | `esp32_s3_imu_basics/ble/ble_protocol.h` (legacy) |
+| Android | `ImuProtocol.kt`, `BleImuClient.kt`, `OtaProtocol` in `ConfigProtocol.kt` |
 
-Keep UUIDs and CAP bitmasks in sync when extending the Zephyr port (Z6+ net, OTA, real IMU batches).
+Keep UUIDs and CAP bitmasks in sync on the Zephyr + Android side. Arduino is not a second
+implementation target.
+
+OTA GATT (historical Arduino numbers, still wired this way):
+
+| Role | UUID |
+|------|------|
+| OTA service | `4a6e0201-0000-1000-8000-00805f9b34fb` |
+| CTRL (JSON begin / abort / finish) | `4a6e0202-…` |
+| DATA (480-byte chunks) | `4a6e0203-…` |
+
+Those values overlap **characteristic** UUIDs on the NET service (`4a6e0200-…`). They are
+different GATT services; the phone looks up OTA by service UUID.
 
 ---
 
 ## Identifying which firmware is running
 
-| Signal | Arduino | Zephyr handshake | Zephyr smoke |
-|--------|---------|------------------|--------------|
-| BLE name | ESP32S3 IMU sim | ESP32S3 IMU sim | WS147B-Zephyr |
-| Boot acrylic | App-driven | R/G/B cycle then off | Off after boot |
-| STATUS JSON | Full telemetry | `"fw":"zephyr"` | N/A (no GATT) |
-| Serial banner | Arduino / ESP-IDF | `handshake:` log module | `smoke:` log module |
+| Signal | Zephyr handshake | Zephyr smoke | Arduino |
+|--------|------------------|--------------|---------|
+| BLE name | ESP32S3 IMU sim | WS147B-Zephyr | ESP32S3 IMU sim |
+| Serial module | `handshake:` | `smoke:` | Arduino / ESP-IDF |
+| STATUS `fw` | `handshake vNN` or `00.0001.0000.NNNNN` | N/A | Arduino string |
+| STATUS `fwc` | desk `NN` or cloud `1000000000+N` | N/A | n/a or old |
+| STATUS `boot_part` | `A` or `B` | N/A | N/A |
+| `feat` / CAPS | IMU+TFT+…+**OTA** | N/A | subset, no MCUboot A/B |
+| Crash ring | `crash ring ready` | no | no |
+| Boot acrylic | operational / vibro | off after boot | app-driven |
 
-When both Arduino and Zephyr use the same BLE name, only one board should be powered nearby during app testing.
+USB factory images report `handshake v191` (desk `FW_VERSION_CODE`). Cloud OTA restamps
+`FW_VERSION_NAME` / `FW_VERSION_CODE` to the allocated `00.0001.0000.NNNNN` line. Same
+source tree, different compare numbers — see [zephyr-ota.md](zephyr-ota.md).

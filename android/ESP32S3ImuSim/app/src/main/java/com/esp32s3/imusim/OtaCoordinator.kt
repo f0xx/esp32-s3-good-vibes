@@ -5,88 +5,69 @@ import android.os.Build
 import android.util.Log
 
 /**
- * Poll cloud OTA: APK first, then signed firmware. Caller supplies BLE connected
- * state; this class never flashes USB.
- *
- * Firmware compare is numeric `versionCode` (live STATUS `fwc`, else parsed
- * `handshake vN`). Same or older is never offered; Check for OTA only re-shows
- * a declined newer build.
+ * Inspect cloud OTA only — no download. App update is always offered first;
+ * firmware is offered only when the installed APK already meets min_apk.
  */
 class OtaCoordinator(
     private val context: Context,
     private val bleConnected: () -> Boolean,
     private val otaCapable: () -> Boolean,
     private val liveFwCode: () -> Int = { 0 },
+    private val liveFwName: () -> String = { "" },
 ) {
     private val repo = OtaRepository(context)
     private val ota = OtaSettings(context)
-    private val cloud = CloudSettings(context)
 
-    fun poll(force: Boolean) {
-        if (!cloud.enabled) {
-            Log.i(TAG, "skip — cloud disabled")
-            return
-        }
+    sealed class Result {
+        data class App(val apk: OtaManifest.Apk, val currentName: String, val currentCode: Int) : Result()
+        data class Firmware(
+            val fw: OtaManifest.Fw,
+            val currentName: String,
+            val currentCode: Int,
+        ) : Result()
+        data class None(val reason: String) : Result()
+    }
+
+    fun inspect(force: Boolean): Result {
+        val currentAppName = installedApkVersionName(context)
+        val currentAppCode = installedApkVersionCode(context)
+        val channel = CloudSettings(context).otaChannel
+        val chTag = "ch=$channel"
         val manifest = repo.fetchManifest()
         if (manifest == null || !manifest.available) {
-            Log.i(TAG, "no ota artifacts")
-            return
+            return Result.None("No OTA on $chTag · app $currentAppName ($currentAppCode)")
         }
-        val apkCode = installedApkVersionCode(context)
         val apk = manifest.apk
-        if (apk != null && apk.versionCode > apkCode &&
+        if (apk != null && apk.versionCode > currentAppCode &&
             (force || apk.versionCode != ota.declinedApkVersionCode)
         ) {
-            val file = repo.download(OtaOffer.Kind.APK, apk.url, apk.size, apk.sha256) ?: return
-            OtaOfferHub.publish(
-                context,
-                OtaOffer(
-                    kind = OtaOffer.Kind.APK,
-                    title = context.getString(R.string.ota_prompt_apk_title),
-                    body = context.getString(R.string.ota_prompt_apk_body, apk.versionName, apk.versionCode),
-                    file = file,
-                    versionLabel = apk.versionName,
-                    apkVersionCode = apk.versionCode,
-                ),
-            )
-            return
+            return Result.App(apk, currentAppName, currentAppCode)
         }
-        val fw = manifest.fw ?: return
-        if (fw.minApkVersionCode > apkCode) {
-            Log.i(TAG, "fw ${fw.version} needs apk ${fw.minApkVersionCode} (have $apkCode)")
-            return
+        val fw = manifest.fw ?: return Result.None(
+            "App current ($currentAppName) · no firmware on $chTag",
+        )
+        if (fw.minApkVersionCode > currentAppCode) {
+            return Result.None(
+                "Firmware ${fw.version} needs app ${fw.minApkVersionCode} (have $currentAppCode)",
+            )
         }
         val offerCode = if (fw.versionCode > 0) fw.versionCode else OtaSettings.parseVersionCode(fw.version)
-        val live = maxOf(ota.liveVersionCode(), liveFwCode())
-        if (offerCode > 0 && live > 0 && offerCode <= live) {
-            Log.i(TAG, "fw ${fw.version} ($offerCode) not newer than live $live")
-            return
+        val statusCode = liveFwCode()
+        val liveCode = if (statusCode > 0) statusCode else ota.liveVersionCode()
+        val liveName = liveFwName().ifBlank { ota.lastFwVersion }.ifBlank { "unknown" }
+        if (offerCode > 0 && liveCode > 0 && offerCode <= liveCode) {
+            return Result.None("Firmware current · $liveName ($liveCode)")
         }
-        if (!force && offerCode > 0 && offerCode == ota.declinedFwVersionCode) return
+        if (!force && offerCode > 0 && offerCode == ota.declinedFwVersionCode) {
+            return Result.None("Firmware OTA deferred · $liveName")
+        }
         if (!bleConnected()) {
-            Log.i(TAG, "fw ${fw.version} waiting for BLE")
-            return
+            return Result.None("Firmware ${fw.version} waiting for BLE · app $currentAppName")
         }
-        if (!otaCapable()) {
-            Log.i(TAG, "fw ${fw.version} — device has no OTA cap")
-            return
+        if (!otaCapable() && !force) {
+            return Result.None("Firmware ${fw.version} waiting for IMU BLE session")
         }
-        val file = repo.download(OtaOffer.Kind.FW, fw.url, fw.size, fw.sha256) ?: return
-        OtaOfferHub.publish(
-            context,
-            OtaOffer(
-                kind = OtaOffer.Kind.FW,
-                title = context.getString(R.string.ota_prompt_fw_title),
-                body = context.getString(
-                    R.string.ota_prompt_fw_body,
-                    fw.version,
-                    ota.lastFwVersion.ifBlank { "unknown" },
-                ),
-                file = file,
-                versionLabel = fw.version,
-                fwVersionCode = offerCode,
-            ),
-        )
+        return Result.Firmware(fw, liveName, liveCode)
     }
 
     companion object {
@@ -99,6 +80,15 @@ class OtaCoordinator(
             } else {
                 @Suppress("DEPRECATION")
                 info.versionCode
+            }
+        }
+
+        fun installedApkVersionName(context: Context): String {
+            return try {
+                context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "?"
+            } catch (e: Exception) {
+                Log.w(TAG, "versionName: ${e.message}")
+                "?"
             }
         }
     }

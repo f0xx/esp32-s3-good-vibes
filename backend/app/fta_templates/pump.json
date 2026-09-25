@@ -1,0 +1,70 @@
+{
+  "id": "pump_stops_working",
+  "kind": "pump",
+  "top_event": "Pump Stops Working",
+  "leaves": [
+    {
+      "leaf_id": "bearing",
+      "label": "Bearing wear / defect",
+      "category": "mechanical",
+      "speakable": true,
+      "new_ref_required": true
+    },
+    {
+      "leaf_id": "misalignment",
+      "label": "Shaft / coupling misalignment",
+      "category": "mechanical",
+      "speakable": true,
+      "new_ref_required": true
+    },
+    {
+      "leaf_id": "cavitation",
+      "label": "Cavitation",
+      "category": "mechanical",
+      "speakable": true,
+      "new_ref_required": false
+    },
+    {
+      "leaf_id": "impeller",
+      "label": "Impeller damage",
+      "category": "mechanical",
+      "speakable": true,
+      "new_ref_required": true
+    },
+    {
+      "leaf_id": "seal",
+      "label": "Seal / packing",
+      "category": "mechanical",
+      "speakable": true,
+      "new_ref_required": true
+    },
+    {
+      "leaf_id": "remount",
+      "label": "Sensor remount / loose fixture",
+      "category": "mechanical",
+      "speakable": true,
+      "new_ref_required": true
+    },
+    {
+      "leaf_id": "electrical",
+      "label": "Electrical (motor / drive)",
+      "category": "electrical",
+      "speakable": false,
+      "new_ref_required": false
+    },
+    {
+      "leaf_id": "process",
+      "label": "Process / flow / valve",
+      "category": "process",
+      "speakable": false,
+      "new_ref_required": false
+    },
+    {
+      "leaf_id": "other",
+      "label": "Other / unknown",
+      "category": "other",
+      "speakable": false,
+      "new_ref_required": true
+    }
+  ]
+}

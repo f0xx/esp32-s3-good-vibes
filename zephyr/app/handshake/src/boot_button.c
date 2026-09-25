@@ -8,10 +8,12 @@
 
 #include "board_config.h"
 #include "ble_imu_gatt.h"
+#include "crash_report.h"
 #include "device_config.h"
 #include "net_profile_store.h"
 #include "power_manager.h"
 #include "soft_reboot.h"
+#include "stack_ra_check.h"
 
 LOG_MODULE_REGISTER(boot_btn, LOG_LEVEL_INF);
 
@@ -23,12 +25,28 @@ static uint32_t g_down_ms;
 static volatile bool g_pressed;
 
 #define BOOT_GRACE_MS 3500U
+/** Hold ≥3s then release → soft reboot (Issues-visible) without erase. */
+#define BOOT_SOFT_REBOOT_MS 3000U
 
 static bool g_warn_wifi_erase;
 static bool g_warn_nvs_erase;
+static bool g_warn_soft_reboot;
 
-static void input_cb(struct input_event *evt)
+static void soft_reboot_now(const char *why)
 {
+	const uint8_t part = soft_reboot_boot_partition();
+
+	LOG_WRN("BOOT: soft crash + reboot (%s)", why);
+	/* Ring entry now so phone can drain after reconnect; NVS pending for boot label. */
+	crash_report_append_soft("boot_btn", (uint8_t)0, part, 255U, why);
+	soft_reboot_schedule(SOFT_REBOOT_BOOT_BTN, part, 255U);
+	k_msleep(80);
+	sys_reboot(SYS_REBOOT_COLD);
+}
+
+static void input_cb(struct input_event *evt, void *user_data)
+{
+	ARG_UNUSED(user_data);
 	if (evt->type != INPUT_EV_KEY || evt->code != INPUT_KEY_0) {
 		return;
 	}
@@ -36,7 +54,7 @@ static void input_cb(struct input_event *evt)
 	g_pressed = (evt->value != 0);
 }
 
-INPUT_CALLBACK_DEFINE(NULL, input_cb);
+INPUT_CALLBACK_DEFINE(NULL, input_cb, NULL);
 
 void boot_button_init(void)
 {
@@ -106,8 +124,7 @@ static void erase_nvs_and_reboot(void)
 	}
 	LOG_WRN("BOOT: sys_reboot (NVS erase complete)");
 	k_msleep(100);
-	soft_reboot_schedule(SOFT_REBOOT_BOOT_BTN, soft_reboot_boot_partition(), 255U);
-	sys_reboot(SYS_REBOOT_COLD);
+	soft_reboot_now("nvs_erase");
 }
 
 static void erase_wifi_and_reboot(void)
@@ -121,12 +138,12 @@ static void erase_wifi_and_reboot(void)
 	net_profile_store_clear_all();
 	LOG_WRN("BOOT: sys_reboot (WiFi erase complete)");
 	k_msleep(100);
-	soft_reboot_schedule(SOFT_REBOOT_BOOT_BTN, soft_reboot_boot_partition(), 255U);
-	sys_reboot(SYS_REBOOT_COLD);
+	soft_reboot_now("wifi_erase");
 }
 
 void boot_button_poll(void)
 {
+	STACK_RA_CHECK_SETUP;
 	const uint32_t now = k_uptime_get_32();
 	const bool pressed = g_pressed;
 
@@ -136,6 +153,7 @@ void boot_button_poll(void)
 
 	if (!g_armed) {
 		boot_button_sync();
+		STACK_RA_CHECK();
 		return;
 	}
 
@@ -157,9 +175,16 @@ void boot_button_poll(void)
 		g_long_handled = false;
 		g_warn_wifi_erase = false;
 		g_warn_nvs_erase = false;
+		g_warn_soft_reboot = false;
 	} else if (pressed && g_prev_pressed && !g_long_handled && g_down_ms > 0U) {
 		const uint32_t held = now - g_down_ms;
 
+		if (held >= 2500U && held < BOOT_SOFT_REBOOT_MS + 500U) {
+			if (!g_warn_soft_reboot) {
+				LOG_WRN("BOOT ~3s — release for soft reboot (Issues), or keep holding to erase");
+				g_warn_soft_reboot = true;
+			}
+		}
 		if (held >= 9000U && held < NET_BOOT_ERASE_MS) {
 			if (!g_warn_wifi_erase) {
 				LOG_WRN("BOOT ~10s — release now or WiFi profiles will be erased");
@@ -193,7 +218,12 @@ void boot_button_poll(void)
 	} else if (!pressed && g_prev_pressed && !g_long_handled) {
 		const uint32_t held = now - g_down_ms;
 
-		if (held >= 50 && held < NET_BOOT_ERASE_MS) {
+		if (held >= BOOT_SOFT_REBOOT_MS && held < NET_BOOT_ERASE_MS) {
+			g_long_handled = true;
+			soft_reboot_now("btn_hold");
+			return;
+		}
+		if (held >= 50 && held < BOOT_SOFT_REBOOT_MS) {
 			LOG_INF("BOOT tap (%ums) → toggle demo/staging mode", held);
 			toggle_mode();
 		} else if (held >= NET_BOOT_ERASE_MS) {
@@ -203,4 +233,5 @@ void boot_button_poll(void)
 	}
 
 	g_prev_pressed = pressed;
+	STACK_RA_CHECK();
 }

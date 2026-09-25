@@ -3,6 +3,7 @@ package com.esp32s3.imusim
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
+import android.widget.CheckBox
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
@@ -17,12 +18,17 @@ class CrashDebugActivity : AppCompatActivity() {
     private lateinit var statusText: TextView
     private lateinit var injectContainer: LinearLayout
     private lateinit var bistButton: MaterialButton
+    private lateinit var ledStatus: TextView
+    private lateinit var ledR: CheckBox
+    private lateinit var ledG: CheckBox
+    private lateinit var ledB: CheckBox
     private lateinit var serviceController: ImuServiceController
 
     private var imuService: IImuBleService? = null
     private var connected = false
     private var debugFirmware = false
     private var sessionCaps = 0
+    private var ledListenerArmed = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -31,12 +37,17 @@ class CrashDebugActivity : AppCompatActivity() {
         statusText = findViewById(R.id.crashDebugStatus)
         injectContainer = findViewById(R.id.crashInjectButtonContainer)
         bistButton = findViewById(R.id.crashDebugBistButton)
+        ledStatus = findViewById(R.id.ledDebugStatus)
+        ledR = findViewById(R.id.ledDebugR)
+        ledG = findViewById(R.id.ledDebugG)
+        ledB = findViewById(R.id.ledDebugB)
 
         findViewById<MaterialToolbar>(R.id.crashDebugToolbar).setNavigationOnClickListener { finish() }
 
         serviceController = ImuServiceController(applicationContext, serviceEvents)
         buildInjectButtons()
         wireBist()
+        wireLedDebug()
         refreshUi()
     }
 
@@ -45,7 +56,20 @@ class CrashDebugActivity : AppCompatActivity() {
         serviceController.startAndBind()
     }
 
+    override fun onResume() {
+        super.onResume()
+        ledListenerArmed = true
+    }
+
+    override fun onPause() {
+        ledListenerArmed = false
+        imuService?.clearDebugLed()
+        super.onPause()
+    }
+
     override fun onStop() {
+        ledListenerArmed = false
+        imuService?.clearDebugLed()
         serviceController.unbind()
         super.onStop()
     }
@@ -78,6 +102,50 @@ class CrashDebugActivity : AppCompatActivity() {
         }
     }
 
+    private fun wireLedDebug() {
+        val listener = android.widget.CompoundButton.OnCheckedChangeListener { _, _ ->
+            if (ledListenerArmed) {
+                pushLedDebug()
+            }
+        }
+        ledR.setOnCheckedChangeListener(listener)
+        ledG.setOnCheckedChangeListener(listener)
+        ledB.setOnCheckedChangeListener(listener)
+        ledListenerArmed = true
+        updateLedStatus()
+    }
+
+    private fun ledMask(): Int {
+        var m = 0
+        if (ledR.isChecked) m = m or 1
+        if (ledG.isChecked) m = m or 2
+        if (ledB.isChecked) m = m or 4
+        return m
+    }
+
+    private fun updateLedStatus() {
+        ledStatus.text = if (!connected || imuService == null) {
+            getString(R.string.led_debug_disconnected)
+        } else {
+            getString(
+                R.string.led_debug_wire,
+                if (ledR.isChecked) "on" else "off",
+                if (ledG.isChecked) "on" else "off",
+                if (ledB.isChecked) "on" else "off",
+            )
+        }
+    }
+
+    private fun pushLedDebug() {
+        updateLedStatus()
+        val svc = imuService
+        if (!connected || svc == null) {
+            statusBanner.show(StatusBannerLevel.WARN, getString(R.string.connect_ble_first))
+            return
+        }
+        svc.setDebugLed(ledMask())
+    }
+
     private fun confirmInject(spec: CrashInjectKind.Spec) {
         if (!connected || imuService == null) {
             statusBanner.show(StatusBannerLevel.WARN, getString(R.string.connect_ble_first))
@@ -107,6 +175,13 @@ class CrashDebugActivity : AppCompatActivity() {
         }
         val enabled = connected && imuService != null
         bistButton.isEnabled = enabled
+        ledR.isEnabled = enabled
+        ledG.isEnabled = enabled
+        ledB.isEnabled = enabled
+        updateLedStatus()
+        if (enabled) {
+            imuService?.setDebugLed(ledMask())
+        }
         for (i in 0 until injectContainer.childCount) {
             injectContainer.getChildAt(i).isEnabled = enabled
         }
@@ -128,6 +203,8 @@ class CrashDebugActivity : AppCompatActivity() {
             this@CrashDebugActivity.connected = connected
             runOnUiThread { refreshUi() }
         }
+
+        override fun onCaps(caps: Int) {}
 
         override fun onSessionRestore(snapshot: Bundle) {
             sessionCaps = snapshot.getInt(ImuSessionStore.KEY_CAPS, 0)

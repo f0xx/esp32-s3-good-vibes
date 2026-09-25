@@ -4,8 +4,9 @@
 
 #include "display_panel.h"
 #include "panel_draw.h"
-#include "panel_fb.h"
+#include "renderer.h"
 #include "panel_font_glcd.h"
+#include "stack_ra_check.h"
 
 #define GLYPH_COLS 5
 #define GLYPH_ROWS 8
@@ -18,7 +19,7 @@
 
 void panel_draw_pixel(int16_t x, int16_t y, uint16_t color)
 {
-	panel_fb_put(x, y, color);
+	renderer_put(x, y, color);
 }
 
 static int clip_outcode(int32_t x, int32_t y)
@@ -134,6 +135,7 @@ static bool clip_to_panel(int32_t *x0, int32_t *y0, int32_t *x1, int32_t *y1)
  */
 void panel_draw_line(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t color)
 {
+	STACK_RA_CHECK_SETUP;
 	int32_t ax0 = x0;
 	int32_t ay0 = y0;
 	int32_t ax1 = x1;
@@ -155,7 +157,7 @@ void panel_draw_line(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t co
 	int32_t guard = (ax > ay ? ax : ay) + 2;
 
 	while (guard-- > 0) {
-		panel_fb_put((int16_t)px, (int16_t)py, color);
+		renderer_put((int16_t)px, (int16_t)py, color);
 		if (px == ax1 && py == ay1) {
 			break;
 		}
@@ -170,6 +172,7 @@ void panel_draw_line(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t co
 			py += sy;
 		}
 	}
+	STACK_RA_CHECK();
 }
 
 void panel_draw_circle(int16_t cx, int16_t cy, int16_t r, uint16_t color, bool filled)
@@ -184,7 +187,7 @@ void panel_draw_circle(int16_t cx, int16_t cy, int16_t r, uint16_t color, bool f
 			if (!filled && d < (r - 1) * (r - 1)) {
 				continue;
 			}
-			panel_fb_put(cx + x, cy + y, color);
+			renderer_put(cx + x, cy + y, color);
 		}
 	}
 }
@@ -204,7 +207,7 @@ static void draw_glyph_upright(int16_t x, int16_t y, uint16_t color, const uint8
 			}
 			for (uint8_t sy = 0; sy < scale; sy++) {
 				for (uint8_t sx = 0; sx < scale; sx++) {
-					panel_fb_put(x + (int16_t)col * scale + sx,
+					renderer_put(x + (int16_t)col * scale + sx,
 						     y + (int16_t)row * scale + sy, color);
 				}
 			}
@@ -225,7 +228,7 @@ static void draw_glyph_rotated(int16_t x, int16_t y, uint16_t color, const uint8
 			}
 			for (uint8_t sy = 0; sy < scale; sy++) {
 				for (uint8_t sx = 0; sx < scale; sx++) {
-					panel_fb_put(x + (int16_t)row * scale + sx,
+					renderer_put(x + (int16_t)row * scale + sx,
 						     y + (int16_t)(GLYPH_COLS - 1U - col) * scale +
 							     sy,
 						     color);
