@@ -1,6 +1,7 @@
 package com.esp32s3.imusim
 
 import android.content.Context
+import android.content.Intent
 import java.util.concurrent.ExecutorService
 
 /** Shared cloud save / upload logic for MainActivity and CloudSettingsActivity. */
@@ -28,6 +29,7 @@ object CloudSettingsHelper {
         key: String,
         deviceId: String,
         groupId: String,
+        otaChannel: String,
         bridgeMode: BridgeSyncSettings.Mode,
         intervalMin: Int,
         dwellSec: Int,
@@ -36,6 +38,7 @@ object CloudSettingsHelper {
         cloud.apiKey = key
         cloud.deviceId = deviceId
         cloud.groupId = groupId
+        cloud.otaChannel = otaChannel
         cloud.baseUrl = CloudSettings.fixUrlScheme(cloud.baseUrl)
         bridge.mode = bridgeMode
         bridge.intervalMinutes = intervalMin
@@ -57,6 +60,13 @@ object CloudSettingsHelper {
                 AutopilotRelay.onCloudEnabled(app, bridge)
             } else {
                 AutopilotRelay.onCloudDisabled(app)
+            }
+            /* Push CDN channel to ESP even when cloud upload is off (channel is local pref). */
+            runCatching {
+                val intent = Intent(app, ImuBleForegroundService::class.java).apply {
+                    action = ImuBleForegroundService.ACTION_SYNC_OTA_CHANNEL
+                }
+                app.startForegroundService(intent)
             }
             if (!cloud.enabled) {
                 onComplete(null)

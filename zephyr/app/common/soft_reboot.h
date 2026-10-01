@@ -26,6 +26,9 @@ void soft_reboot_post_boot(void);
 /** Running image partition label 0=A (slot0), 1=B (slot1), 255=unknown. */
 uint8_t soft_reboot_boot_partition(void);
 
+/** Drop cached mcuboot_swap_type() — call after staging an OTA image. */
+void soft_reboot_invalidate_boot_cache(void);
+
 const char *soft_reboot_partition_label(uint8_t part);
 
 const char *soft_reboot_kind_str(enum soft_reboot_kind kind);

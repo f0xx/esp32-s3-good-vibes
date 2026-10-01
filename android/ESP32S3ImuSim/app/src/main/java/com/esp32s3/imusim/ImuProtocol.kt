@@ -9,6 +9,9 @@ import java.util.UUID
 object ImuProtocol {
     const val DEVICE_NAME = "ESP32S3 IMU sim"
 
+    /** Wire protocol — same four-part pattern as Android Cast; independent of app/fw OTA. */
+    const val PROTO_VERSION_STRING = "00.01.00.0001"
+
     /** Match firmware BLE_IMU_CONNECT_GRACE_MS + BLE_IMU_POST_GRACE_MS (+500 ms margin). */
     const val ESP_CONNECT_SETTLE_MS = 3_000L
 
@@ -41,9 +44,13 @@ object ImuProtocol {
     const val CAP_CRASH_DEBUG = 1 shl 7
     const val CAP_MT200 = 1 shl 8
     const val CAP_RSSI = 1 shl 9
+    const val CAP_TIME = 1 shl 10
+    const val CAP_BENCH = 1 shl 11
 
     /** HCI/Android 127 = N/A. Missing RSSI is reported as worst legal dBm. */
     const val RSSI_UNAVAIL = -127
+
+    private val FEAT_RE = Regex("\"feat\":(\\d+)")
 
     const val MODE_RAW = 0
     const val MODE_COMPUTED = 1
@@ -146,6 +153,24 @@ object ImuProtocol {
         val fwVersion: String? = null,
         /** Monotonic OTA compare from STATUS `fwc`. */
         val fwVersionCode: Int? = null,
+        /** Compile-in feature bitset from STATUS `feat` (same layout as CHAR_CAPS). */
+        val feat: Int = 0,
+        /** CMD 14 repair pause — leftover STATUS rows are not live trend. */
+        val repair: Boolean = false,
+        /** Preferred CDN OTA channel from STATUS `och` (stable|staging|dev). */
+        val otaChannel: String? = null,
+        val spiMhz: Int? = null,
+        val i2cKhz: Int? = null,
+        val bleRxKb: Int? = null,
+        val bleTxKb: Int? = null,
+        val bleRxB: Long? = null,
+        val bleTxB: Long? = null,
+        val bleRxBps: Int? = null,
+        val bleTxBps: Int? = null,
+        val wifiOn: Boolean? = null,
+        val wifiRssiDbm: Int? = null,
+        val wifiAp: Boolean? = null,
+        val wifiSsid: String? = null,
     )
 
     data class PowerStatus(
@@ -378,6 +403,21 @@ object ImuProtocol {
             wrssiDbm = if (o.has("wrssi")) normalizeRssiDbm(o.optInt("wrssi")) else null,
             fwVersion = o.optString("fw").takeIf { it.isNotBlank() && it != "zephyr" },
             fwVersionCode = if (o.has("fwc") && o.optInt("fwc") > 0) o.optInt("fwc") else null,
+            feat = o.optInt("feat", 0),
+            repair = o.optInt("repair", 0) != 0,
+            otaChannel = o.optString("och").takeIf { it.isNotBlank() },
+            spiMhz = if (o.has("spi")) o.optInt("spi") else null,
+            i2cKhz = if (o.has("i2c")) o.optInt("i2c") else null,
+            bleRxKb = if (o.has("blerxkb")) o.optInt("blerxkb") else null,
+            bleTxKb = if (o.has("bletxkb")) o.optInt("bletxkb") else null,
+            bleRxB = if (o.has("blerxb")) o.optLong("blerxb") else null,
+            bleTxB = if (o.has("bletxb")) o.optLong("bletxb") else null,
+            bleRxBps = if (o.has("blerxbps")) o.optInt("blerxbps") else null,
+            bleTxBps = if (o.has("bletxbps")) o.optInt("bletxbps") else null,
+            wifiOn = if (o.has("wifi")) o.optInt("wifi") != 0 else null,
+            wifiRssiDbm = if (o.has("wfr")) normalizeRssiDbm(o.optInt("wfr")) else null,
+            wifiAp = if (o.has("wap")) o.optInt("wap") != 0 else null,
+            wifiSsid = o.optString("wssid").takeIf { it.isNotBlank() },
         )
 
     fun crashDebugFromCaps(caps: Int): Boolean = (caps and CAP_CRASH_DEBUG) != 0
@@ -389,9 +429,9 @@ object ImuProtocol {
 
     fun verdictCaption(level: Int, corr: Float?): String {
         val tag = when (level) {
-            VERDICT_ALERT -> "ALERT"
-            VERDICT_WARN -> "WARN"
-            else -> "OK"
+            VERDICT_ALERT -> "cand ALERT"
+            VERDICT_WARN -> "cand WARN"
+            else -> "cand OK"
         }
         return if (corr != null) {
             String.format(java.util.Locale.US, "vib:%s c=%.2f", tag, corr)
@@ -400,10 +440,19 @@ object ImuProtocol {
         }
     }
 
+    fun featFromJson(json: String): Int {
+        val m = FEAT_RE.find(json) ?: return 0
+        return m.groupValues[1].toIntOrNull() ?: 0
+    }
+
     fun parseCaps(data: ByteArray): Int {
-        if (data.size < 4) return 0
-        val bb = ByteBuffer.wrap(data, 0, 4).order(ByteOrder.LITTLE_ENDIAN)
-        return bb.int
+        if (data.isEmpty()) return 0
+        var v = 0
+        val n = minOf(4, data.size)
+        for (i in 0 until n) {
+            v = v or ((data[i].toInt() and 0xff) shl (8 * i))
+        }
+        return v
     }
 
     fun capsCaption(caps: Int): String {
@@ -417,6 +466,8 @@ object ImuProtocol {
         if (caps and CAP_CRASH_DEBUG != 0) parts.add("DBG")
         if (caps and CAP_MT200 != 0) parts.add("MT200")
         if (caps and CAP_RSSI != 0) parts.add("RSSI")
+        if (caps and CAP_TIME != 0) parts.add("TIME")
+        if (caps and CAP_BENCH != 0) parts.add("BENCH")
         return if (parts.isEmpty()) "caps:--" else "caps:${parts.joinToString("+")}"
     }
 

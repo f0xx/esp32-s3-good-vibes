@@ -29,6 +29,7 @@ class CloudSettingsActivity : AppCompatActivity() {
     private lateinit var deviceEdit: TextInputEditText
     private lateinit var groupEdit: TextInputEditText
     private lateinit var bridgeModeSpinner: Spinner
+    private lateinit var otaChannelSpinner: Spinner
     private lateinit var bridgeIntervalEdit: TextInputEditText
     private lateinit var bridgeDwellEdit: TextInputEditText
 
@@ -47,12 +48,18 @@ class CloudSettingsActivity : AppCompatActivity() {
         keyStatus = findViewById(R.id.cloudKeyStatus)
         deviceEdit = findViewById(R.id.cloudDeviceEdit)
         groupEdit = findViewById(R.id.cloudGroupEdit)
+        otaChannelSpinner = findViewById(R.id.otaChannelSpinner)
         bridgeModeSpinner = findViewById(R.id.bridgeModeSpinner)
         bridgeIntervalEdit = findViewById(R.id.bridgeIntervalEdit)
         bridgeDwellEdit = findViewById(R.id.bridgeDwellEdit)
 
         findViewById<MaterialToolbar>(R.id.cloudToolbar).setNavigationOnClickListener { finish() }
 
+        otaChannelSpinner.adapter = ArrayAdapter(
+            this,
+            android.R.layout.simple_spinner_dropdown_item,
+            CloudSettings.OTA_CHANNEL_LABELS,
+        )
         bridgeModeSpinner.adapter = ArrayAdapter(
             this,
             android.R.layout.simple_spinner_dropdown_item,
@@ -135,6 +142,9 @@ class CloudSettingsActivity : AppCompatActivity() {
         keyEdit.setText(cloudSettings.apiKey)
         deviceEdit.setText(cloudSettings.deviceId)
         groupEdit.setText(cloudSettings.groupId)
+        otaChannelSpinner.setSelection(
+            CloudSettings.OTA_CHANNELS.indexOf(cloudSettings.otaChannel).coerceAtLeast(0),
+        )
         bridgeModeSpinner.setSelection(
             BridgeSyncSettings.Mode.entries.indexOf(bridgeSettings.mode).coerceAtLeast(0),
         )
@@ -175,6 +185,7 @@ class CloudSettingsActivity : AppCompatActivity() {
             key = keyEdit.text?.toString().orEmpty(),
             deviceId = deviceEdit.text?.toString().orEmpty(),
             groupId = groupEdit.text?.toString().orEmpty(),
+            otaChannel = CloudSettings.OTA_CHANNELS.getOrElse(otaChannelSpinner.selectedItemPosition) { "stable" },
             bridgeMode = BridgeSyncSettings.Mode.entries[bridgeModeSpinner.selectedItemPosition],
             intervalMin = bridgeIntervalEdit.text?.toString()?.toIntOrNull()
                 ?: BridgeSyncSettings.DEFAULT_INTERVAL_MIN,

@@ -34,6 +34,7 @@ class ImuServiceController(
         fun onEspScreenState(on: Boolean) {}
         fun onCaptionEpoch(epoch: Int) {}
         fun onClockState(synced: Boolean, tzMin: Int) {}
+        fun onCaps(caps: Int) {}
         fun onBatteryBench(
             active: Boolean,
             sessionId: Long,
@@ -45,6 +46,7 @@ class ImuServiceController(
         ) {}
         /** Flat-floor mounting calibration status JSON — see floor_calib.h. */
         fun onFloorCalStatus(json: String) {}
+        fun onBleStats(rxBytes: Long, txBytes: Long, rssiDbm: Int) {}
     }
 
     private var service: IImuBleService? = null
@@ -141,6 +143,14 @@ class ImuServiceController(
             events.onClockState(synced, tzMin)
         }
 
+        override fun onCaps(caps: Int) {
+            try {
+                events.onCaps(caps)
+            } catch (_: AbstractMethodError) {
+                /* Activities that predate Events.onCaps */
+            }
+        }
+
         override fun onBatteryBench(
             active: Boolean,
             sessionId: Long,
@@ -155,6 +165,10 @@ class ImuServiceController(
 
         override fun onFloorCalStatus(json: String) {
             events.onFloorCalStatus(json)
+        }
+
+        override fun onBleStats(rxBytes: Long, txBytes: Long, rssiDbm: Int) {
+            events.onBleStats(rxBytes, txBytes, rssiDbm)
         }
     }
 
@@ -180,6 +194,11 @@ class ImuServiceController(
     }
 
     fun startAndBind() {
+        if (!AutopilotRelay.BlePermissionGate.canUseBle(context)) {
+            Log.w(TAG, "startAndBind deferred until BLE permissions are granted")
+            return
+        }
+        if (bound) return
         val intent = Intent(context, ImuBleForegroundService::class.java).apply {
             action = ImuBleForegroundService.ACTION_BLE_RELAY
         }

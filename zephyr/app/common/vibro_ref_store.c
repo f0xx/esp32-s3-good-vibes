@@ -1,5 +1,5 @@
 /*
- * Reference-profile flash store — same scratch_partition as crash_ring_store
+ * Reference-profile flash store — appdata_partition (not McUboot scratch)
  * (offset 0, 4KB) and vibro_verdict_store (offset 4096, 4KB). This store
  * starts at offset 8192: one 4KB header sector (active-slot pointer) plus
  * VIBRO_REF_STORE_SLOTS dedicated 4KB sectors (one per slot), so recording a
@@ -22,20 +22,24 @@
 #include <zephyr/sys/util.h>
 
 #include "flash_safety.h"
+#include "appdata_layout.h"
 
 LOG_MODULE_REGISTER(vibro_ref, LOG_LEVEL_INF);
 
-#define VIBRO_REF_PARTITION    scratch_partition
-#define VIBRO_REF_PARTITION_ID FIXED_PARTITION_ID(VIBRO_REF_PARTITION)
+#define VIBRO_REF_PARTITION    appdata_partition
+#define VIBRO_REF_PARTITION_ID PARTITION_ID(VIBRO_REF_PARTITION)
 
-#if !FIXED_PARTITION_EXISTS(VIBRO_REF_PARTITION)
-#error "vibro ref store requires scratch partition"
+#if !PARTITION_EXISTS(VIBRO_REF_PARTITION)
+#error "vibro ref store requires appdata_partition (OTA-safe; not image-scratch)"
 #endif
 
-#define VIBRO_REF_HDR_OFFSET  8192U
-#define VIBRO_REF_HDR_BYTES   4096U
-#define VIBRO_REF_SLOTS_OFFSET (VIBRO_REF_HDR_OFFSET + VIBRO_REF_HDR_BYTES) /* 12288 */
-#define VIBRO_REF_SLOT_BYTES  4096U
+BUILD_ASSERT(VIBRO_REF_STORE_SLOTS == APPDATA_VIBRO_REF_SLOTS,
+	     "VIBRO_REF_STORE_SLOTS must match appdata_layout.h");
+
+#define VIBRO_REF_HDR_OFFSET   APPDATA_VIBRO_REF_HDR_OFF
+#define VIBRO_REF_HDR_BYTES    APPDATA_SECTOR_BYTES
+#define VIBRO_REF_SLOTS_OFFSET APPDATA_VIBRO_REF_SLOTS_OFF
+#define VIBRO_REF_SLOT_BYTES   APPDATA_SECTOR_BYTES
 
 #define VIBRO_REF_HDR_MAGIC 0x52465248U /* RFRH */
 #define VIBRO_REF_REC_MAGIC 0x52465252U /* RFRR */
@@ -80,6 +84,16 @@ static bool g_loaded;
  * flash erase hasn't happened yet. */
 static atomic_t g_pending_erase_mask;
 static atomic_t g_hdr_dirty;
+
+/*
+ * Slot-validity RAM cache. vibro_led_poll() used to call vibro_ref_store_valid() every
+ * main-loop turn → flash_area_read on MSPI while the panel/PSRAM path was live, which
+ * wedged the S3 (GDB: main stuck in spi_flash_chip_generic_config_host_io_mode via
+ * vibro_led → ref_slot_count). Populate once at init / on write; never re-read flash
+ * from the hot path.
+ */
+static uint8_t g_valid_mask;
+static bool g_valid_cached;
 
 static uint32_t hdr_crc(const struct vibro_ref_header *hdr)
 {
@@ -186,18 +200,11 @@ int vibro_ref_store_read(uint8_t slot, struct vibro_ref_profile *out)
 	return 0;
 }
 
-bool vibro_ref_store_valid(uint8_t slot)
+static bool slot_magic_valid_flash(uint8_t slot)
 {
 	const struct flash_area *fa;
 	uint32_t magic = 0;
 	int err;
-
-	if (slot >= VIBRO_REF_STORE_SLOTS) {
-		return false;
-	}
-	if (atomic_test_bit(&g_pending_erase_mask, slot)) {
-		return false;
-	}
 
 	err = flash_area_open(VIBRO_REF_PARTITION_ID, &fa);
 	if (err != 0) {
@@ -206,6 +213,34 @@ bool vibro_ref_store_valid(uint8_t slot)
 	err = flash_area_read(fa, slot_offset(slot), &magic, sizeof(magic));
 	flash_area_close(fa);
 	return err == 0 && magic == VIBRO_REF_REC_MAGIC;
+}
+
+static void refresh_valid_cache(void)
+{
+	uint8_t mask = 0U;
+
+	for (uint8_t s = 0U; s < VIBRO_REF_STORE_SLOTS; s++) {
+		if (slot_magic_valid_flash(s)) {
+			mask |= (uint8_t)BIT(s);
+		}
+	}
+	g_valid_mask = mask;
+	g_valid_cached = true;
+}
+
+bool vibro_ref_store_valid(uint8_t slot)
+{
+	if (slot >= VIBRO_REF_STORE_SLOTS) {
+		return false;
+	}
+	if (atomic_test_bit(&g_pending_erase_mask, slot)) {
+		return false;
+	}
+	if (!g_valid_cached) {
+		/* Boot / first call only — never from LED hot path after init. */
+		refresh_valid_cache();
+	}
+	return (g_valid_mask & (uint8_t)BIT(slot)) != 0U;
 }
 
 int vibro_ref_store_write(uint8_t slot, const struct vibro_ref_profile *prof)
@@ -257,6 +292,8 @@ int vibro_ref_store_write(uint8_t slot, const struct vibro_ref_profile *prof)
 	} else {
 		/* Fresh data now on flash — any earlier pending delete of this slot is moot. */
 		atomic_clear_bit(&g_pending_erase_mask, slot);
+		g_valid_mask |= (uint8_t)BIT(slot);
+		g_valid_cached = true;
 		LOG_INF("ref store slot=%u saved name=%s dur=%ums mag_len=%u", slot, rec.name,
 			rec.duration_ms, rec.mag_len);
 	}
@@ -273,6 +310,7 @@ int vibro_ref_store_delete(uint8_t slot)
 	 * (vibro_ref_store_valid()/read() mask it out) even though flash_area_erase() hasn't
 	 * run yet; vibro_ref_store_poll() does the real erase once BLE is idle. */
 	atomic_set_bit(&g_pending_erase_mask, slot);
+	g_valid_mask &= (uint8_t)~BIT(slot);
 	if (g_hdr.active_slot == (int8_t)slot) {
 		g_hdr.active_slot = -1;
 		atomic_set(&g_hdr_dirty, 1);
@@ -285,6 +323,8 @@ int vibro_ref_store_clear_all(void)
 	for (uint8_t s = 0; s < VIBRO_REF_STORE_SLOTS; s++) {
 		atomic_set_bit(&g_pending_erase_mask, s);
 	}
+	g_valid_mask = 0U;
+	g_valid_cached = true;
 	g_hdr.active_slot = -1;
 	atomic_set(&g_hdr_dirty, 1);
 	LOG_WRN("ref store: all slots marked for clear (erase deferred until BLE idle)");
@@ -351,6 +391,7 @@ int vibro_ref_store_init(void)
 	if (g_loaded) {
 		uint8_t valid_count = 0;
 
+		refresh_valid_cache();
 		for (uint8_t s = 0; s < VIBRO_REF_STORE_SLOTS; s++) {
 			if (vibro_ref_store_valid(s)) {
 				valid_count++;
@@ -359,6 +400,8 @@ int vibro_ref_store_init(void)
 		LOG_INF("vibro ref store ready (slots=%u valid=%u active=%d)",
 			VIBRO_REF_STORE_SLOTS, valid_count, g_hdr.active_slot);
 	} else {
+		g_valid_mask = 0U;
+		g_valid_cached = true;
 		LOG_WRN("vibro ref store init failed (%d)", err);
 	}
 	return err;

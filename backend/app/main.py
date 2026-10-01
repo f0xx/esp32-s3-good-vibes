@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.api import ensure_db, router as api_router
 from app.auth import API_KEY
+from app.ota import router as ota_router
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
@@ -19,7 +20,7 @@ app = FastAPI(title="Good Vibes IMU Backend", version="0.2.0")
 def _demo_hints_json() -> str:
     hints = {
         "api_key": API_KEY,
-        "grafana_url": "grafana/",
+        "grafana_url": "/app/good_vibes/grafana/",
         "grafana_user": "admin",
     }
     grafana_pass = os.getenv("GRAFANA_ADMIN_PASSWORD", "").strip()
@@ -28,9 +29,13 @@ def _demo_hints_json() -> str:
     return json.dumps(hints)
 
 
-def _render_index_html() -> str:
-    template = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+def _render_html(filename: str) -> str:
+    template = (WEB_DIR / filename).read_text(encoding="utf-8")
     return template.replace("__DEMO_HINTS_JSON__", _demo_hints_json())
+
+
+def _render_index_html() -> str:
+    return _render_html("index.html")
 
 
 @app.on_event("startup")
@@ -40,6 +45,8 @@ def on_startup() -> None:
 # Legacy + public UI paths (monstro proxies /app/good_vibes/ → artc0:8080)
 app.include_router(api_router, prefix="/v1")
 app.include_router(api_router, prefix="/app/good_vibes/v1")
+app.include_router(ota_router, prefix="/v1")
+app.include_router(ota_router, prefix="/app/good_vibes/v1")
 
 
 @app.get("/health")
@@ -48,13 +55,33 @@ def health_root():
     return {"ok": True, "ui": "/app/good_vibes/"}
 
 
-@app.get("/app/good_vibes")
-@app.get("/app/good_vibes/")
-def good_vibes_index():
+def _spa() -> HTMLResponse:
     index = WEB_DIR / "index.html"
     if index.is_file():
         return HTMLResponse(_render_index_html())
-    return {"detail": "web UI not installed"}
+    return HTMLResponse('{"detail":"web UI not installed"}', status_code=404)
+
+
+@app.get("/app/good_vibes")
+@app.get("/app/good_vibes/")
+@app.get("/app/good_vibes/hub")
+@app.get("/app/good_vibes/hub/")
+@app.get("/app/good_vibes/body")
+@app.get("/app/good_vibes/body/")
+@app.get("/app/good_vibes/vibro")
+@app.get("/app/good_vibes/vibro/")
+@app.get("/app/good_vibes/ahrs")
+@app.get("/app/good_vibes/ahrs/")
+@app.get("/app/good_vibes/insights")
+@app.get("/app/good_vibes/insights/")
+@app.get("/app/good_vibes/issues")
+@app.get("/app/good_vibes/issues/")
+@app.get("/app/good_vibes/wearable")
+@app.get("/app/good_vibes/wearable/")
+@app.get("/app/good_vibes/map")
+@app.get("/app/good_vibes/map/")
+def good_vibes_spa():
+    return _spa()
 
 
 if (WEB_DIR / "static").is_dir():

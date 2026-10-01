@@ -295,3 +295,20 @@ Phone never logged `Wearable relay` this session (`wok` never uploaded). Watch L
 - What are `F002` / `F003` / `AE00` actually for on this SKU?
 - Can we keep HR *and* steps without SpO2 (SpO2 stole the PPG from HR)?
 - Soft pairing / bonding: we connected unencrypted. Some CCC writes on other Veepoo SKUs want a bond; this one did not.
+
+---
+
+## History / origin sync (vpprotocol-2.3.83.15, jadx 2026-09-20)
+
+Veepoo **daily health** is not in A8/D8 live frames. SDK `readOriginData*` pulls **5-minute packages** (≤288/day) with a stable identity the phone remembers: `(date, packageNumber)`.
+
+| Protocol | When | Write (20 B, F0080003) | Notes |
+|----------|------|------------------------|--------|
+| Classic | `originProtocolVersion` ∉ {3,5} | **`D1`** + pos BE16 + day u8 — `vp_bp.vp_a`: `{-47, pos[3], pos[2], day}` | One notify ≈ one `OriginData` (steps/HR/BP/sport + TimeData) |
+| Origin3/5 | version **3 or 5** | **`DF`** + pos LE16 + day LE16 — `vp_bo.vp_a`: `bArr[0]=-33` | Multi-block stream; end marker `[1]==[2]==0xFF`; first/mid packets carry block index. Parsed into `OriginData3` / SpO2 / HRV lists |
+
+**Dedupe key for history:** calendar day + `packageNumber` (1…288), not a free-running watch counter. SDK explicitly says to pass the last `currentPackage` back on the next read to avoid re-fetch.
+
+**Live sample rate (this repo):** enqueue on content change, **max 1 Hz** (`mt200_sample_queue`); phone drain pops one queued sample per DATA JSON (`wq` / `wd` / `wseq`). History DF/D1 fetch from ESP is **not wired yet** — next step after live queue soaks.
+
+Artifact path used for dig: `/tmp/mt200-origin-dig/decompiled` from `HBandSDK/Android_Ble_SDK` `vpprotocol-2.3.83.15.aar`.

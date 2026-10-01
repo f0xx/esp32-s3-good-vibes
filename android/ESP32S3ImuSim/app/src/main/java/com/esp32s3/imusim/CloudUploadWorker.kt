@@ -32,7 +32,7 @@ class CloudUploadWorker(appContext: Context, params: WorkerParameters) :
             batch.totalAccepted > 0 ->
                 AppEventHub.showBanner(StatusBannerLevel.OK, "Uploaded ${batch.summary}")
             batch.verdicts.ok && batch.spectra.ok && batch.crashes.ok &&
-                batch.batteryBench.ok && batch.telemetry.ok -> {
+                batch.batteryBench.ok && batch.telemetry.ok && batch.geo.ok -> {
                 AppEventHub.showBanner(StatusBannerLevel.OK, "Cloud synced — ${batch.summary}")
             }
             batch.verdicts.message == "cloud disabled" -> return

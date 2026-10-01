@@ -22,6 +22,7 @@ struct crash_report_info {
 	const char *reason;
 	char fw_version[32];
 	char ota_outcome[16];
+	char thread_name[16];
 	uint32_t backtrace[CRASH_REPORT_BACKTRACE_MAX];
 	uint8_t backtrace_count;
 };

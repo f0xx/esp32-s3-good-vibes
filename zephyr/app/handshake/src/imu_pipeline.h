@@ -19,6 +19,10 @@ struct imu_pipeline_raw_entry {
 };
 
 bool imu_pipeline_init(void);
+/** Schedule first IMU bring-up after BLE + power_manager_mark_ready(). */
+void imu_pipeline_start(void);
+/** True after imu_pipeline_start() — BIST uses this to avoid false IMU fails. */
+bool imu_pipeline_started(void);
 void imu_pipeline_poll(void);
 void imu_pipeline_reschedule(void);
 uint32_t imu_pipeline_take_hb_ticks(void);

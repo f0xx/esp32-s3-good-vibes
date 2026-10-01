@@ -9,6 +9,16 @@
 
 int ble_imu_gatt_init(void);
 void ble_imu_gatt_set_traffic_paused(bool paused);
+/** True when there is no phone link, or its interval is already ≥200 ms (WiFi can scan). */
+bool ble_imu_phone_conn_quiet_for_wifi(void);
+/** Re-issue the stretched phone LE interval while waiting to start a WiFi scan. */
+void ble_imu_phone_stretch_for_wifi(void);
+/** Hold advertising so a WiFi scan can own the 2.4 GHz radio with no BLE traffic. */
+void ble_imu_set_hold_adv(bool hold);
+/** Hold advertising only while an MT200 central session is live (scan/connect/fetch). */
+void ble_imu_set_mt200_adv_hold(bool hold);
+/** Drop the phone link after the scan GATT write has completed. */
+void ble_imu_disconnect_phone_for_wifi(void);
 bool ble_imu_link_active(void);
 bool ble_imu_in_connect_grace(void);
 

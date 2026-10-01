@@ -9,7 +9,7 @@ Pattern matches [Android Cast](/app/androidcast_project/) — TLS on monstro, ba
 | File | Install target on monstro |
 |------|---------------------------|
 | `fe/monstro-good-vibes-upstream.conf` | `/etc/nginx/good-vibes-upstream.conf` |
-| `fe/monstro-apps-good-vibes.fragment` | include inside `apps.f0xx.org` server block |
+| `fe/monstro-apps-good-vibes.fragment` | include inside `apps.f0xx.org` server block (`client_max_body_size 32m` for zephyr.elf uploads) |
 
 ## Steps (you run on monstro)
 

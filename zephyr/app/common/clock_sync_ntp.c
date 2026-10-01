@@ -8,6 +8,8 @@
 #include <zephyr/net/socket.h>
 #include <zephyr/sys/atomic.h>
 
+#include "network_manager.h"
+
 LOG_MODULE_REGISTER(clock_ntp, LOG_LEVEL_INF);
 
 #define NTP_BOOT_DELAY_MS     (5U * 60U * 1000U)
@@ -143,6 +145,10 @@ void clock_sync_ntp_poll(void)
 
 	if (g_boot_deadline > 0 && k_uptime_get() >= g_boot_deadline) {
 		g_boot_deadline = 0;
+		if (!network_manager_link_up()) {
+			LOG_INF("NTP boot-delay skipped (WiFi not associated)");
+			return;
+		}
 		LOG_INF("NTP boot-delay query (+5 min)");
 		if (ntp_query_once() == 0) {
 			arm_periodic();

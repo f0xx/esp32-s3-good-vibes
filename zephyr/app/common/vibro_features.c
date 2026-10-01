@@ -1,3 +1,4 @@
+#include <stddef.h>
 #include "vibro_features.h"
 
 #include <math.h>

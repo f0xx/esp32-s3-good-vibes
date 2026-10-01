@@ -25,6 +25,8 @@ oneway interface IImuBleService {
     void requestConfigSync();
     void pushConfig(in byte[] blob, boolean commit);
     void uploadFirmware(in byte[] firmware);
+    /** Preferred: avoid Binder ~1 MB limit on signed slot images. */
+    void uploadFirmwarePath(String path);
 
     void requestNetScan();
     void requestNetProfiles();
@@ -38,6 +40,8 @@ oneway interface IImuBleService {
     void vibroRefClearAll();
     /** End ref wizard — device acrylic LED off (operational). */
     void vibroArm();
+    /** START/END REPAIR: pause live persist without wiping refs. */
+    void vibroSetSensingPaused(boolean paused);
     /** Async: result arrives via onVibroRefList. */
     void requestVibroRefList();
     void analyzeSpectrum();
@@ -67,4 +71,15 @@ oneway interface IImuBleService {
     void floorCalibClear();
     /** Async: result arrives via onFloorCalStatus. */
     void requestFloorCalStatus();
+
+    /** Arm IMU dead-reckon for the AHRS screen. GPS is requested by AhrsActivity, not here. */
+    void startGeoTracking();
+    void stopGeoTracking();
+    /** IMU dead-reckon origin from a GPS fix obtained by the visible AHRS screen. */
+    void seedGeoAnchor(double lat, double lon);
+
+    /** Acrylic LED debug: mask bits 1=R 2=G 4=B. All-zero is programmed off (not schema). */
+    void setDebugLed(int mask);
+    /** Leave LED debug — device returns to the normal acrylic schema. */
+    void clearDebugLed();
 }

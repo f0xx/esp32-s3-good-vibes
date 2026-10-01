@@ -39,11 +39,15 @@ Or use the helper script (hardcoded paths — edit if needed):
 ## Configure on device
 
 1. Open **ESP32S3ImuSim**
-2. Scan → connect to **ESP32S3 IMU sim** (Zephyr) or matching name
-3. **Cloud** settings (optional):
+2. Grant the requested Bluetooth/location/notification permissions and allow unrestricted battery usage when prompted.
+3. The foreground BLE service starts independently of the UI, reconnects in the background, and is re-armed after reboot, package replacement, task removal, or service destruction.
+4. Scan → connect to **ESP32S3 IMU sim** (Zephyr) or matching name
+5. **Cloud** settings (optional):
    - URL: `http://<backend-ip>:8080`
    - API key: same as backend `IMU_API_KEY`
    - Device / group IDs for ingest
+
+Android and OEM force-stop controls cannot be overridden by an application. The service uses a foreground notification, `START_STICKY`, boot/package-replace receivers, and an alarm-backed restart as the strongest platform-supported recovery.
 
 ## BLE protocol
 

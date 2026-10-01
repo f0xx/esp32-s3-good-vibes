@@ -45,6 +45,55 @@
                 android:textColor="#AAAAAA"
                 android:textSize="13sp" />
 
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:paddingBottom="4dp"
+                android:text="@string/led_debug_heading"
+                android:textColor="#CCCCCC"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/ledDebugHelp"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:lineSpacingExtra="3dp"
+                android:paddingBottom="8dp"
+                android:text="@string/led_debug_help"
+                android:textColor="#AAAAAA"
+                android:textSize="13sp" />
+
+            <TextView
+                android:id="@+id/ledDebugStatus"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:paddingBottom="8dp"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp" />
+
+            <com.google.android.material.checkbox.MaterialCheckBox
+                android:id="@+id/ledDebugR"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/led_debug_r"
+                android:textColor="@android:color/white" />
+
+            <com.google.android.material.checkbox.MaterialCheckBox
+                android:id="@+id/ledDebugG"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/led_debug_g"
+                android:textColor="@android:color/white" />
+
+            <com.google.android.material.checkbox.MaterialCheckBox
+                android:id="@+id/ledDebugB"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="16dp"
+                android:text="@string/led_debug_b"
+                android:textColor="@android:color/white" />
+
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/crashDebugBistButton"
                 style="@style/Widget.MaterialComponents.Button.OutlinedButton"

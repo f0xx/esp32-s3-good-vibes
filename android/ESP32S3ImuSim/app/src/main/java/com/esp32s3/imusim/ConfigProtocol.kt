@@ -42,14 +42,22 @@ object ConfigProtocol {
     const val CMD_FLOOR_CALIB_START = 11
     /** Discard the stored flat-floor correction (back to identity). */
     const val CMD_FLOOR_CALIB_CLEAR = 12
+    /** Debug LED: [13][0] releases schema; [13][1][mask] holds R/G/B (bits 1/2/4). */
+    const val CMD_LED_DEBUG = 13
+    /** Pause live persist during repair without wiping refs. [14] or [14][1]=pause; [14][0]=resume. */
+    const val CMD_VIBRO_PAUSE = 14
+    /** Payload: opcode + channel ASCII (stable|staging|dev). Sync phone CDN channel → ESP. */
+    const val CMD_OTA_CHANNEL = 15
 }
 
 object OtaProtocol {
+    // Service 4a6e0201 is distinct from WiFi NET (4a6e0200). CTRL/DATA numbers
+    // collide with NET PROFILES/CMD — always match writes by parent service UUID.
     val SERVICE_UUID: UUID = UUID.fromString("4a6e0201-0000-1000-8000-00805f9b34fb")
     val CHAR_CTRL_UUID: UUID = UUID.fromString("4a6e0202-0000-1000-8000-00805f9b34fb")
     val CHAR_DATA_UUID: UUID = UUID.fromString("4a6e0203-0000-1000-8000-00805f9b34fb")
 
     const val CHUNK_SIZE = 480
     /** Gap between DATA chunk writes — BLE stack / ESP need breathing room. */
-    const val CHUNK_WRITE_DELAY_MS = 20L
+    const val CHUNK_WRITE_DELAY_MS = 35L
 }

@@ -16,9 +16,16 @@
 #include "crash_ring_store.h"
 #include "device_config.h"
 #include "panel_backlight.h"
+#include "stack_ra_check.h"
 #include "stall_watchdog.h"
 
 LOG_MODULE_REGISTER(power_mgr, LOG_LEVEL_INF);
+
+/* Handshake provides the real symbol; other apps keep CPU apply unblocked. */
+__attribute__((weak)) bool imu_pipeline_recovering(void)
+{
+	return false;
+}
 
 /** After screen-on while BLE is connected, cap CPU/render briefly to avoid VHCI races. */
 #define SCREEN_BLE_RAMP_MS 4000
@@ -27,7 +34,7 @@ static const struct device *g_display;
 static struct device_config_v1 g_cfg;
 static bool g_screen_on = true;
 static bool g_tft_render = true;
-static bool g_panel_hw_on = true;
+static bool g_panel_hw_on = false; /* force first sync to actually unblank */
 static bool g_panel_hw_want = true;
 static bool g_panel_hw_sync_needed;
 static bool (*g_panel_hw_fn)(bool on);
@@ -120,13 +127,20 @@ static int apply_cpu_mhz(uint8_t mhz)
 	mhz = clamp_cpu_mhz(mhz);
 
 	err = apply_cpu_mhz_fast(mhz);
+	if (err != 0 && (g_bt_controller_on || g_ble_active)) {
+		/* Full clock_control_configure() resets regi2c / BBPLL and wedges BT
+		 * (historical TG0WDT ~37 s). Keep the running tap rather than ILL/WDT. */
+		LOG_WRN("CPU fast path failed (%d) — keep %u MHz (BT live)", err,
+			g_cpu_settled_mhz);
+		return 0;
+	}
 	if (err != 0) {
 		/* Should not happen — clamp_cpu_mhz() only ever returns 80/160/240, all PLL —
 		 * but fall back to the full (slower, BT-unsafe) driver path rather than silently
 		 * doing nothing if some future tier ever asks for something else. */
 		LOG_WRN("CPU fast path unavailable (%d) — falling back to full reconfigure", err);
 #if DT_HAS_COMPAT_STATUS_OKAY(espressif_xtensa_lx7)
-		static const struct device *clk_dev = DEVICE_DT_GET(DT_NODELABEL(rtc));
+		static const struct device *clk_dev = DEVICE_DT_GET(DT_NODELABEL(clock));
 		struct esp32_clock_config clk_cfg = { 0 };
 
 		clk_cfg.cpu.clk_src = ESP32_CPU_CLK_SRC_PLL;
@@ -211,6 +225,11 @@ static void apply_cpu_deferred(void)
 		return;
 	}
 
+	/* PLL retap during QMI8658 I2C init wedges the bus; leave pending until recover done. */
+	if (imu_pipeline_recovering()) {
+		return;
+	}
+
 	g_cpu_apply_pending = false;
 	stall_watchdog_feed_main();
 	apply_cpu_if_needed(g_target_cpu_mhz);
@@ -219,7 +238,9 @@ static void apply_cpu_deferred(void)
 
 void power_manager_sync_render(void)
 {
+	STACK_RA_CHECK_SETUP;
 	power_manager_sync_panel_hw();
+	STACK_RA_CHECK();
 }
 
 void power_manager_set_display_busy_query(bool (*fn)(void))
@@ -339,6 +360,13 @@ static void apply_rates(void)
 	}
 	if (g_imu_hz_override != 0U) {
 		imu_hz = g_imu_hz_override;
+	}
+	/* AHRS / lab can request 240 MHz. On battery that sag + BLE + LCD is what
+	 * produced today's task-WDT cluster (~20 s uptime, empty PC). Cap. */
+	if (!on_dc && target_cpu > OPMODE_CPU_MHZ_DEMO_BAT) {
+		LOG_WRN("CPU %u MHz capped to %u on battery", target_cpu,
+			OPMODE_CPU_MHZ_DEMO_BAT);
+		target_cpu = OPMODE_CPU_MHZ_DEMO_BAT;
 	}
 
 	if (g_screen_on && g_ble_active && g_screen_ble_ramp_until > 0 &&
@@ -590,6 +618,9 @@ void power_manager_tick(void)
 		g_last_on_dc_valid = true;
 		LOG_INF("power source -> %s — re-applying %s mode targets", on_dc ? "DC" : "BAT",
 			g_staging_mode ? "staging" : "demo");
+		/* Unplug sag + immediate clock change was wedging BT (task WDT ~20 s). */
+		battery_monitor_settle(800U);
+		stall_watchdog_feed_main();
 		apply_rates();
 		if (g_imu_reschedule != NULL) {
 			g_imu_reschedule();
@@ -710,7 +741,8 @@ void power_manager_log_telemetry(uint32_t render_frames, uint32_t imu_ticks,
 	const uint32_t frame_ms = render_frames ? (window_ms / render_frames) : 0U;
 	const struct battery_state *bat = battery_monitor_state();
 
-	LOG_INF("telemetry screen=%s target(cpu=%u want=%u%s render=%uHz imu=%uHz) "
+	/* DBG: long line every HB window — IMMEDIATE usb_serial soak wedge. */
+	LOG_DBG("telemetry screen=%s target(cpu=%u want=%u%s render=%uHz imu=%uHz) "
 		"actual(cpu=%u settled=%u apb=%u render=%u.%uHz imu=%u.%uHz frame=%ums flush=%ums "
 		"bat=%.2fV %u%% adc=%umV src=%s",
 		g_screen_on ? "on" : "off", g_target_cpu_mhz, g_cpu_desired_mhz,

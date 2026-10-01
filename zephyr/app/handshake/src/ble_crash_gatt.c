@@ -15,6 +15,7 @@
 #include "crash_debug.h"
 #include "bist.h"
 #include "crash_ring_store.h"
+#include "flash_safety.h"
 #include "mt200_bridge.h"
 
 LOG_MODULE_REGISTER(ble_crash, LOG_LEVEL_INF);
@@ -174,6 +175,17 @@ static void process_ctrl_json(void)
 	char *json = g_ctrl_json;
 
 	if (strstr(json, "\"op\":\"clear\"") != NULL) {
+		static int64_t last_clear_ms;
+		const int64_t now = k_uptime_get();
+
+		/* Phone was re-issuing clear every ~1–3s while dual-role linked — pure ATT spam. */
+		if (last_clear_ms != 0 && (now - last_clear_ms) < 10000) {
+			LOG_DBG("crash clear ignored (rate limit)");
+			refresh_info_json();
+			return;
+		}
+		last_clear_ms = now;
+
 		uint8_t slots[CRASH_RING_SLOTS];
 		int n = parse_slots_array(json, slots, (int)ARRAY_SIZE(slots));
 		int slot = -1;
@@ -317,8 +329,8 @@ bool ble_crash_gatt_pending(void)
 
 static void maybe_flush_ram_clears(void)
 {
-	if (!ble_imu_link_active() &&
-	    ble_imu_disconnected_settled(CRASH_FLUSH_DISCONNECT_SETTLE_MS)) {
+	/* Use the shared gate (phone + MT200) — not phone-only settle. */
+	if (app_flash_erase_safe()) {
 		crash_ring_flush_ram_clears();
 	}
 }

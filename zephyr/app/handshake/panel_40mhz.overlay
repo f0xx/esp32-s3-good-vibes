@@ -1,0 +1,4 @@
+/* Release-only. Desk DTS stays 20 MHz (GPIO-matrix spec). */
+&st7789v {
+	mipi-max-frequency = <40000000>;
+};

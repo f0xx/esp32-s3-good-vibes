@@ -3,9 +3,11 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
+#include <zephyr/sys/util.h>
 
 #include "battery_monitor.h"
 #include "device_config.h"
+#include "panel_backlight.h"
 #include "vibro_capture.h"
 #include "vibro_ref_store.h"
 #include "ws2812_gpio38.h"
@@ -21,6 +23,8 @@ LOG_MODULE_REGISTER(vibro_led, LOG_LEVEL_INF);
 
 static atomic_t g_nok;
 static atomic_t g_ok_until_ms;
+static atomic_t g_debug_on;
+static atomic_t g_debug_mask;
 static uint8_t g_last_grb[3];
 static uint8_t g_last_reason;
 
@@ -31,6 +35,7 @@ enum led_reason {
 	LED_REASON_NOK,
 	LED_REASON_SETUP_BLUE,
 	LED_REASON_AWAIT_FLASH,
+	LED_REASON_DEBUG,
 };
 
 static uint8_t ref_slot_count(void)
@@ -79,23 +84,25 @@ static const char *reason_detail(enum led_reason reason)
 {
 	switch (reason) {
 	case LED_REASON_OFF:
-		return "operational (armed, refs OK)";
+		return "off — operational (armed, refs OK)";
 	case LED_REASON_OK_PULSE:
 		return "ok pulse (NVS/config saved)";
 	case LED_REASON_BATT_FLASH:
 		return "battery <=10% on battery power";
 	case LED_REASON_NOK:
-		return "verdict NOK or armed without loaded reference";
+		return "armed without loaded reference";
 	case LED_REASON_SETUP_BLUE:
 		return "setup — no reference profiles in flash";
 	case LED_REASON_AWAIT_FLASH:
 		return "await — refs recorded, not armed yet";
+	case LED_REASON_DEBUG:
+		return "debug RGB override (phone checkboxes)";
 	default:
 		return "?";
 	}
 }
 
-/** WS2812 on this board is GRB wire order — set channels explicitly, not RGB param names. */
+/** Logical GRB in; RGB on the wire (this pixel is not Arduino-default GRB). */
 static void apply_grb(uint8_t green, uint8_t red, uint8_t blue, enum led_reason reason)
 {
 	if (g_last_grb[0] == green && g_last_grb[1] == red && g_last_grb[2] == blue &&
@@ -108,22 +115,32 @@ static void apply_grb(uint8_t green, uint8_t red, uint8_t blue, enum led_reason 
 	g_last_grb[2] = blue;
 	if (reason != g_last_reason) {
 		g_last_reason = reason;
-		LOG_INF("acrylic LED grb=%u,%u,%u reason=%u (%s; slots=%u armed=%d ref_len=%u)",
-			green, red, blue, (unsigned)reason, reason_detail(reason),
+		LOG_INF("acrylic LED rgb=%u,%u,%u reason=%u (%s; slots=%u armed=%d ref_len=%u)",
+			red, green, blue, (unsigned)reason, reason_detail(reason),
 			ref_slot_count(), device_config_vibro_armed() ? 1 : 0,
 			(unsigned)vibro_capture_reference_len());
 	}
-	ws2812_gpio38_grb(green, red, blue);
+	ws2812_gpio38_rgb(red, green, blue);
 }
 
 static void render(void)
 {
 	const uint32_t now = k_uptime_get_32();
 	const uint32_t ok_until = (uint32_t)atomic_get(&g_ok_until_ms);
+	const uint8_t dbg = (uint8_t)atomic_get(&g_debug_mask);
+	const bool debug_on = atomic_get(&g_debug_on) != 0;
+
+	if (debug_on) {
+		const uint8_t r = (dbg & 1U) ? LED_CH_BRIGHT : 0U;
+		const uint8_t g = (dbg & 2U) ? LED_CH_BRIGHT : 0U;
+		const uint8_t b = (dbg & 4U) ? LED_CH_BRIGHT : 0U;
+
+		apply_grb(g, r, b, LED_REASON_DEBUG);
+		return;
+	}
 
 	if (ok_until != 0U && (int32_t)(now - ok_until) < 0) {
-		/* Brief blue flash — green reads as red through the red acrylic diffuser. */
-		apply_grb(0U, 0U, LED_CH_BRIGHT, LED_REASON_OK_PULSE);
+		apply_grb(LED_CH_BRIGHT, 0U, 0U, LED_REASON_OK_PULSE);
 		return;
 	}
 	if (ok_until != 0U) {
@@ -134,7 +151,9 @@ static void render(void)
 		if (flash_on_phase()) {
 			apply_grb(LED_CH_BRIGHT, LED_CH_BRIGHT, 0U, LED_REASON_BATT_FLASH);
 		} else {
-			apply_grb(0U, 0U, 0U, LED_REASON_OFF);
+			/* Keep BATT_FLASH as the reason so the off half of the 2s/2s
+			 * blink is not logged as "operational (armed, refs OK)". */
+			apply_grb(0U, 0U, 0U, LED_REASON_BATT_FLASH);
 		}
 		return;
 	}
@@ -148,7 +167,7 @@ static void render(void)
 		if (flash_on_phase()) {
 			apply_grb(0U, 0U, LED_CH_BRIGHT, LED_REASON_AWAIT_FLASH);
 		} else {
-			apply_grb(0U, 0U, 0U, LED_REASON_OFF);
+			apply_grb(0U, 0U, 0U, LED_REASON_AWAIT_FLASH);
 		}
 		return;
 	}
@@ -165,6 +184,8 @@ void vibro_led_init(void)
 {
 	atomic_set(&g_nok, 0);
 	atomic_set(&g_ok_until_ms, 0);
+	atomic_set(&g_debug_on, 0);
+	atomic_set(&g_debug_mask, 0);
 	g_last_grb[0] = g_last_grb[1] = g_last_grb[2] = 255U;
 	g_last_reason = 255U;
 	(void)ws2812_gpio38_init();
@@ -183,21 +204,34 @@ void vibro_led_poll(void)
 
 void vibro_led_on_verdict(enum vibro_level level)
 {
-	switch (level) {
-	case VIBRO_LEVEL_ALERT:
-	case VIBRO_LEVEL_WARN:
-		atomic_set(&g_nok, 1);
-		break;
-	case VIBRO_LEVEL_OK:
-	default:
-		atomic_set(&g_nok, 0);
-		break;
-	}
+	/* Per-window candidate (vd) never pages the acrylic LED. Backend
+	 * operator_alert is the mechanic page; missing-ref NOK still applies. */
+	ARG_UNUSED(level);
+	atomic_set(&g_nok, 0);
 }
 
 void vibro_led_pulse_ok(void)
 {
 	atomic_set(&g_ok_until_ms, (atomic_val_t)(k_uptime_get_32() + LED_OK_PULSE_MS));
+}
+
+void vibro_led_debug_set(bool active, uint8_t mask)
+{
+	mask &= 7U;
+	atomic_set(&g_debug_on, active ? 1 : 0);
+	atomic_set(&g_debug_mask, mask);
+	g_last_grb[0] = g_last_grb[1] = g_last_grb[2] = 255U;
+	g_last_reason = 255U;
+	/* Hold LCD backlight only (ST7789 TFT). Keep scene rendering so leave is just BL on. */
+	panel_backlight_hold_off(active);
+	if (!active) {
+		ws2812_gpio38_off();
+		LOG_INF("LED debug off — schema and LCD backlight resumed");
+	} else {
+		LOG_INF("LED debug on mask=0x%x (R=%d G=%d B=%d) LCD BL held off", mask,
+			(mask & 1) ? 1 : 0, (mask & 2) ? 1 : 0, (mask & 4) ? 1 : 0);
+	}
+	render();
 }
 
 void devcfg_led_nvs_ok(void)

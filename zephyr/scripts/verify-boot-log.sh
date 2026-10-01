@@ -23,8 +23,13 @@ check() {
 echo "boot-log verify:"
 check "handshake: main()"
 check "stage: main loop"
-check "BLE advertising started"
-check "framebuffer"
+if grep -qE "BLE advertising started|advertising as" <<<"$text"; then
+	echo "OK  BLE advertising"
+else
+	echo "MISS BLE advertising"
+	fail=1
+fi
+check "framebuffer ready"
 check "backlight on"
 
 # Post-boot heartbeat (10s) when USB CDC misses early boot text.

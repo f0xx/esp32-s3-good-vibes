@@ -9,8 +9,11 @@
 #include <esp_flash.h>
 #include <esp_err.h>
 
+#include "app_func_trace.h"
 #include "crash_ring_store.h"
 #include "device_config.h"
+#include "imu_pipeline.h"
+#include "stall_watchdog.h"
 
 LOG_MODULE_REGISTER(bist, LOG_LEVEL_INF);
 
@@ -22,14 +25,16 @@ bool qmi8658_ready(void);
 uint8_t qmi8658_who_am_i(void);
 uint8_t qmi8658_i2c_addr(void);
 
-static struct bist_result g_last;
-
 struct bist_line {
 	const char *tag;
 	uint32_t flag;
 	bool pass;
 	char detail[44];
 };
+
+static struct bist_result g_last;
+static struct bist_line g_lines[BIST_TEST_MAX];
+static uint8_t g_line_count;
 
 static struct bist_line *line_add(struct bist_line *lines, uint8_t *count, const char *tag,
 				  uint32_t flag)
@@ -58,6 +63,30 @@ static void line_pass(struct bist_line *ln)
 	g_last.pass_count++;
 }
 
+static void summary_append_fail_tag(const char *tag)
+{
+	size_t len;
+	size_t room;
+
+	if (tag == NULL || tag[0] == '\0') {
+		return;
+	}
+
+	if (g_last.summary[0] == '\0') {
+		(void)snprintf(g_last.summary, sizeof(g_last.summary), "fail:%s", tag);
+		return;
+	}
+
+	len = strlen(g_last.summary);
+	room = sizeof(g_last.summary) - len;
+	if (room < 2U) {
+		return;
+	}
+	g_last.summary[len] = ',';
+	g_last.summary[len + 1U] = '\0';
+	(void)strncat(g_last.summary, tag, room - 2U);
+}
+
 static void line_fail(struct bist_line *ln)
 {
 	if (ln == NULL) {
@@ -67,23 +96,23 @@ static void line_fail(struct bist_line *ln)
 	ln->pass = false;
 	g_last.flags_fail |= ln->flag;
 	g_last.fail_count++;
-
-	if (g_last.fail_count == 1U) {
-		snprintf(g_last.summary, sizeof(g_last.summary), "fail:%s", ln->tag);
-	} else if (strncmp(g_last.summary, "fail:", 5) == 0) {
-		char tmp[sizeof(g_last.summary)];
-
-		snprintf(tmp, sizeof(tmp), "%s,%s", g_last.summary + 5, ln->tag);
-		snprintf(g_last.summary, sizeof(g_last.summary), "fail:%s", tmp);
-	}
+	summary_append_fail_tag(ln->tag);
 }
 
-static void bist_imu(struct bist_line *lines, uint8_t *count)
+static void bist_score_imu(struct bist_line *ln, bool allow_deferred)
 {
-	struct bist_line *ln = line_add(lines, count, "imu", BIST_FLAG_IMU);
 	const bool ready = qmi8658_ready();
 	const uint8_t who = qmi8658_who_am_i();
 	const uint8_t addr = qmi8658_i2c_addr();
+	const bool started = imu_pipeline_started();
+
+	/* Bring-up is deferred until after BLE/CPU settle — who=0x00 here is expected. */
+	if (allow_deferred && !started && !ready) {
+		snprintf(ln->detail, sizeof(ln->detail),
+			 "deferred who=0x%02X (bring-up pending)", who);
+		line_pass(ln);
+		return;
+	}
 
 	snprintf(ln->detail, sizeof(ln->detail), "who=0x%02X addr=0x%02X ready=%u exp=0x05",
 		 who, addr, ready ? 1U : 0U);
@@ -94,6 +123,14 @@ static void bist_imu(struct bist_line *lines, uint8_t *count)
 	}
 
 	line_pass(ln);
+}
+
+static void bist_imu(struct bist_line *lines, uint8_t *count)
+{
+	struct bist_line *ln = line_add(lines, count, "imu", BIST_FLAG_IMU);
+
+	/* On-demand BLE BIST: bring-up already scheduled — require live QMI. */
+	bist_score_imu(ln, !imu_pipeline_started());
 }
 
 static void bist_heap(struct bist_line *lines, uint8_t *count)
@@ -118,6 +155,7 @@ static void bist_heap(struct bist_line *lines, uint8_t *count)
 		 (unsigned)heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
 	line_pass(ln);
 }
+
 
 static void bist_cfg(struct bist_line *lines, uint8_t *count)
 {
@@ -204,9 +242,10 @@ static void bist_mem(struct bist_line *lines, uint8_t *count)
 	line_pass(ln);
 }
 
-static void bist_log_report(const struct bist_line *lines, uint8_t count)
+static void bist_log_report(const struct bist_line *lines, uint8_t count, const char *phase)
 {
-	LOG_INF("BIST report (%u tests, %ums):", count, g_last.elapsed_ms);
+	LOG_INF("BIST report %s (%u tests, %ums):", phase != NULL ? phase : "", count,
+		g_last.elapsed_ms);
 
 	for (uint8_t i = 0; i < count; i++) {
 		if (lines[i].pass) {
@@ -221,36 +260,97 @@ static void bist_log_report(const struct bist_line *lines, uint8_t count)
 			 g_last.pass_count, count, g_last.elapsed_ms);
 		LOG_INF("BIST ok — %u/%u passed in %ums", g_last.pass_count, count,
 			g_last.elapsed_ms);
-	} else {
+		return;
+	}
+
+	g_last.summary[0] = '\0';
+	for (uint8_t i = 0; i < count; i++) {
+		if (lines[i].pass) {
+			continue;
+		}
+		summary_append_fail_tag(lines[i].tag);
+	}
+	{
 		char suffix[24];
 
 		snprintf(suffix, sizeof(suffix), "(%u/%u,%ums)", g_last.pass_count, count,
 			 g_last.elapsed_ms);
 		strncat(g_last.summary, suffix,
 			sizeof(g_last.summary) - strlen(g_last.summary) - 1U);
-		LOG_WRN("BIST %s", g_last.summary);
 	}
+	LOG_WRN("BIST %s", g_last.summary);
 }
 
 void bist_run(void)
 {
-	struct bist_line lines[BIST_TEST_MAX];
-	uint8_t count = 0;
 	const uint32_t t0 = k_uptime_get_32();
 
+	APP_ENTER();
 	memset(&g_last, 0, sizeof(g_last));
-	memset(lines, 0, sizeof(lines));
+	memset(g_lines, 0, sizeof(g_lines));
+	g_line_count = 0;
 
 	LOG_INF("BIST start");
 
-	bist_imu(lines, &count);
-	bist_heap(lines, &count);
-	bist_cfg(lines, &count);
-	bist_crash_ring(lines, &count);
-	bist_mem(lines, &count);
+	bist_imu(g_lines, &g_line_count);
+	bist_heap(g_lines, &g_line_count);
+	bist_cfg(g_lines, &g_line_count);
+	bist_crash_ring(g_lines, &g_line_count);
+	bist_mem(g_lines, &g_line_count);
 
 	g_last.elapsed_ms = k_uptime_get_32() - t0;
-	bist_log_report(lines, count);
+	bist_log_report(g_lines, g_line_count, "boot");
+	APP_LEAVE();
+}
+
+void bist_imu_finalize(uint32_t wait_ms)
+{
+	struct bist_line *imu_ln = NULL;
+	const uint32_t t0 = k_uptime_get_32();
+
+	APP_ENTER();
+	LOG_INF("BIST imu finalize (wait_ms=%u, started=%u)", wait_ms,
+		imu_pipeline_started() ? 1U : 0U);
+
+	while (!qmi8658_ready() && (k_uptime_get_32() - t0) < wait_ms) {
+		k_msleep(20);
+		stall_watchdog_feed_main();
+	}
+
+	for (uint8_t i = 0; i < g_line_count; i++) {
+		if (g_lines[i].flag == BIST_FLAG_IMU) {
+			imu_ln = &g_lines[i];
+			break;
+		}
+	}
+	if (imu_ln == NULL) {
+		imu_ln = line_add(g_lines, &g_line_count, "imu", BIST_FLAG_IMU);
+	}
+
+	/* Drop prior deferred IMU pass/fail before re-scoring. */
+	if ((g_last.flags_ok & BIST_FLAG_IMU) != 0U) {
+		g_last.flags_ok &= ~BIST_FLAG_IMU;
+		if (g_last.pass_count > 0U) {
+			g_last.pass_count--;
+		}
+	}
+	if ((g_last.flags_fail & BIST_FLAG_IMU) != 0U) {
+		g_last.flags_fail &= ~BIST_FLAG_IMU;
+		if (g_last.fail_count > 0U) {
+			g_last.fail_count--;
+		}
+	}
+	if (imu_ln != NULL) {
+		imu_ln->pass = false;
+		imu_ln->detail[0] = '\0';
+	}
+
+	bist_score_imu(imu_ln, false);
+	g_last.elapsed_ms = k_uptime_get_32() - t0;
+	/* Re-print full 5-line report — early boot UART often drops the first one
+	 * (USB ACM flood during BLE bring-up; see net_mgr line glued to recover). */
+	bist_log_report(g_lines, g_line_count, "post-imu");
+	APP_LEAVE();
 }
 
 const struct bist_result *bist_last(void)
@@ -270,6 +370,11 @@ int bist_json(char *buf, size_t len)
 
 void bist_run(void)
 {
+}
+
+void bist_imu_finalize(uint32_t wait_ms)
+{
+	ARG_UNUSED(wait_ms);
 }
 
 const struct bist_result *bist_last(void)

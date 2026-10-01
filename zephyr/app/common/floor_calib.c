@@ -11,6 +11,7 @@
 #include "clock_sync.h"
 #include "flash_safety.h"
 #include "floor_calib.h"
+#include "stack_ra_check.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -99,6 +100,7 @@ static int persist_save(void)
 
 void floor_calib_poll(void)
 {
+	STACK_RA_CHECK_SETUP;
 	if (!atomic_get(&g_dirty)) {
 		return;
 	}
@@ -114,6 +116,7 @@ void floor_calib_poll(void)
 	if (persist_save() != 0) {
 		LOG_ERR("floor calib: settings_save_one failed");
 	}
+	STACK_RA_CHECK();
 }
 
 void floor_calib_start(uint16_t duration_ms)
@@ -244,8 +247,10 @@ void floor_calib_apply(struct imu_sample *sample)
 		return;
 	}
 
-	const struct vec3 a = mat3_transform(&g_st.r, vec3_make(sample->ax, sample->ay, sample->az));
-	const struct vec3 g = mat3_transform(&g_st.r, vec3_make(sample->gx, sample->gy, sample->gz));
+	/* Copy out of packed persist so &mat3 is naturally aligned. */
+	const struct mat3 r = g_st.r;
+	const struct vec3 a = mat3_transform(&r, vec3_make(sample->ax, sample->ay, sample->az));
+	const struct vec3 g = mat3_transform(&r, vec3_make(sample->gx, sample->gy, sample->gz));
 
 	sample->ax = a.x;
 	sample->ay = a.y;

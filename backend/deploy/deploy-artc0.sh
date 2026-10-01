@@ -6,8 +6,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REMOTE="${REMOTE:-foxx@artc0}"
 REMOTE_DIR="${REMOTE_DIR:-~/esp32-imu-backend}"
+ZEPHYR_ELF="${ZEPHYR_ELF:-}"
+if [[ -z "$ZEPHYR_ELF" ]]; then
+	ZEPHYR_ELF="$(find "$HOME/zephyrproject/zephyr/build" -name zephyr.elf ! -path '*mcuboot*' -print -quit 2>/dev/null || true)"
+fi
 ZEPHYR_ELF="${ZEPHYR_ELF:-$HOME/zephyrproject/zephyr/build/zephyr/zephyr.elf}"
-ZEPHYR_ADDR2LINE="${ZEPHYR_ADDR2LINE:-$HOME/zephyr-sdk-0.16.8/xtensa-espressif_esp32s3_zephyr-elf/bin/xtensa-espressif_esp32s3_zephyr-elf-addr2line}"
+ZEPHYR_ADDR2LINE="${ZEPHYR_ADDR2LINE:-$HOME/zephyr-sdk-1.0.1/gnu/xtensa-espressif_esp32s3_zephyr-elf/bin/xtensa-espressif_esp32s3_zephyr-elf-addr2line}"
 STAGE_DIR="${BACKEND_DIR}/deploy/stage"
 
 echo "=== stage symbolication assets"

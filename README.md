@@ -78,7 +78,7 @@ Accu Gnd (black) <-> G pin (common ground)
 
 | Task | Guide |
 |------|-------|
-| Install Zephyr v3.7 + SDK 0.16.8 | [docs/zephyr-install.md](docs/zephyr-install.md) |
+| Install Zephyr v4.4 + SDK 1.0.1 | [docs/zephyr-install.md](docs/zephyr-install.md) |
 | Install arduino-cli + esp32 core | [docs/arduino-firmware.md](docs/arduino-firmware.md) |
 | Android SDK + JDK 21 | [docs/android-app.md](docs/android-app.md) |
 | Docker (backend) | [docs/backend.md](docs/backend.md) |
@@ -89,7 +89,7 @@ Accu Gnd (black) <-> G pin (common ground)
 
 ### 1. One-time toolchain
 
-Follow **[docs/zephyr-install.md](docs/zephyr-install.md)**. You need Zephyr **v3.7.0**, SDK **0.16.8**, target `xtensa-espressif_esp32s3_zephyr-elf`.
+Follow **[docs/zephyr-install.md](docs/zephyr-install.md)**. You need Zephyr **v4.4.2**, SDK **1.0.1**, target `xtensa-espressif_esp32s3_zephyr-elf`.
 
 ### 2. Build and flash
 
@@ -234,11 +234,11 @@ esp32-s3-imu-basics/
 | [docs/zephyr-install.md](docs/zephyr-install.md) | Zephyr + SDK install (Linux/Gentoo/Debian) |
 | [docs/zephyr-hardware.md](docs/zephyr-hardware.md) | Ported peripherals, drivers, CPU scaling, partitions |
 | [docs/zephyr-build.md](docs/zephyr-build.md) | Build, flash, serial, troubleshooting |
-| [docs/arduino-firmware.md](docs/arduino-firmware.md) | Arduino profiles, upload, battery reference |
 | [docs/android-app.md](docs/android-app.md) | Build/install APK, BLE/cloud settings |
 | [docs/backend.md](docs/backend.md) | Docker deploy, API, Grafana, firewall |
 | [docs/battery.md](docs/battery.md) | ADC path, HUD labels, validation |
-| [docs/dual-firmware-probing.md](docs/dual-firmware-probing.md) | Switching Arduino ↔ Zephyr, protocol parity |
+| [docs/dual-firmware-probing.md](docs/dual-firmware-probing.md) | Zephyr production vs Arduino reference, how to tell them apart |
+| [docs/zephyr-ota.md](docs/zephyr-ota.md) | Cloud → phone BLE bridge → MCUboot A/B, OK/NOK (PDF: [zephyr-ota.pdf](docs/zephyr-ota.pdf)) |
 | [docs/zephyr-experiment.md](docs/zephyr-experiment.md) | Zephyr port notes and history |
 | [docs/metrics.md](docs/metrics.md) | On-device/backend metrics reference |
 | [docs/veepoo-proto-ble-reverse.md](docs/veepoo-proto-ble-reverse.md) | Veepoo/MT200 BLE protocol, tools, live HR/SpO2 results, step opcodes, integration plan |

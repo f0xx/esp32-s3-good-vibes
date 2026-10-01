@@ -31,22 +31,27 @@
 
 		slot0_partition: partition@10000 {
 			label = "image-0";
-			reg = <0x00010000 0x00100000>;
+			reg = <0x00010000 0x00300000>;
 		};
 
-		slot1_partition: partition@110000 {
+		slot1_partition: partition@310000 {
 			label = "image-1";
-			reg = <0x00110000 0x00100000>;
+			reg = <0x00310000 0x00300000>;
 		};
 
-		scratch_partition: partition@210000 {
+		scratch_partition: partition@610000 {
 			label = "image-scratch";
-			reg = <0x00210000 0x00040000>;
+			reg = <0x00610000 0x00040000>;
 		};
 
-		storage_partition: partition@250000 {
+		storage_partition: partition@650000 {
 			label = "storage";
-			reg = <0x00250000 0x00006000>;
+			reg = <0x00650000 0x00008000>;
+		};
+
+		appdata_partition: partition@65c000 {
+			label = "app-data";
+			reg = <0x0065c000 0x00040000>;
 		};
 	};
 };

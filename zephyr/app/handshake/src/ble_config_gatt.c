@@ -11,6 +11,7 @@
 #include "flash_safety.h"
 #include "floor_calib.h"
 #include "imu_pipeline.h"
+#include "ota_channel.h"
 #include "soft_reboot.h"
 #include "vibro_led.h"
 #include "vibro_capture.h"
@@ -215,8 +216,13 @@ static ssize_t write_cmd(struct bt_conn *conn, const struct bt_gatt_attr *attr, 
 		LOG_WRN("vibro reference: all slots cleared (CMD 9)");
 		break;
 	case 10:
+		vibro_capture_set_sensing_paused(false);
 		device_config_set_vibro_armed(true);
-		LOG_INF("vibro monitoring armed (CMD 10) — acrylic LED operational");
+		LOG_INF("vibro monitoring armed (CMD 10) — pause cleared, acrylic LED operational");
+		break;
+	case 14:
+		/* [14] or [14][1] = pause persist (repair). [14][0] = resume persist. */
+		vibro_capture_set_sensing_paused(len < 2 || bytes[1] != 0U);
 		break;
 	case 5:
 		if (len >= 5) {
@@ -248,6 +254,28 @@ static ssize_t write_cmd(struct bt_conn *conn, const struct bt_gatt_attr *attr, 
 	case 12:
 		floor_calib_clear();
 		break;
+	case 13:
+		/* [13][0] = release schema. [13][1][mask] = debug; mask bits 1=R 2=G 4=B. */
+		if (len >= 2 && bytes[1] == 0U) {
+			vibro_led_debug_set(false, 0U);
+		} else {
+			vibro_led_debug_set(true, (len >= 3) ? bytes[2] : 0U);
+		}
+		break;
+	case 15: {
+		/* [15][channel ascii…] — stable|staging|dev (phone CDN sync). */
+		char ch[OTA_CHANNEL_MAX + 1];
+		const size_t n = (len > 1U) ? MIN((size_t)(len - 1U), (size_t)OTA_CHANNEL_MAX) : 0U;
+
+		if (n == 0U) {
+			(void)ota_channel_set("stable");
+		} else {
+			memcpy(ch, &bytes[1], n);
+			ch[n] = '\0';
+			(void)ota_channel_set(ch);
+		}
+		break;
+	}
 	default:
 		break;
 	}

@@ -5,22 +5,28 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 
 #include <zephyr/device.h>
 #include <zephyr/drivers/display.h>
 #include <zephyr/kernel.h>
 
+#include <zephyr/sys/atomic.h>
+
+#include "attitude.h"
 #include "battery_monitor.h"
+#include "ble_ota_gatt.h"
 #include "board_config.h"
 #include "clock_sync.h"
 #include "display_panel.h"
 #include "imu_pipeline.h"
 #include "panel_draw.h"
-#include "panel_fb.h"
+#include "renderer.h"
 #include "power_manager.h"
 #include "scene_snapshot.h"
 #include "scene_zoom.h"
+#include "stack_ra_check.h"
 
 #define COL_TEXT  PANEL_WHITE
 #define COL_X     PANEL_RED
@@ -38,6 +44,17 @@
 #define HUD_CYCLE_MS  (HUD_STATS_MS + HUD_DATE_MS + HUD_TIME_MS)
 
 static bool g_panel_on;
+static atomic_t g_flash_quiet;
+
+void scene_live_set_flash_quiet(bool quiet)
+{
+	atomic_set(&g_flash_quiet, quiet ? 1 : 0);
+}
+
+bool scene_live_flash_quiet(void)
+{
+	return atomic_get(&g_flash_quiet) != 0;
+}
 
 static void draw_delta_triangle(int16_t x, int16_t y, uint16_t color)
 {
@@ -123,7 +140,7 @@ static void draw_walk_overlay(float distance_m)
 		phase = HUD_TIME;
 	}
 
-	panel_fb_fill_rect(hud_x, hud_y, hud_w, hud_h, PANEL_BLACK);
+	renderer_fill_rect(hud_x, hud_y, hud_w, hud_h, PANEL_BLACK);
 	draw_delta_triangle(hud_x + 2, hud_y + 2, COL_WALK);
 
 	switch (phase) {
@@ -172,29 +189,70 @@ static void draw_seg(float x0, float y0, float x1, float y1, uint16_t color)
 
 void scene_live_init(const struct device *display)
 {
+	ARG_UNUSED(display);
 	scene_zoom_init();
-	panel_fb_begin(PANEL_BLACK);
-	panel_fb_flush(display);
+	/* No SPI on main — queue black clear + unblank for render thread. */
+	renderer_request_present();
 	if (power_manager_screen_on()) {
-		(void)panel_display_hw_set(display, true);
+		(void)renderer_request_hw(true);
 		g_panel_on = true;
 	} else {
+		(void)renderer_request_hw(false);
 		g_panel_on = false;
 	}
 }
 
 void scene_live_draw(const struct device *display)
 {
+	STACK_RA_CHECK_SETUP;
+	ARG_UNUSED(display);
 	struct imu_sample sample;
 	struct attitude_estimator att;
+	const char *ota_label = NULL;
+	uint16_t ota_label_c = PANEL_WHITE;
+	uint16_t ota_bar_c = PANEL_BLUE;
+	uint16_t ota_pct = 0;
 
-	panel_fb_begin(PANEL_BLACK);
+	renderer_begin(PANEL_BLACK);
+
+	if (ble_ota_ui_snapshot(&ota_label, &ota_label_c, &ota_bar_c, &ota_pct)) {
+		const bool big = (ota_label[0] == 'F' || ota_label[0] == 'R'); /* FAIL / REBOOT */
+		const uint8_t scale = big ? 3U : 1U;
+		const uint16_t glyph_w = (uint16_t)(6U * scale);
+		const uint16_t text_w = (uint16_t)(strlen(ota_label) * glyph_w);
+		const int16_t text_x =
+			(int16_t)((PANEL_W > text_w) ? (PANEL_W - text_w) / 2 : 2);
+		const int16_t text_y = big ? (int16_t)(PANEL_H / 2 - 20) : 72;
+
+		panel_draw_text(text_x, text_y, ota_label_c, ota_label, scale);
+
+		if (!big) {
+			const uint16_t bar_x = 16;
+			const uint16_t bar_y = 110;
+			const uint16_t bar_w = PANEL_W - 32U;
+			const uint16_t bar_h = 14;
+			const uint16_t fill_w =
+				(uint16_t)(((uint32_t)bar_w * (uint32_t)ota_pct) / 1000U);
+
+			renderer_fill_rect(bar_x, bar_y, bar_w, bar_h, PANEL_GREY);
+			if (fill_w > 0U) {
+				renderer_fill_rect(bar_x, bar_y, fill_w, bar_h, ota_bar_c);
+			}
+		}
+
+		renderer_present();
+		if (power_manager_screen_on() && !g_panel_on) {
+			(void)renderer_request_hw(true);
+			g_panel_on = true;
+		}
+		return;
+	}
 
 	if (imu_pipeline_recovering()) {
 		panel_draw_text(8, 40, COL_TEXT, "IMU recovering...", SCENE_FONT_BODY);
-		panel_fb_flush(display);
+		renderer_present();
 		if (power_manager_screen_on() && !g_panel_on) {
-			panel_display_hw_set(display, true);
+			(void)renderer_request_hw(true);
 			g_panel_on = true;
 		}
 		return;
@@ -203,16 +261,19 @@ void scene_live_draw(const struct device *display)
 	if (!imu_pipeline_snapshot(&sample, &att)) {
 		panel_draw_text(8, 40, COL_TEXT, "IMU not ready", SCENE_FONT_BODY);
 		panel_draw_text(8, 58, COL_TEXT, "retrying I2C...", SCENE_FONT_BODY);
-		panel_fb_flush(display);
+		renderer_present();
 		if (power_manager_screen_on() && !g_panel_on) {
-			panel_display_hw_set(display, true);
+			(void)renderer_request_hw(true);
 			g_panel_on = true;
 		}
 		return;
 	}
 
+	scene_zoom_tick(&sample);
+
+	STACK_RA_CHECK();
 	const float walk_m = imu_pipeline_walk_distance_m();
-	/* Draw tilt from this sample's accelerometer, not only the complementary-filter
+	/* Draw tilt from this sample's accelerometer, not only the Madgwick
 	 * matrix. A "stationary" lock used to freeze yaw (and a stuck filter would freeze
 	 * the cube) while the HUD tick still moved. */
 	const float roll_acc = atan2f(sample.ay, sample.az);
@@ -224,13 +285,14 @@ void scene_live_draw(const struct device *display)
 	const struct scene_snapshot snap = scene_snapshot_build(
 		PANEL_W, PANEL_H, scene_zoom_current(), &rot, &sample, walk_m);
 
+	STACK_RA_CHECK();
 	panel_draw_circle(snap.center_x, snap.center_y, 3, COL_TEXT, true);
 	/* Sliding tick in the cube band (~y=170). White so it is not confused with the
 	 * green Y axis (PANEL_YELLOW 0x07FF reads green on this BGR panel). */
 	{
 		const uint16_t tick_x = (uint16_t)(4U + ((k_uptime_get_32() / 40U) % 40U));
 
-		panel_fb_fill_rect(tick_x, (uint16_t)snap.center_y + 36U, 5U, 2U, PANEL_WHITE);
+		renderer_fill_rect(tick_x, (uint16_t)snap.center_y + 36U, 5U, 2U, PANEL_WHITE);
 	}
 
 	for (int i = 0; i < 3; i++) {
@@ -264,10 +326,11 @@ void scene_live_draw(const struct device *display)
 	panel_draw_text(4, footer_y, COL_FOOT, buf, SCENE_FONT_BODY);
 
 	draw_walk_overlay(walk_m);
-	panel_fb_flush(display);
+	STACK_RA_CHECK();
+	renderer_present();
 
 	if (power_manager_screen_on() && !g_panel_on) {
-		panel_display_hw_set(display, true);
+		(void)renderer_request_hw(true);
 		g_panel_on = true;
 	} else if (!power_manager_screen_on()) {
 		g_panel_on = false;

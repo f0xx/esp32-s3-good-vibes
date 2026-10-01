@@ -7,6 +7,8 @@
 
 /*
  * Acrylic WS2812 indication (GPIO38) — hardcoded schema; edit firmware to change.
+ * Channels are pure RGB on the wire. LED debug holds the TFT
+ * backlight off (scene still renders) so white BL cannot mix.
  *
  *  Blue solid          — no reference profiles; run mobile ref wizard first.
  *  Blue flash 2s/2s    — refs recorded, awaiting arm/start (wizard Finish or CMD 10).
@@ -26,3 +28,9 @@ void vibro_led_on_verdict(enum vibro_level level);
 
 /** Brief green OK indication (~2 s). */
 void vibro_led_pulse_ok(void);
+
+/**
+ * Phone debug override (CMD 13). While active, `mask` bits 1=R 2=G 4=B drive
+ * the pixel (0 = all off). Inactive returns to the normal schema.
+ */
+void vibro_led_debug_set(bool active, uint8_t mask);

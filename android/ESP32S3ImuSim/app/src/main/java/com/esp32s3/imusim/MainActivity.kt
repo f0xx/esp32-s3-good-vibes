@@ -7,9 +7,12 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.SystemClock
+import android.os.PowerManager
+import android.provider.Settings
+import android.net.Uri
 import android.view.Choreographer
 import android.view.WindowManager
+import android.view.View
 import android.widget.Button
 import android.widget.EditText
 import android.widget.RadioGroup
@@ -33,6 +36,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var vibroMenuButton: Button
     private lateinit var deviceMenuButton: Button
     private lateinit var vibroText: TextView
+    private var otaLockOverlay: View? = null
     private lateinit var statusBanner: StatusBannerController
 
     private lateinit var sessionStore: ImuSessionStore
@@ -46,11 +50,9 @@ class MainActivity : AppCompatActivity() {
      *  device — the dialog just remembers what the user picked last within this session. */
     private var lastCpuMhzOverride = 0
     private var lastImuHzOverride = 0
-    private var drawFpsCap = 0
     private var otaDialogShowing = false
     private var acceptedFwVersion: String? = null
     private var acceptedFwVersionCode: Int = 0
-    private var lastDrawApplyUptimeMs = 0L
     private var blockPreConnectCaptions = false
     private var captionEpoch = 0
     private var renderMode = ImuProtocol.MODE_COMPUTED
@@ -58,6 +60,7 @@ class MainActivity : AppCompatActivity() {
     private var crashDebugFirmware = false
     private var sessionCaps = 0
     private var pendingVibroRefListCallback: ((String) -> Unit)? = null
+    private var pendingConnectAfterServiceReady = false
 
     private val fpsMeter = FpsMeter()
     private var fpsHudRunnable: Runnable? = null
@@ -72,20 +75,6 @@ class MainActivity : AppCompatActivity() {
     private val frameCallback = Choreographer.FrameCallback {
         frameCallbackPosted = false
         val json = pendingBatchJson.getAndSet(null) ?: return@FrameCallback
-        val minInterval = drawMinIntervalMs()
-        if (minInterval > 0L) {
-            val now = SystemClock.uptimeMillis()
-            val elapsed = now - lastDrawApplyUptimeMs
-            if (elapsed < minInterval) {
-                pendingBatchJson.set(json)
-                mainHandler.postDelayed({
-                    frameCallbackPosted = false
-                    scheduleNextDrawFrame()
-                }, minInterval - elapsed)
-                return@FrameCallback
-            }
-            lastDrawApplyUptimeMs = now
-        }
         val gen = renderGeneration.incrementAndGet()
         renderExecutor.execute { prepareAndApplyBatch(json, gen) }
     }
@@ -99,7 +88,14 @@ class MainActivity : AppCompatActivity() {
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
             if (granted.values.all { it }) {
-                connectBle()
+                AutopilotRelay.bootstrap(this)
+                requestBatteryOptimizationExemption()
+                if (imuService != null) {
+                    connectBle()
+                } else {
+                    pendingConnectAfterServiceReady = true
+                    serviceController.startAndBind()
+                }
             } else {
                 statusText.text = "BLE permissions denied"
             }
@@ -108,6 +104,10 @@ class MainActivity : AppCompatActivity() {
     private val otaPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         val svc = imuService
         if (uri == null || svc == null || !connected) return@registerForActivityResult
+        if (OtaSession.blocksNewRequest()) {
+            statusText.text = getString(R.string.ota_busy)
+            return@registerForActivityResult
+        }
         Thread {
             val bytes = OtaFirmwareFormats.parseFirmware(
                 uri,
@@ -119,7 +119,9 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread {
                 if (bytes != null) {
                     statusText.text = "OTA uploading ${bytes.size} B..."
-                    svc.uploadFirmware(bytes)
+                    val tmp = java.io.File(cacheDir, "ota-picker.bin")
+                    tmp.writeBytes(bytes)
+                    svc.uploadFirmwarePath(tmp.absolutePath)
                 }
             }
         }.start()
@@ -132,13 +134,15 @@ class MainActivity : AppCompatActivity() {
         bindViews()
         sceneView.fpsMeter = fpsMeter
         sessionStore = ImuSessionStore(this)
-        drawFpsCap = sessionStore.drawFpsCap
-        fpsMeter.setDrawFpsCap(drawFpsCap)
+        // Draw FPS cap removed — always follow BLE notify cadence (was making 30Hz look like ~15).
+        sessionStore.drawFpsCap = 0
+        fpsMeter.setDrawFpsCap(0)
         cloudSettings = CloudSettings(this)
         verdictStore = VerdictStore(this)
         serviceController = ImuServiceController(applicationContext, serviceEvents)
         wireControls()
         serviceController.startAndBind()
+        requestStartupPermissions()
         handleCloudSetupIntent(intent)
         handleOtaPromptIntent(intent)
     }
@@ -152,9 +156,13 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
-        AppEventHub.onBanner = { level, message -> statusBanner.show(level, message) }
+        AppEventHub.onBanner = { level, message ->
+            if (!OtaSession.locked()) statusBanner.show(level, message)
+        }
         OtaOfferHub.onOffer = { offer -> showOtaPrompt(offer) }
-        OtaOfferHub.pending?.let { showOtaPrompt(it) }
+        (OtaOfferHub.pending ?: OtaOfferHub.load(this))?.let { showOtaPrompt(it) }
+        OtaSession.listener = { applyOtaState(it) }
+        applyOtaState(OtaSession.state)
         if (::serviceController.isInitialized) {
             serviceController.setUiVisible(true)
             serviceController.requestState()
@@ -164,6 +172,7 @@ class MainActivity : AppCompatActivity() {
     override fun onStop() {
         AppEventHub.onBanner = null
         OtaOfferHub.onOffer = null
+        OtaSession.listener = null
         if (::serviceController.isInitialized) {
             serviceController.setUiVisible(false)
         }
@@ -189,6 +198,8 @@ class MainActivity : AppCompatActivity() {
         vibroMenuButton = findViewById(R.id.vibroMenuButton)
         deviceMenuButton = findViewById(R.id.deviceMenuButton)
         vibroText = findViewById(R.id.vibroText)
+        otaLockOverlay = findViewById(R.id.otaLockOverlay)
+        otaLockOverlay?.setOnClickListener { }
         updateEspScreenButton()
     }
 
@@ -227,20 +238,25 @@ class MainActivity : AppCompatActivity() {
         deviceMenuButton.setOnClickListener { showDeviceMenu() }
     }
 
-    private enum class VibroMenuItem { REF_WIZARD, REF_PROFILES, HISTORY, FFT, MODE }
+    private enum class VibroMenuItem { REF_WIZARD, REPAIR, REF_PROFILES, HISTORY, FFT, MODE }
 
     private enum class DeviceMenuItem {
         PROFILE, CONFIG_EDITOR, MIX, ERASE_NVS, CRASH_DEBUG, BATTERY_BENCH, FLOOR_CALIB, AHRS, WIFI, SYNC, OTA_CHECK, OTA, CLOUD,
-        SCREEN, PERFORMANCE, DRAW_FPS,
+        SCREEN, PERFORMANCE,
     }
 
     private fun showVibroMenu() {
+        if (OtaSession.locked()) {
+            applyOtaState(OtaSession.state)
+            return
+        }
         val items = VibroMenuItem.values()
         AlertDialog.Builder(this)
             .setTitle(R.string.menu_vibro)
             .setItems(items.map { vibroMenuLabel(it) }.toTypedArray()) { _, which ->
                 when (items[which]) {
                     VibroMenuItem.REF_WIZARD -> VibroRefWizardActivity.open(this)
+                    VibroMenuItem.REPAIR -> RepairWizardActivity.open(this)
                     VibroMenuItem.REF_PROFILES -> showVibroRefProfilesMenu()
                     VibroMenuItem.HISTORY -> showVerdictHistory()
                     VibroMenuItem.FFT -> {
@@ -258,7 +274,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showDeviceMenu() {
-        val items = DeviceMenuItem.entries
+        if (OtaSession.locked()) {
+            applyOtaState(OtaSession.state)
+            return
+        }
+        val items = DeviceMenuItem.entries.filter { item ->
+            item != DeviceMenuItem.WIFI || (sessionCaps and ImuProtocol.CAP_WIFI) != 0
+        }
         AlertDialog.Builder(this)
             .setTitle(R.string.menu_device)
             .setItems(items.map { deviceMenuLabel(it) }.toTypedArray()) { _, which ->
@@ -298,13 +320,22 @@ class MainActivity : AppCompatActivity() {
                         imuService?.requestConfigSync()
                     }
                     DeviceMenuItem.OTA_CHECK -> {
-                        statusText.text = getString(R.string.ota_check_cloud)
+                        if (OtaSession.blocksNewRequest()) {
+                            statusText.text = getString(R.string.ota_busy)
+                            applyOtaState(OtaSession.state)
+                            return@setItems
+                        }
                         val i = Intent(this, ImuBleForegroundService::class.java).apply {
                             action = ImuBleForegroundService.ACTION_CHECK_OTA
                         }
                         startForegroundService(i)
                     }
                     DeviceMenuItem.OTA -> {
+                        if (OtaSession.blocksNewRequest()) {
+                            statusText.text = getString(R.string.ota_busy)
+                            applyOtaState(OtaSession.state)
+                            return@setItems
+                        }
                         if (!connected) {
                             statusText.text = "Connect first"
                             return@setItems
@@ -315,7 +346,6 @@ class MainActivity : AppCompatActivity() {
                     DeviceMenuItem.CLOUD -> CloudSettingsActivity.open(this)
                     DeviceMenuItem.SCREEN -> espScreenButton.performClick()
                     DeviceMenuItem.PERFORMANCE -> showPerformanceDialog()
-                    DeviceMenuItem.DRAW_FPS -> showDrawFpsDialog()
                 }
             }
             .show()
@@ -323,6 +353,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun vibroMenuLabel(item: VibroMenuItem): String = when (item) {
         VibroMenuItem.REF_WIZARD -> getString(R.string.vibro_ref_wizard_menu)
+        VibroMenuItem.REPAIR -> getString(R.string.repair_wizard_menu)
         VibroMenuItem.REF_PROFILES -> getString(R.string.vibro_ref_profiles)
         VibroMenuItem.HISTORY -> getString(R.string.vibro_history)
         VibroMenuItem.FFT -> getString(R.string.vibro_fft)
@@ -344,7 +375,6 @@ class MainActivity : AppCompatActivity() {
         DeviceMenuItem.OTA -> getString(R.string.ota_file)
         DeviceMenuItem.CLOUD -> getString(R.string.cloud_settings)
         DeviceMenuItem.PERFORMANCE -> "CPU / IMU speed"
-        DeviceMenuItem.DRAW_FPS -> "Draw FPS cap"
         DeviceMenuItem.SCREEN -> if (espScreenOn) {
             getString(R.string.esp_screen_off)
         } else {
@@ -561,6 +591,10 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread {
                 serviceController.requestState()
                 serviceController.setUiVisible(true)
+                if (pendingConnectAfterServiceReady) {
+                    pendingConnectAfterServiceReady = false
+                    connectBle()
+                }
             }
         }
 
@@ -583,10 +617,15 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread {
                 if (bleConnected && state == RelayFsmState.CONNECTED) {
                     blockPreConnectCaptions = false
-                    statusBanner.hide()
+                    if (!OtaSession.blocksNewRequest() && !OtaSession.locked()) {
+                        statusBanner.hide()
+                    }
                 }
                 updateConnectedUi(bleConnected, showDisconnect)
                 if (connected && state != RelayFsmState.CONNECTED && state != RelayFsmState.CLOUD_SYNC) {
+                    return@runOnUiThread
+                }
+                if (OtaSession.locked() || OtaSession.blocksNewRequest()) {
                     return@runOnUiThread
                 }
                 if (caption.isNotBlank() && !(blockPreConnectCaptions && !bleConnected)) {
@@ -611,7 +650,9 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread {
                 captionEpoch = epoch
                 blockPreConnectCaptions = false
-                statusBanner.hide()
+                if (!OtaSession.locked() && !OtaSession.blocksNewRequest()) {
+                    statusBanner.hide()
+                }
             }
         }
 
@@ -620,6 +661,21 @@ class MainActivity : AppCompatActivity() {
                 sceneView.setClockSynced(synced)
                 if (tzMin != 0) {
                     sceneView.setClockTzMin(tzMin)
+                }
+            }
+        }
+
+        override fun onCaps(caps: Int) {
+            runOnUiThread {
+                if (caps == 0) {
+                    if (!connected) {
+                        sessionCaps = 0
+                    }
+                    return@runOnUiThread
+                }
+                sessionCaps = sessionCaps or caps
+                if (ImuProtocol.crashDebugFromCaps(sessionCaps)) {
+                    crashDebugFirmware = true
                 }
             }
         }
@@ -639,6 +695,7 @@ class MainActivity : AppCompatActivity() {
 
         override fun onStatus(text: String) {
             runOnUiThread {
+                if (OtaSession.locked() || OtaSession.blocksNewRequest()) return@runOnUiThread
                 if (blockPreConnectCaptions && !connected) return@runOnUiThread
                 if (connected && isStaleFsmCaption(text)) return@runOnUiThread
                 statusText.text = text
@@ -647,6 +704,7 @@ class MainActivity : AppCompatActivity() {
 
         override fun onBanner(level: StatusBannerLevel, message: String) {
             runOnUiThread {
+                if (OtaSession.locked() || OtaSession.blocksNewRequest()) return@runOnUiThread
                 if (blockPreConnectCaptions && !connected) return@runOnUiThread
                 if (connected && isStaleFsmCaption(message)) return@runOnUiThread
                 statusBanner.show(level, message)
@@ -661,6 +719,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun onBatchJson(batchJson: String) {
+            if (OtaSession.pauseScene()) return
             fpsMeter.onBleBatch()
             scheduleBatchRender(batchJson)
         }
@@ -670,23 +729,39 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun onOtaProgress(percent: Int) {
-            runOnUiThread { statusText.text = "OTA $percent%" }
+            runOnUiThread {
+                val caption = getString(R.string.notification_dfu, percent)
+                OtaSession.uploading(percent)
+                statusText.text = caption
+                statusBanner.showSticky(StatusBannerLevel.WARN, caption)
+            }
         }
 
         override fun onOtaDone(ok: Boolean, message: String) {
             runOnUiThread {
-                statusText.text = if (ok) message else "OTA failed: $message"
-                statusBanner.show(
-                    if (ok) StatusBannerLevel.OK else StatusBannerLevel.ERROR,
-                    if (ok) "OK!" else "OTA failed: $message",
-                )
-                if (ok) {
+                val finished = message.contains("confirmed") ||
+                    message.contains("board back") ||
+                    message.contains("still ")
+                if (!ok && finished) {
+                    OtaSession.complete(message, ok = false)
+                    statusBanner.show(StatusBannerLevel.WARN, message)
+                } else if (ok && finished) {
                     acceptedFwVersion?.let {
                         OtaSettings(this@MainActivity).noteFw(it, acceptedFwVersionCode)
                     }
+                    acceptedFwVersion = null
+                    acceptedFwVersionCode = 0
+                    OtaSession.complete(message)
+                    statusBanner.show(StatusBannerLevel.OK, message)
+                } else if (!ok) {
+                    OtaSession.fail(message.ifBlank { "DFU failed" })
+                    statusBanner.showSticky(StatusBannerLevel.ERROR, message.ifBlank { "DFU failed" })
+                } else {
+                    OtaSession.restarting(OtaSession.Kind.FIRMWARE)
+                    val caption = message.ifBlank { "DFU done — reconnecting…" }
+                    statusText.text = caption
+                    statusBanner.showSticky(StatusBannerLevel.WARN, caption)
                 }
-                acceptedFwVersion = null
-                acceptedFwVersionCode = 0
             }
         }
 
@@ -732,7 +807,12 @@ class MainActivity : AppCompatActivity() {
                 snap.getString(ImuSessionStore.KEY_STATUS)?.let { statusText.text = it }
             } else Unit
         crashDebugFirmware = snap.getBoolean(ImuSessionStore.KEY_CRASH_DEBUG, false)
-        sessionCaps = snap.getInt(ImuSessionStore.KEY_CAPS, 0)
+        val snapCaps = snap.getInt(ImuSessionStore.KEY_CAPS, 0)
+        if (snapCaps != 0) {
+            sessionCaps = sessionCaps or snapCaps
+        } else if (!connected) {
+            sessionCaps = 0
+        }
         if (ImuProtocol.crashDebugFromCaps(sessionCaps)) {
             crashDebugFirmware = true
         }
@@ -822,9 +902,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun drawMinIntervalMs(): Long =
-        if (drawFpsCap <= 0) 0L else (1000L / drawFpsCap)
-
     private fun scheduleNextDrawFrame() {
         frameCallbackPosted = true
         runOnUiThread {
@@ -834,7 +911,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateConnectedUi(connected: Boolean, showDisconnect: Boolean = connected) {
         this.connected = connected
-        setKeepScreenOn(connected)
+        setKeepScreenOn(connected || OtaSession.locked())
         connectButton.text = if (showDisconnect) {
             getString(R.string.disconnect)
         } else {
@@ -882,6 +959,7 @@ class MainActivity : AppCompatActivity() {
     private fun refreshStatusLine() {
         val snap = fpsMeter.snapshot()
         sceneView.setFpsHud(snap.hudLine())
+        if (OtaSession.locked() || OtaSession.blocksNewRequest()) return
         statusText.text = snap.caption()
     }
 
@@ -920,6 +998,47 @@ class MainActivity : AppCompatActivity() {
             connectBle()
         } else {
             permissionLauncher.launch(needed.toTypedArray())
+        }
+    }
+
+    private fun requestStartupPermissions() {
+        val needed = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.BLUETOOTH_SCAN)
+            }
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.BLUETOOTH_CONNECT)
+            }
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            needed.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (needed.isNotEmpty()) {
+            permissionLauncher.launch(needed.toTypedArray())
+        } else {
+            AutopilotRelay.bootstrap(this)
+            requestBatteryOptimizationExemption()
+        }
+    }
+
+    private fun requestBatteryOptimizationExemption() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        val power = getSystemService(PowerManager::class.java)
+        if (power.isIgnoringBatteryOptimizations(packageName)) return
+        try {
+            startActivity(
+                Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                    data = Uri.parse("package:$packageName")
+                },
+            )
+        } catch (e: Exception) {
+            statusText.text = "Allow unrestricted battery usage for reliable BLE service"
         }
     }
 
@@ -1150,39 +1269,6 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    private fun showDrawFpsDialog() {
-        val options = listOf(
-            0 to "Auto (unlimited)",
-            5 to "5 FPS",
-            10 to "10 FPS",
-            15 to "15 FPS",
-            20 to "20 FPS",
-            25 to "25 FPS",
-        )
-        val labels = options.map { it.second }.toTypedArray()
-        val checked = options.indexOfFirst { it.first == drawFpsCap }.coerceAtLeast(0)
-        AlertDialog.Builder(this)
-            .setTitle("On-screen draw FPS cap")
-            .setMessage(
-                "Limits only how fast the phone redraws IMU/scene frames. BLE polling and " +
-                    "ESP IMU sampling follow poll interval and CPU/IMU speed settings.",
-            )
-            .setSingleChoiceItems(labels, checked) { dialog, which ->
-                drawFpsCap = options[which].first
-                sessionStore.drawFpsCap = drawFpsCap
-                fpsMeter.setDrawFpsCap(drawFpsCap)
-                lastDrawApplyUptimeMs = 0L
-                statusText.text = if (drawFpsCap == 0) {
-                    "Draw FPS: auto (unlimited)"
-                } else {
-                    "Draw FPS cap: $drawFpsCap"
-                }
-                dialog.dismiss()
-            }
-            .setNegativeButton(android.R.string.cancel, null)
-            .show()
-    }
-
     private fun showProfileWizard() {
         if (!requireBleConnected { showProfileWizard() }) return
         statusText.text = getString(R.string.profile_wizard_intro)
@@ -1246,12 +1332,39 @@ class MainActivity : AppCompatActivity() {
 
     private fun handleOtaPromptIntent(intent: Intent?) {
         if (intent?.getBooleanExtra(OtaNotifier.EXTRA_OTA_PROMPT, false) != true) return
-        OtaOfferHub.pending?.let { showOtaPrompt(it) }
+        val offer = OtaOfferHub.pending ?: OtaOfferHub.load(this) ?: return
+        showOtaPrompt(offer)
+    }
+
+    private fun applyOtaState(state: OtaSession.State) {
+        otaLockOverlay?.visibility = if (state.locked) View.VISIBLE else View.GONE
+        setKeepScreenOn(connected || state.locked)
+        if (state.caption.isBlank()) {
+            if (state.phase == OtaSession.Phase.IDLE) {
+                statusBanner.hide()
+            }
+            return
+        }
+        statusText.text = state.caption
+        if (state.phase == OtaSession.Phase.IDLE) {
+            statusBanner.show(state.level, state.caption)
+        } else {
+            statusBanner.showSticky(state.level, state.caption)
+        }
     }
 
     private fun showOtaPrompt(offer: OtaOffer) {
         if (otaDialogShowing || isFinishing) return
+        if (OtaSession.locked()) return
+        if (OtaSession.state.phase == OtaSession.Phase.IDLE || OtaSession.state.kind == null) {
+            if (offer.kind == OtaOffer.Kind.APK) {
+                OtaSession.offerApp(offer.currentLabel, offer.versionLabel, "")
+            } else {
+                OtaSession.offerFw(offer.currentLabel, offer.currentLabel, offer.versionLabel)
+            }
+        }
         otaDialogShowing = true
+        applyOtaState(OtaSession.state)
         AlertDialog.Builder(this)
             .setTitle(offer.title)
             .setMessage(offer.body)
@@ -1271,43 +1384,77 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun declineOta(offer: OtaOffer) {
-        OtaOfferHub.clear()
+        OtaOfferHub.clear(this)
         val s = OtaSettings(this)
         if (offer.kind == OtaOffer.Kind.APK) {
             s.declinedApkVersionCode = offer.apkVersionCode
         } else {
             s.declinedFwVersionCode = offer.fwVersionCode
         }
+        OtaSession.decline()
         statusText.text = getString(R.string.ota_later)
     }
 
     private fun acceptOta(offer: OtaOffer) {
-        OtaOfferHub.clear()
-        when (offer.kind) {
-            OtaOffer.Kind.APK -> {
-                if (!ApkInstaller.canInstall(this)) {
-                    statusBanner.show(StatusBannerLevel.WARN, getString(R.string.ota_need_unknown_sources))
-                    ApkInstaller.openUnknownSourcesSettings(this)
-                    return
-                }
-                statusText.text = "Installing APK ${offer.versionLabel}…"
-                if (!ApkInstaller.install(this, offer.file)) {
-                    statusBanner.show(StatusBannerLevel.ERROR, "APK install failed")
-                }
+        OtaOfferHub.clear(this)
+        if (offer.kind == OtaOffer.Kind.APK && !ApkInstaller.canInstall(this)) {
+            OtaSession.fail(getString(R.string.ota_need_unknown_sources))
+            ApkInstaller.openUnknownSourcesSettings(this)
+            return
+        }
+        if (offer.kind == OtaOffer.Kind.FW && (imuService == null || !connected)) {
+            OtaSession.fail(getString(R.string.connect_ble_first))
+            return
+        }
+        if (!OtaSession.accept()) {
+            if (OtaSession.blocksNewRequest()) {
+                applyOtaState(OtaSession.state)
+                return
             }
-            OtaOffer.Kind.FW -> {
-                val svc = imuService
-                if (svc == null || !connected) {
-                    statusText.text = getString(R.string.connect_ble_first)
-                    return
+        }
+        acceptedFwVersion = offer.versionLabel.takeIf { offer.kind == OtaOffer.Kind.FW }
+        acceptedFwVersionCode = offer.fwVersionCode
+        val kind = if (offer.kind == OtaOffer.Kind.APK) OtaSession.Kind.APP else OtaSession.Kind.FIRMWARE
+        OtaSession.io.execute {
+            try {
+                val repo = OtaRepository(applicationContext)
+                val file = repo.download(
+                    offer.kind,
+                    offer.urls,
+                    offer.size,
+                    offer.sha256,
+                ) { got, total ->
+                    OtaSession.downloading(kind, got, total)
                 }
-                acceptedFwVersion = offer.versionLabel
-                acceptedFwVersionCode = offer.fwVersionCode
-                statusText.text = "OTA uploading ${offer.file.length()} B…"
-                Thread {
-                    val bytes = offer.file.readBytes()
-                    runOnUiThread { svc.uploadFirmware(bytes) }
-                }.start()
+                if (file == null) {
+                    OtaSession.fail("download failed")
+                    return@execute
+                }
+                when (offer.kind) {
+                    OtaOffer.Kind.APK -> {
+                        OtaSession.installing()
+                        val ok = try {
+                            ApkInstaller.install(applicationContext, file)
+                        } catch (e: Exception) {
+                            OtaSession.fail(e.message ?: "install start failed")
+                            return@execute
+                        }
+                        if (!ok) {
+                            OtaSession.fail("could not stage APK")
+                        }
+                    }
+                    OtaOffer.Kind.FW -> {
+                        val svc = imuService
+                        if (svc == null) {
+                            OtaSession.fail("BLE service gone")
+                            return@execute
+                        }
+                        val path = file.absolutePath
+                        mainHandler.post { svc.uploadFirmwarePath(path) }
+                    }
+                }
+            } catch (e: Exception) {
+                OtaSession.fail(e.message ?: "OTA failed")
             }
         }
     }

@@ -21,11 +21,11 @@ __weak void devcfg_led_nvs_ok(void)
 
 #define SETTINGS_KEY "devcfg/blob"
 
-#if !FIXED_PARTITION_EXISTS(storage_partition)
+#if !PARTITION_EXISTS(storage_partition)
 #error "storage_partition required for device config NVS"
 #endif
 
-#define STORAGE_PARTITION_ID FIXED_PARTITION_ID(storage_partition)
+#define STORAGE_PARTITION_ID PARTITION_ID(storage_partition)
 
 static struct device_config_v1 g_runtime;
 static atomic_t g_save_pending;

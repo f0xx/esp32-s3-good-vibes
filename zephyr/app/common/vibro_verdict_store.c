@@ -8,18 +8,19 @@
 #include <zephyr/sys/crc.h>
 
 #include "flash_safety.h"
+#include "appdata_layout.h"
 
 LOG_MODULE_REGISTER(vibro_spool, LOG_LEVEL_INF);
 
-#define VERDICT_SPOOL_PARTITION   scratch_partition
-#define VERDICT_SPOOL_PARTITION_ID FIXED_PARTITION_ID(VERDICT_SPOOL_PARTITION)
+#define VERDICT_SPOOL_PARTITION   appdata_partition
+#define VERDICT_SPOOL_PARTITION_ID PARTITION_ID(VERDICT_SPOOL_PARTITION)
 
-#if !FIXED_PARTITION_EXISTS(VERDICT_SPOOL_PARTITION)
-#error "verdict spool requires scratch partition"
+#if !PARTITION_EXISTS(VERDICT_SPOOL_PARTITION)
+#error "verdict spool requires appdata_partition (OTA-safe; not image-scratch)"
 #endif
 
-#define VERDICT_SPOOL_FLASH_OFF 4096U
-#define VERDICT_SPOOL_FLASH_BYTES 4096U
+#define VERDICT_SPOOL_FLASH_OFF   APPDATA_VIBRO_VERDICT_OFF
+#define VERDICT_SPOOL_FLASH_BYTES APPDATA_SECTOR_BYTES
 
 #define VERDICT_HDR_MAGIC 0x56445248U /* VDRH */
 #define VERDICT_REC_MAGIC 0x56445252U /* VDRR */

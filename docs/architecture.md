@@ -11,7 +11,7 @@ flowchart LR
     TFT[ST7789 172x320]
     BLE[BLE peripheral]
     WIFI[WiFi STA optional]
-    IMU --> FW[Zephyr handshake / Arduino]
+    IMU --> FW[Zephyr handshake]
     FW --> TFT
     FW --> BLE
     FW --> WIFI
@@ -53,22 +53,25 @@ The **handshake** firmware and Android app implement Case B/C today. The backend
 
 | Track | When to use |
 |-------|-------------|
-| **Zephyr `handshake`** | Primary development — IMU, scene, BLE GATT, WiFi, power profiles |
+| **Zephyr `handshake`** | Production — IMU, scene, BLE GATT, WiFi, A/B OTA, crash ring |
 | **Zephyr `smoke`** | Hardware sanity — LCD, BOOT, BLE advertising only |
-| **Arduino `production`** | Reference behaviour — battery calibration, mature UI, fallback |
+| **Arduino `production`** | Frozen reference — battery curve / early UI. Overwrites MCUboot |
 
 See [dual-firmware-probing.md](dual-firmware-probing.md) for switching between tracks.
+Cloud / phone / A/B sequence: [zephyr-ota.md](zephyr-ota.md).
 
 ## BLE services (handshake)
 
 | Service | UUID prefix | Purpose |
 |---------|-------------|---------|
 | IMU | `4a6e0001-…` | Live samples, mode, caps, status |
-| NET | `4a6e0101-…` | WiFi profile provisioning, HTTP proxy |
-| Config | `4a6e0201-…` | Device settings |
-| OTA | `4a6e0301-…` | MCUboot image transfer |
+| Config | `4a6e0101-…` | Device settings |
+| NET | `4a6e0200-…` | WiFi profile provisioning, HTTP proxy |
+| OTA | `4a6e0201-…` | MCUboot signed-slot transfer (CTRL/DATA) |
+| Crash | `4a6e0301-…` | Crash-ring drain (OTA OK/NOK rides here) |
 
-Protocol headers: `zephyr/app/common/ble_imu_protocol.h`, `esp32_s3_imu_basics/ble/ble_protocol.h`, Android `ImuProtocol.kt`.
+Protocol headers: `zephyr/app/common/ble_imu_protocol.h`, Android `ImuProtocol.kt`.
+Arduino headers are legacy.
 
 ## Storage
 

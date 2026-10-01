@@ -13,6 +13,7 @@ class OffloadExporter(private val context: Context) {
     private val spectrumFile = File(dir, "spectra.jsonl")
     private val crashFile = File(dir, "crashes.jsonl")
     private val telemetryFile = File(dir, "telemetry.jsonl")
+    private val geoFile = File(dir, "geo.jsonl")
 
     fun exportVerdict(status: ImuProtocol.Status) {
         val level = status.vibroVerdictLevel
@@ -41,10 +42,16 @@ class OffloadExporter(private val context: Context) {
 
     /** Periodic STATUS telemetry for Grafana (temp/cpu/apb/spool). */
     fun exportTelemetry(status: ImuProtocol.Status) {
-        val ts = status.clockUnixSec?.takeIf { it > 0L }?.times(1000L) ?: System.currentTimeMillis()
+        /* STATUS "clk" can be board uptime before phone TIME sync — those tiny
+         * values sort above real wall-clock rows in Insights if used as ts_ms. */
+        val clockMs = status.clockUnixSec?.takeIf { it >= 1_000_000_000L }?.times(1000L)
+        val ts = clockMs ?: System.currentTimeMillis()
         val line = JSONObject().apply {
             put("type", "telemetry")
             put("ts_ms", ts)
+            put("pct", status.percent)
+            put("voltage", status.voltageV.toDouble())
+            status.powerSource.takeIf { it > 0 }?.let { put("power_source", it) }
             status.chipTempC?.let { put("chip_temp_c", it) }
             status.cpuMhzApplied?.let { put("cpu_mhz", it) }
             status.apbMhz?.let { put("apb_mhz", it) }
@@ -52,6 +59,21 @@ class OffloadExporter(private val context: Context) {
             status.spoolCapB?.let { put("spool_cap_b", it) }
             status.spoolPending?.let { put("spool_pending", it) }
             status.dramFreeKb?.let { put("dram_free_kb", it) }
+            status.fwVersion?.takeIf { it.isNotBlank() }?.let { put("fw_version", it) }
+            status.fwVersionCode?.takeIf { it > 0 }?.let { put("fwc", it) }
+            status.spiMhz?.let { put("spi_mhz", it) }
+            status.i2cKhz?.let { put("i2c_khz", it) }
+            status.bleRxKb?.let { put("ble_rx_kb", it) }
+            status.bleTxKb?.let { put("ble_tx_kb", it) }
+            status.bleRxB?.let { put("ble_rx_b", it) }
+            status.bleTxB?.let { put("ble_tx_b", it) }
+            status.bleRxBps?.let { put("ble_rx_bps", it) }
+            status.bleTxBps?.let { put("ble_tx_bps", it) }
+            status.screenOn?.let { put("display_on", if (it) 1 else 0) }
+            status.wifiOn?.let { put("wifi_on", if (it) 1 else 0) }
+            status.wifiRssiDbm?.takeIf { it > -120 }?.let { put("wifi_rssi", it) }
+            status.wifiAp?.let { put("wifi_ap", if (it) 1 else 0) }
+            status.wifiSsid?.takeIf { it.isNotBlank() }?.let { put("wifi_ssid", it) }
         }.toString() + "\n"
         FileOutputStream(telemetryFile, true).use { it.write(line.toByteArray()) }
     }
@@ -94,6 +116,68 @@ class OffloadExporter(private val context: Context) {
             put("axis", "mag")
         }.toString() + "\n"
         FileOutputStream(spectrumFile, true).use { it.write(line.toByteArray()) }
+    }
+
+    /**
+     * GPS / IMU-dead-reckon points when the cloud POST fails (phone+ESP walk with no
+     * Wi-Fi/data). Capped so a long offline stroll cannot fill flash.
+     */
+    @Synchronized
+    fun exportGeoPoint(kind: String, lat: Double, lon: Double, unixMs: Long, accuracyM: Double?): Int {
+        val line = JSONObject().apply {
+            put("kind", kind)
+            put("lat", lat)
+            put("lon", lon)
+            put("unix_ms", unixMs)
+            if (accuracyM != null) put("accuracy_m", accuracyM)
+        }.toString() + "\n"
+        FileOutputStream(geoFile, true).use { it.write(line.toByteArray()) }
+        trimGeoLocked()
+        return pendingGeoCountLocked()
+    }
+
+    @Synchronized
+    fun drainPendingGeo(maxLines: Int): List<String> {
+        if (!geoFile.exists() || maxLines <= 0) return emptyList()
+        val all = geoFile.readLines().filter { it.isNotBlank() }
+        if (all.isEmpty()) return emptyList()
+        val take = all.take(maxLines)
+        rewriteGeo(all.drop(take.size))
+        return take
+    }
+
+    @Synchronized
+    fun restoreGeo(lines: List<String>) {
+        if (lines.isEmpty()) return
+        val existing = if (geoFile.exists()) {
+            geoFile.readLines().filter { it.isNotBlank() }
+        } else {
+            emptyList()
+        }
+        rewriteGeo(lines + existing)
+        trimGeoLocked()
+    }
+
+    fun pendingGeoCount(): Int = synchronized(this) { pendingGeoCountLocked() }
+
+    private fun pendingGeoCountLocked(): Int {
+        if (!geoFile.exists()) return 0
+        return geoFile.readLines().count { it.isNotBlank() }
+    }
+
+    private fun trimGeoLocked() {
+        if (!geoFile.exists()) return
+        val all = geoFile.readLines().filter { it.isNotBlank() }
+        if (all.size <= GEO_MAX_POINTS) return
+        rewriteGeo(all.takeLast(GEO_MAX_POINTS))
+    }
+
+    private fun rewriteGeo(lines: List<String>) {
+        if (lines.isEmpty()) {
+            geoFile.delete()
+            return
+        }
+        geoFile.writeText(lines.joinToString("\n", postfix = "\n"))
     }
 
     fun exportCrashJson(line: String) {
@@ -228,5 +312,9 @@ class OffloadExporter(private val context: Context) {
     fun pendingCrashCount(): Int {
         if (!crashFile.exists()) return 0
         return crashFile.readLines().count { it.isNotBlank() }
+    }
+
+    companion object {
+        private const val GEO_MAX_POINTS = 4000
     }
 }

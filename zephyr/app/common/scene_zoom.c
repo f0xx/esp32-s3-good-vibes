@@ -1,3 +1,4 @@
+#include <stddef.h>
 /*
  * Motion-reactive scene zoom — parity with esp32 scene_renderer tickZoom / updateMotionZoom.
  */

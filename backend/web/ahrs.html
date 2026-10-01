@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Good Vibes — AHRS debug</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --panel: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --ok: #3fb950;
+      --warn: #d29922;
+      --alert: #f85149;
+      --accent: #58a6ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.45;
+    }
+    header { padding: 1rem 1.25rem; border-bottom: 1px solid var(--border); background: var(--panel); }
+    header h1 { margin: 0; font-size: 1.25rem; font-weight: 600; }
+    header p { margin: 0.35rem 0 0; color: var(--muted); font-size: 0.9rem; }
+    header a { color: var(--accent); text-decoration: none; }
+    main { max-width: 1100px; margin: 0 auto; padding: 1rem 1.25rem 2rem; }
+    .grid { display: grid; gap: 1rem; grid-template-columns: 1fr 320px; }
+    @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; }
+    .card h2 { margin: 0 0 0.75rem; font-size: 1rem; }
+    label { display: block; font-size: 0.8rem; color: var(--muted); margin-bottom: 0.25rem; }
+    input, select, button {
+      font: inherit;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      padding: 0.45rem 0.6rem;
+    }
+    input { width: 100%; }
+    button { cursor: pointer; background: #21262d; margin-top: 0.5rem; }
+    button:hover { border-color: var(--accent); }
+    .row { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: end; margin-bottom: 0.75rem; }
+    .row > * { flex: 1; min-width: 140px; }
+    #glCanvas { width: 100%; aspect-ratio: 1 / 1; background: #010409; border-radius: 8px; display: block; }
+    .stat { display: flex; justify-content: space-between; padding: 0.25rem 0; border-bottom: 1px solid var(--border); font-size: 0.85rem; }
+    .stat span:first-child { color: var(--muted); }
+    .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.75rem; }
+    .badge.ok { background: rgba(63,185,80,0.15); color: var(--ok); }
+    .badge.warn { background: rgba(210,153,34,0.15); color: var(--warn); }
+    .badge.alert { background: rgba(248,81,73,0.15); color: var(--alert); }
+    .legend { font-size: 0.78rem; color: var(--muted); margin-top: 0.5rem; }
+    .legend span.x { color: #f85149; }
+    .legend span.y { color: #3fb950; }
+    .legend span.z { color: #58a6ff; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>AHRS debug — live device orientation</h1>
+    <p>Relayed from the ESP32's on-device attitude filter (complementary filter, no magnetometer — yaw drifts) via the phone app. <a href="./">&larr; back to dashboard</a></p>
+  </header>
+  <main>
+    <div class="grid">
+      <div class="card">
+        <canvas id="glCanvas" width="600" height="600"></canvas>
+        <p class="legend"><span class="x">&#9632; X (roll axis)</span> &nbsp; <span class="y">&#9632; Y (pitch axis)</span> &nbsp; <span class="z">&#9632; Z (yaw / up axis)</span></p>
+      </div>
+      <div class="card">
+        <h2>Connection</h2>
+        <div class="row">
+          <div>
+            <label for="apiKey">API key (X-API-Key)</label>
+            <input id="apiKey" type="text" placeholder="dev-change-me" />
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label for="deviceId">Device ID</label>
+            <input id="deviceId" type="text" placeholder="e.g. e8f60a9251f0" />
+          </div>
+        </div>
+        <button type="button" id="startBtn">Start</button>
+        <button type="button" id="stopBtn">Stop</button>
+        <h2 style="margin-top:1rem;">Live status</h2>
+        <div class="stat"><span>Link</span><span id="statLink" class="badge warn">idle</span></div>
+        <div class="stat"><span>Sample age</span><span id="statAge">—</span></div>
+        <div class="stat"><span>Seq</span><span id="statSeq">—</span></div>
+        <div class="stat"><span>Roll</span><span id="statRoll">—</span></div>
+        <div class="stat"><span>Pitch</span><span id="statPitch">—</span></div>
+        <div class="stat"><span>Yaw</span><span id="statYaw">—</span></div>
+      </div>
+    </div>
+  </main>
+  <script id="demo-hints" type="application/json">__DEMO_HINTS_JSON__</script>
+  <script>
+    const API = '/app/good_vibes/v1';
+    const $ = (id) => document.getElementById(id);
+    const DEMO = (() => {
+      try { return JSON.parse(document.getElementById('demo-hints').textContent || '{}'); }
+      catch { return {}; }
+    })();
+
+    function loadSettings() {
+      $('apiKey').value = localStorage.getItem('gv_api_key') || DEMO.api_key || '';
+      $('deviceId').value = localStorage.getItem('gv_device_id') || '';
+    }
+    function saveSettings() {
+      localStorage.setItem('gv_api_key', $('apiKey').value.trim());
+      localStorage.setItem('gv_device_id', $('deviceId').value.trim());
+    }
+
+    // ---- WebGL: a simple axis-colored cube rotated by the latest AHRS rotation matrix ----
+    const canvas = $('glCanvas');
+    const gl = canvas.getContext('webgl');
+    let program, matLoc, posLoc, colLoc, vbo, vertexCount;
+    let currentRot = [1,0,0, 0,1,0, 0,0,1]; // row-major 3x3, identity until first sample
+
+    function compileShader(src, type) {
+      const sh = gl.createShader(type);
+      gl.shaderSource(sh, src);
+      gl.compileShader(sh);
+      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+        throw new Error(gl.getShaderInfoLog(sh));
+      }
+      return sh;
+    }
+
+    function initGl() {
+      const vsSrc = `
+        attribute vec3 aPos;
+        attribute vec3 aCol;
+        uniform mat3 uRot;
+        varying vec3 vCol;
+        void main() {
+          vec3 p = uRot * aPos;
+          // simple orthographic-ish perspective: push back on Z, cheap projection
+          float z = p.z * 0.35 + 2.2;
+          gl_Position = vec4(p.x / z, p.y / z, p.z * 0.2, 1.0);
+          vCol = aCol;
+        }`;
+      const fsSrc = `
+        precision mediump float;
+        varying vec3 vCol;
+        void main() { gl_FragColor = vec4(vCol, 1.0); }`;
+      program = gl.createProgram();
+      gl.attachShader(program, compileShader(vsSrc, gl.VERTEX_SHADER));
+      gl.attachShader(program, compileShader(fsSrc, gl.FRAGMENT_SHADER));
+      gl.linkProgram(program);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        throw new Error(gl.getProgramInfoLog(program));
+      }
+      gl.useProgram(program);
+      posLoc = gl.getAttribLocation(program, 'aPos');
+      colLoc = gl.getAttribLocation(program, 'aCol');
+      matLoc = gl.getUniformLocation(program, 'uRot');
+
+      // Cube: half-size 0.6, one face color per side so orientation is unambiguous.
+      // Faces: +X red, -X dark red, +Y green, -Y dark green, +Z blue, -Z dark blue.
+      const s = 0.6;
+      const faces = [
+        // [nx,ny,nz], color
+        [[ s,-s,-s],[ s, s,-s],[ s, s, s],[ s,-s,-s],[ s, s, s],[ s,-s, s]], [0.97,0.32,0.29], // +X
+        [[-s,-s, s],[-s, s, s],[-s, s,-s],[-s,-s, s],[-s, s,-s],[-s,-s,-s]], [0.45,0.12,0.10], // -X
+        [[-s, s,-s],[-s, s, s],[ s, s, s],[-s, s,-s],[ s, s, s],[ s, s,-s]], [0.25,0.73,0.31], // +Y
+        [[-s,-s, s],[-s,-s,-s],[ s,-s,-s],[-s,-s, s],[ s,-s,-s],[ s,-s, s]], [0.10,0.30,0.12], // -Y
+        [[-s,-s, s],[ s,-s, s],[ s, s, s],[-s,-s, s],[ s, s, s],[-s, s, s]], [0.35,0.65,1.00], // +Z (device "up"/top)
+        [[ s,-s,-s],[-s,-s,-s],[-s, s,-s],[ s,-s,-s],[-s, s,-s],[ s, s,-s]], [0.10,0.20,0.45], // -Z
+      ];
+      const verts = [];
+      for (let i = 0; i < faces.length; i += 2) {
+        const pts = faces[i];
+        const col = faces[i + 1];
+        for (const p of pts) verts.push(p[0], p[1], p[2], col[0], col[1], col[2]);
+      }
+      vertexCount = verts.length / 6;
+      vbo = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verts), gl.STATIC_DRAW);
+      gl.enable(gl.DEPTH_TEST);
+    }
+
+    function render() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = canvas.clientWidth * dpr, h = canvas.clientHeight * dpr;
+      if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      gl.clearColor(0.004, 0.008, 0.035, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+      const stride = 6 * 4;
+      gl.enableVertexAttribArray(posLoc);
+      gl.vertexAttribPointer(posLoc, 3, gl.FLOAT, false, stride, 0);
+      gl.enableVertexAttribArray(colLoc);
+      gl.vertexAttribPointer(colLoc, 3, gl.FLOAT, false, stride, 3 * 4);
+
+      // Firmware rotation matrix is row-major (attitude.c's mat3); WebGL mat3 uniforms are
+      // column-major, so transpose on upload.
+      const r = currentRot;
+      const colMajor = [r[0], r[3], r[6], r[1], r[4], r[7], r[2], r[5], r[8]];
+      gl.uniformMatrix3fv(matLoc, false, colMajor);
+      gl.drawArrays(gl.TRIANGLES, 0, vertexCount);
+      requestAnimationFrame(render);
+    }
+
+    // ---- Polling loop ----
+    let pollTimer = null;
+    let lastRecvMs = 0;
+
+    function setLink(cls, text) {
+      const el = $('statLink');
+      el.className = 'badge ' + cls;
+      el.textContent = text;
+    }
+
+    function rad2deg(r) { return r * 180 / Math.PI; }
+
+    /** Extract roll/pitch/yaw (deg) from the row-major rotation matrix for the readout —
+     *  purely a display convenience; the cube itself renders the matrix directly. */
+    function eulerFromRot(r) {
+      const pitch = Math.asin(Math.max(-1, Math.min(1, -r[6])));
+      const roll = Math.atan2(r[7], r[8]);
+      const yaw = Math.atan2(r[3], r[0]);
+      return [rad2deg(roll), rad2deg(pitch), rad2deg(yaw)];
+    }
+
+    async function pollOnce() {
+      const key = $('apiKey').value.trim();
+      const device = $('deviceId').value.trim();
+      if (!key || !device) { setLink('warn', 'need key + device id'); return; }
+      try {
+        const res = await fetch(`${API}/ahrs/${encodeURIComponent(device)}/latest`, {
+          headers: { 'X-API-Key': key },
+        });
+        if (res.status === 404) { setLink('warn', 'no sample yet'); return; }
+        if (!res.ok) { setLink('alert', 'HTTP ' + res.status); return; }
+        const sample = await res.json();
+        currentRot = sample.rot;
+        lastRecvMs = Date.now();
+        setLink('ok', 'live');
+        $('statSeq').textContent = sample.seq;
+        const [roll, pitch, yaw] = eulerFromRot(sample.rot);
+        $('statRoll').textContent = roll.toFixed(1) + '\u00b0';
+        $('statPitch').textContent = pitch.toFixed(1) + '\u00b0';
+        $('statYaw').textContent = yaw.toFixed(1) + '\u00b0';
+      } catch (e) {
+        setLink('alert', 'fetch failed');
+      }
+    }
+
+    function tickAge() {
+      if (!lastRecvMs) { $('statAge').textContent = '—'; return; }
+      const ageMs = Date.now() - lastRecvMs;
+      $('statAge').textContent = (ageMs / 1000).toFixed(1) + 's';
+      if (ageMs > 5000) setLink('alert', 'stale');
+    }
+
+    $('startBtn').addEventListener('click', () => {
+      saveSettings();
+      if (pollTimer) return;
+      pollOnce();
+      pollTimer = setInterval(pollOnce, 200);
+      setInterval(tickAge, 500);
+    });
+    $('stopBtn').addEventListener('click', () => {
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+      setLink('warn', 'stopped');
+    });
+
+    loadSettings();
+    initGl();
+    requestAnimationFrame(render);
+  </script>
+</body>
+</html>

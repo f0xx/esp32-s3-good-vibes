@@ -1,12 +1,13 @@
 /*
- * WS2812 on GPIO38 — bit-bang (matches Arduino rgbLedWrite / RMT timing).
- * GRB wire order. Pin 38 lives in GPIO OUT1 bank (bit 6).
+ * WS2812 on GPIO38 — bit-bang, same GRB frame as Arduino rgbLedWrite().
+ * Cycle-counted WS2812B timings (see handshake copy for the stuck-channel note).
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/irq.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/device.h>
+#include <esp_cpu.h>
 #include <esp_rom_sys.h>
 #include <soc/gpio_reg.h>
 
@@ -17,24 +18,23 @@
 static const struct device *gpio1_dev;
 static bool gpio_ready;
 
-static inline void delay_short(void)
+static inline void wait_until(uint32_t start, uint32_t ticks)
 {
-	__asm__ volatile("nop; nop; nop; nop; nop; nop; nop; nop");
+	while ((esp_cpu_get_cycle_count() - start) < ticks) {
+	}
 }
 
 static void ws2812_send_bit(bool one)
 {
-	if (one) {
-		REG_WRITE(GPIO_OUT1_W1TS_REG, BIT(WS2812_PIN));
-		esp_rom_delay_us(1);
-		REG_WRITE(GPIO_OUT1_W1TC_REG, BIT(WS2812_PIN));
-		delay_short();
-	} else {
-		REG_WRITE(GPIO_OUT1_W1TS_REG, BIT(WS2812_PIN));
-		delay_short();
-		REG_WRITE(GPIO_OUT1_W1TC_REG, BIT(WS2812_PIN));
-		esp_rom_delay_us(1);
-	}
+	const uint32_t tpus = esp_rom_get_cpu_ticks_per_us();
+	const uint32_t th = one ? ((tpus * 70U) / 100U) : ((tpus * 35U) / 100U);
+	const uint32_t tl = one ? ((tpus * 60U) / 100U) : ((tpus * 80U) / 100U);
+	const uint32_t t0 = esp_cpu_get_cycle_count();
+
+	REG_WRITE(GPIO_OUT1_W1TS_REG, BIT(WS2812_PIN));
+	wait_until(t0, th);
+	REG_WRITE(GPIO_OUT1_W1TC_REG, BIT(WS2812_PIN));
+	wait_until(t0, th + tl);
 }
 
 static void ws2812_send_byte(uint8_t byte)
@@ -56,6 +56,7 @@ int ws2812_gpio38_init(void)
 		return -EIO;
 	}
 
+	REG_WRITE(GPIO_OUT1_W1TC_REG, BIT(WS2812_PIN));
 	gpio_ready = true;
 	return 0;
 }
@@ -68,12 +69,16 @@ void ws2812_gpio38_rgb(uint8_t r, uint8_t g, uint8_t b)
 		return;
 	}
 
+	REG_WRITE(GPIO_OUT1_W1TC_REG, BIT(WS2812_PIN));
+	esp_rom_delay_us(300);
+
 	key = irq_lock();
-	ws2812_send_byte(g);
 	ws2812_send_byte(r);
+	ws2812_send_byte(g);
 	ws2812_send_byte(b);
 	irq_unlock(key);
 
+	REG_WRITE(GPIO_OUT1_W1TC_REG, BIT(WS2812_PIN));
 	esp_rom_delay_us(300);
 }
 

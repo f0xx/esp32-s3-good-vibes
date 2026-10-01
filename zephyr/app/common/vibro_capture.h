@@ -73,6 +73,9 @@ struct vibro_edge_features vibro_capture_edge_features(void);
 struct vibro_band_rms vibro_capture_band_rms(void);
 struct vibro_verdict vibro_capture_verdict(void);
 void vibro_capture_on_status_seq(uint32_t seq, bool persist_flash);
+/** CMD 14: pause live persist without wiping refs. CMD 10 clears this. */
+void vibro_capture_set_sensing_paused(bool paused);
+bool vibro_capture_sensing_paused(void);
 bool vibro_capture_ack_offload(uint32_t seq);
 void vibro_capture_session_tick(uint32_t now_ms);
 uint32_t vibro_capture_last_ack_seq(void);

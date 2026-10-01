@@ -1,34 +1,26 @@
 /*
  * Waveshare ESP32-S3-LCD-1.47B smoke test:
- * - ST7789 corners (BGR panel)
+ * - ST7789 corners via shared renderer (sole display_write site)
  * - WS2812 off via GPIO38 bitbang
  * - BOOT press → yellow bar flash + serial log
  * - BLE connectable advertising (nRF Connect)
  */
 
-#include <string.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/hci.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
-#include <zephyr/drivers/display.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/dt-bindings/input/input-event-codes.h>
 #include <zephyr/input/input.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/sys/util.h>
 
+#include "display_panel.h"
+#include "renderer.h"
 #include "ws2812_gpio38.h"
 
 LOG_MODULE_REGISTER(smoke, LOG_LEVEL_INF);
-
-/* Panel shows G/B swapped vs naive RGB565 — match Waveshare/TFT_eSPI BGR. */
-#define C_RED   0xF800
-#define C_GREEN 0x001F
-#define C_BLUE  0x07E0
-#define C_GREY  0x8410
-#define C_YELL  0xFFE0
 
 static const struct device *const display_dev =
 	DEVICE_DT_GET(DT_CHOSEN(zephyr_display));
@@ -57,55 +49,27 @@ static void ws2812_off(void)
 
 static void draw_corners(void)
 {
-	struct display_capabilities caps;
-	struct display_buffer_descriptor desc;
-	static uint16_t buf[48 * 48];
-	uint16_t colors[4] = {C_RED, C_GREEN, C_BLUE, C_GREY};
-	int coords[4][2] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
-
-	display_get_capabilities(display_dev, &caps);
-
 	const uint16_t w = 48;
 	const uint16_t h = 48;
+	const uint16_t colors[4] = {PANEL_RED, PANEL_GREEN, PANEL_BLUE, PANEL_GREY};
+	const uint16_t xs[4] = {0, PANEL_W - w, PANEL_W - w, 0};
+	const uint16_t ys[4] = {0, 0, PANEL_H - h, PANEL_H - h};
 
-	coords[1][0] = caps.x_resolution - w;
-	coords[2][0] = caps.x_resolution - w;
-	coords[2][1] = caps.y_resolution - h;
-	coords[3][1] = caps.y_resolution - h;
-
-	desc.width = w;
-	desc.height = h;
-	desc.pitch = w;
-	desc.buf_size = sizeof(buf);
-
+	renderer_begin(PANEL_BLACK);
 	for (int i = 0; i < 4; i++) {
-		for (size_t n = 0; n < ARRAY_SIZE(buf); n++) {
-			buf[n] = colors[i];
-		}
-		display_write(display_dev, coords[i][0], coords[i][1], &desc, buf);
+		renderer_fill_rect(xs[i], ys[i], w, h, colors[i]);
 	}
-
-	display_blanking_off(display_dev);
+	renderer_present();
+	(void)renderer_request_hw(true);
 }
 
 static void boot_feedback(void)
 {
-	struct display_capabilities caps;
-	struct display_buffer_descriptor desc;
-	static uint16_t buf[172 * 24];
+	const uint16_t y0 = PANEL_H / 2 - PANEL_BAR_H / 2;
 
-	display_get_capabilities(display_dev, &caps);
-
-	desc.width = caps.x_resolution;
-	desc.height = 24;
-	desc.pitch = caps.x_resolution;
-	desc.buf_size = sizeof(buf);
-
-	for (size_t n = 0; n < ARRAY_SIZE(buf); n++) {
-		buf[n] = C_YELL;
-	}
-
-	display_write(display_dev, 0, caps.y_resolution / 2 - 12, &desc, buf);
+	renderer_begin(PANEL_BLACK);
+	renderer_fill_rect(0, y0, PANEL_W, PANEL_BAR_H, PANEL_YELLOW);
+	renderer_present();
 	k_msleep(250);
 	draw_corners();
 }
@@ -119,7 +83,7 @@ static void start_ble(void)
 		return;
 	}
 
-	err = bt_le_adv_start(BT_LE_ADV_CONN, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
 	if (err) {
 		LOG_ERR("BLE advertising failed (%d)", err);
 		return;
@@ -128,15 +92,16 @@ static void start_ble(void)
 	LOG_INF("BLE advertising as \"%s\"", CONFIG_BT_DEVICE_NAME);
 }
 
-static void input_cb(struct input_event *evt)
+static void input_cb(struct input_event *evt, void *user_data)
 {
+	ARG_UNUSED(user_data);
 	if (evt->type == INPUT_EV_KEY && evt->code == INPUT_KEY_0 && evt->value != 0) {
 		boot_presses++;
 		boot_pending = true;
 	}
 }
 
-INPUT_CALLBACK_DEFINE(NULL, input_cb);
+INPUT_CALLBACK_DEFINE(NULL, input_cb, NULL);
 
 int main(void)
 {
@@ -147,7 +112,13 @@ int main(void)
 
 	LOG_INF("Waveshare 1.47B smoke — LCD + WS2812 + BOOT + BLE");
 	ws2812_off();
+
+	/* Smoke is single-threaded: claim main as the sole SPI owner. */
+	renderer_init(display_dev);
+	renderer_claim_thread();
+	(void)renderer_request_hw(true);
 	draw_corners();
+
 	start_ble();
 	LOG_INF("BOOT GPIO%d — press for yellow bar flash", boot_btn.pin);
 

@@ -166,6 +166,8 @@ class BatteryBenchActivity : AppCompatActivity() {
             runOnUiThread { refreshUi() }
         }
 
+        override fun onCaps(caps: Int) {}
+
         override fun onRelayState(
             state: RelayFsmState,
             caption: String,

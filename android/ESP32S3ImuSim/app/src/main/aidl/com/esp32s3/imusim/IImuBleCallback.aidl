@@ -28,8 +28,12 @@ oneway interface IImuBleCallback {
     /** Incremented on each stable BLE connect — UI clears stale pre-connect captions. */
     void onCaptionEpoch(int epoch);
     void onClockState(boolean synced, int tzMin);
+    /** Compile-in feature bitset (CHAR_CAPS and/or STATUS `feat`). 0 until the ESP announces. */
+    void onCaps(int caps);
     /** Battery bench wizard live update (active, sessionId, seq, V, %, elapsedMs, estMa). */
     void onBatteryBench(boolean active, long sessionId, long sampleSeq, float voltageV, int pct, long elapsedMs, float estMa);
     /** Flat-floor mounting calibration status JSON — see floor_calib.h. */
     void onFloorCalStatus(String json);
+    /** BLE link counters since connect (ATT notify/read = rx, writes = tx). rssiDbm is 0 if unknown. */
+    void onBleStats(long rxBytes, long txBytes, int rssiDbm);
 }

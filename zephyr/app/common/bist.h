@@ -12,7 +12,7 @@
 struct bist_result {
 	uint32_t flags_ok;
 	uint32_t flags_fail;
-	char summary[32];
+	char summary[64];
 	uint32_t elapsed_ms;
 	uint8_t pass_count;
 	uint8_t fail_count;
@@ -20,6 +20,12 @@ struct bist_result {
 
 /** Run all self-tests (boot or BLE on-demand). */
 void bist_run(void);
+
+/**
+ * After imu_pipeline_start(): wait up to wait_ms for QMI ready, then score IMU.
+ * Early boot bist_run() treats pre-bring-up who=0x00 as deferred (not a fail).
+ */
+void bist_imu_finalize(uint32_t wait_ms);
 
 const struct bist_result *bist_last(void);
 

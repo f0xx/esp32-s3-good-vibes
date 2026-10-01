@@ -27,8 +27,10 @@ curl -s http://127.0.0.1:8080/v1/health | jq .
 Expected:
 
 ```json
-{"ok": true, "schema_version": "imu.ingest.v1", "db": "postgres"}
+{"ok": true, "schema_version": "imu.ingest.v1", "db": "timescaledb", "timescaledb": true}
 ```
+
+(`db` is `postgres` if the Timescale extension is missing, `sqlite` for local-dev without Docker.)
 
 ## Services (docker-compose.yml)
 
@@ -113,7 +115,26 @@ Dashboard **`imu-verdicts`** — RMS, correlation, battery, verdict level, plus 
 
 Redeploy dashboards: `./backend/deploy/deploy-artc0.sh` (copies `backend/grafana/dashboards/`).
 
-Dashboards: **ESP32 IMU Verdicts** (`uid=imu-verdicts`), **ESP32 IMU Crashes** (`uid=imu-crashes`).
+Dashboards: **ESP32 IMU Verdicts** (`uid=imu-verdicts`), **ESP32 IMU Crashes** (`uid=imu-crashes`), **Wearable (MT200)** (`uid=imu-wearable`).
+
+## Wearable ingest (MT200)
+
+Companion-watch samples (HR / SpO2 / steps) keyed by the **bridging ESP32** `device_id`. Durable store is `wearable_samples` (Timescale hypertable on `ts_ms`). Live page: `/app/good_vibes/wearable`.
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/v1/ingest/wearable \
+  -H 'Content-Type: application/json' \
+  -H "X-API-Key: $IMU_API_KEY" \
+  -d '{
+    "schema": "imu.ingest.v1",
+    "device_id": "test-esp",
+    "sent_at_ms": 1700000000000,
+    "records": [
+      {"type":"wearable","ts_ms":1700000000000,"seq":1,"source":"mt200","kind":"hr","value":97},
+      {"type":"wearable","ts_ms":1700000000000,"seq":1,"source":"mt200","kind":"steps","value":4321}
+    ]
+  }'
+```
 
 ```bash
 bash deploy/ensure-grafana.sh

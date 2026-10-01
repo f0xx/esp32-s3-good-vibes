@@ -1,0 +1,56 @@
+{
+  "id": "machine_abnormal_vibration",
+  "kind": "generic",
+  "top_event": "Abnormal machine vibration",
+  "leaves": [
+    {
+      "leaf_id": "bearing",
+      "label": "Bearing wear / defect",
+      "category": "mechanical",
+      "speakable": true,
+      "new_ref_required": true
+    },
+    {
+      "leaf_id": "misalignment",
+      "label": "Misalignment / coupling",
+      "category": "mechanical",
+      "speakable": true,
+      "new_ref_required": true
+    },
+    {
+      "leaf_id": "cavitation",
+      "label": "Cavitation / fluid noise",
+      "category": "mechanical",
+      "speakable": true,
+      "new_ref_required": false
+    },
+    {
+      "leaf_id": "remount",
+      "label": "Sensor remount / loose fixture",
+      "category": "mechanical",
+      "speakable": true,
+      "new_ref_required": true
+    },
+    {
+      "leaf_id": "electrical",
+      "label": "Electrical",
+      "category": "electrical",
+      "speakable": false,
+      "new_ref_required": false
+    },
+    {
+      "leaf_id": "process",
+      "label": "Process / load change",
+      "category": "process",
+      "speakable": false,
+      "new_ref_required": false
+    },
+    {
+      "leaf_id": "other",
+      "label": "Other / unknown",
+      "category": "other",
+      "speakable": false,
+      "new_ref_required": true
+    }
+  ]
+}
